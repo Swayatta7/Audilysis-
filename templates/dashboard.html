@@ -1,0 +1,648 @@
+{% extends "layout.html" %}
+
+{% block title %}Dashboard Analysis{% endblock %}
+
+{% block content %}
+<div class="space-y-8 max-w-7xl mx-auto pb-12">
+    <!-- Dashboard Header -->
+    <div class="bg-white border border-slate-200 rounded-xl p-6 md:p-8 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-6">
+        <div>
+            <div class="flex items-center gap-3">
+                <span class="text-3xl font-extrabold tracking-tight text-slate-900">{{ run.brand_name }}</span>
+                <span class="text-sm px-2.5 py-1 bg-slate-100 text-slate-600 font-mono rounded-lg border border-slate-200">{{ run.brand_domain }}</span>
+            </div>
+            <p class="text-sm text-slate-500 mt-2 flex items-center gap-4">
+                <span><i class="fa-regular fa-calendar mr-1.5"></i> Run Date: <strong class="text-slate-700">{{ run.run_date }}</strong></span>
+                <span><i class="fa-solid fa-earth-americas mr-1.5"></i> Target: <strong class="text-slate-700">{{ run.country }} ({{ run.language }})</strong></span>
+            </p>
+        </div>
+        <div class="flex flex-wrap items-center gap-3">
+            <a href="/setup" class="px-4 py-2.5 border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold rounded-lg shadow-sm transition-colors text-sm flex items-center gap-2">
+                <i class="fa-solid fa-arrow-rotate-left"></i> Run Again
+            </a>
+            <a href="/download-report?run_id={{ run.id }}" target="_blank" class="px-4 py-2.5 bg-slate-800 text-white hover:bg-slate-900 font-semibold rounded-lg shadow-sm transition-colors text-sm flex items-center gap-2">
+                <i class="fa-solid fa-download"></i> Download Report
+            </a>
+            
+            {% if email_enabled %}
+            <button id="email-report-btn" data-run-id="{{ run.id }}" class="px-4 py-2.5 bg-blue-600 text-white hover:bg-blue-700 font-semibold rounded-lg shadow-sm transition-colors text-sm flex items-center gap-2">
+                <i class="fa-solid fa-envelope" id="email-icon"></i>
+                <i class="fa-solid fa-spinner animate-spin hidden" id="email-spinner"></i>
+                Email Report
+            </button>
+            {% else %}
+            <button class="px-4 py-2.5 bg-slate-200 text-slate-400 font-semibold rounded-lg text-sm flex items-center gap-2 cursor-not-allowed" title="Configure SMTP settings in Setup page to enable emailing." disabled>
+                <i class="fa-solid fa-envelope"></i> Email Report (Disabled)
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Live Toast Notification Container -->
+    <div id="toast-container" class="fixed bottom-5 right-5 z-50 pointer-events-none space-y-2"></div>
+
+    <!-- Row 1: Key Summary Stats Cards -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">Total Checks</span>
+                <i class="fa-solid fa-clipboard-list text-xl text-slate-400"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ stat_total_checks }}</div>
+            <p class="text-xs text-slate-500 mt-1">Keywords × Platforms analyzed</p>
+        </div>
+
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">Brand Mentions</span>
+                <i class="fa-solid fa-quote-left text-xl text-emerald-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ stat_brand_mentions }}</div>
+            <p class="text-xs text-slate-500 mt-1">Mentions across all queries</p>
+        </div>
+
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">Share of Voice</span>
+                <i class="fa-solid fa-chart-pie text-xl text-blue-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ stat_brand_sov }}%</div>
+            <p class="text-xs text-slate-500 mt-1">Brand relative presence rate</p>
+        </div>
+
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">API Health</span>
+                <i class="fa-solid fa-heart-pulse text-xl text-rose-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ stat_api_health }}%</div>
+            <p class="text-xs text-slate-500 mt-1">Successful API responses</p>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">SEO Agents</p>
+            <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.SEO }}</div>
+            <p class="text-sm text-slate-500 mt-1">Current SEO workflows</p>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Content Agents</p>
+            <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.Content }}</div>
+            <p class="text-sm text-slate-500 mt-1">Current content workflows</p>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Social Agents</p>
+            <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.Social }}</div>
+            <p class="text-sm text-slate-500 mt-1">Current social workflows</p>
+        </div>
+    </div>
+
+    <!-- Chart 1: Mention Heatmap Grid (Keyword x Platform) -->
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-border-all text-blue-500"></i>
+                Mention Heatmap (Keyword × Platform)
+            </h3>
+            <div class="flex items-center gap-4 text-xs font-semibold">
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-emerald-500 border border-emerald-600 block"></span> Mentioned</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-rose-500 border border-rose-600 block"></span> Not Mentioned</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-slate-300 border border-slate-400 block"></span> No Data/Error</span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-sm">
+                <thead>
+                    <tr class="bg-slate-100 border-b border-slate-200 text-slate-600 font-semibold">
+                        <th class="px-6 py-4">Keyword</th>
+                        <th class="px-6 py-4 text-center">Google AI Mode</th>
+                        <th class="px-6 py-4 text-center">ChatGPT</th>
+                        <th class="px-6 py-4 text-center">Perplexity</th>
+                        <th class="px-6 py-4 text-center">Gemini</th>
+                        <th class="px-6 py-4 text-center">Claude</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                    {% for kw in keywords %}
+                    <tr class="hover:bg-slate-50 transition-colors">
+                        <td class="px-6 py-4 font-medium text-slate-800">{{ kw }}</td>
+                        {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
+                            {% set res = heatmap_data[kw][platform] %}
+                            <td class="px-4 py-4 text-center">
+                                {% if res is none %}
+                                    <div class="mx-auto w-24 py-1.5 rounded-lg bg-slate-200 border border-slate-300 text-slate-600 text-xs font-semibold flex items-center justify-center gap-1">
+                                        <i class="fa-solid fa-circle-exclamation text-[10px]"></i> Error
+                                    </div>
+                                {% elif res.mentioned %}
+                                    <div class="mx-auto w-24 py-1.5 rounded-lg bg-emerald-500 border border-emerald-600 text-white text-xs font-bold flex items-center justify-center gap-1 shadow-sm">
+                                        <i class="fa-solid fa-check text-[10px]"></i> Mentioned
+                                        {% if res.position %}
+                                            <span class="bg-emerald-700 px-1 py-0.5 rounded text-[10px] ml-0.5">L{{ res.position|round|int }}</span>
+                                        {% endif %}
+                                    </div>
+                                {% else %}
+                                    <div class="mx-auto w-24 py-1.5 rounded-lg bg-rose-500 border border-rose-600 text-white text-xs font-semibold flex items-center justify-center gap-1 shadow-sm">
+                                        <i class="fa-solid fa-xmark text-[10px]"></i> Unmentioned
+                                    </div>
+                                {% endif %}
+                            </td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Charts Row 2 & 3 -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <!-- Competitor Share of Voice -->
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <h3 class="font-bold text-slate-900 mb-4 flex items-center gap-2">
+                <i class="fa-solid fa-chart-bar text-blue-500"></i> Competitor Share of Voice (SOV)
+            </h3>
+            <div class="h-64 relative">
+                {% if metrics|length > 0 %}
+                <canvas id="sovChart"></canvas>
+                {% else %}
+                <div class="h-full flex items-center justify-center text-slate-400 text-sm">
+                    Add competitors in your next run to see share-of-voice comparison.
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Platform Breakdown -->
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <h3 class="font-bold text-slate-900 mb-4 flex items-center gap-2">
+                <i class="fa-solid fa-chart-pie text-blue-500"></i> Platform Mention Success Rate
+            </h3>
+            <div class="h-64 relative">
+                <canvas id="platformChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Trend Over Time -->
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <h3 class="font-bold text-slate-900 mb-4 flex items-center gap-2">
+                <i class="fa-solid fa-chart-line text-blue-500"></i> Mention Trend Over Time
+            </h3>
+            <div class="h-64 relative">
+                {% if trend_data|length >= 2 %}
+                <canvas id="trendChart"></canvas>
+                {% else %}
+                <div class="h-full flex flex-col items-center justify-center text-slate-400 text-sm gap-2">
+                    <i class="fa-solid fa-clock-rotate-left text-3xl"></i>
+                    <span>Run the tracker again next week to see trends over time (requires 2+ runs).</span>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Top Mentioned Domains -->
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <h3 class="font-bold text-slate-900 mb-4 flex items-center gap-2">
+                <i class="fa-solid fa-link text-blue-500"></i> Top Cited Reference Domains
+            </h3>
+            <div class="h-64 relative">
+                {% if top_domains|length > 0 %}
+                <canvas id="domainsChart"></canvas>
+                {% else %}
+                <div class="h-full flex items-center justify-center text-slate-400 text-sm">
+                    No citation data found in successful runs.
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Table: Sources Being Cited -->
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-quote-right text-blue-500"></i>
+                Sources Being Cited (Citations list)
+            </h3>
+        </div>
+        <div class="overflow-x-auto max-h-96">
+            <table class="w-full text-left border-collapse text-sm">
+                <thead class="sticky top-0 bg-slate-100 border-b border-slate-200 text-slate-600 font-semibold z-10">
+                    <tr>
+                        <th class="px-6 py-3">Keyword</th>
+                        <th class="px-6 py-3">Platform</th>
+                        <th class="px-6 py-3">Cited URLs</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                    {% for res in results %}
+                    {% if res.sources_cited %}
+                    <tr class="hover:bg-slate-50 transition-colors">
+                        <td class="px-6 py-4 font-medium text-slate-800 w-1/4">{{ res.keyword }}</td>
+                        <td class="px-6 py-4 text-slate-600 font-mono text-xs w-1/6">{{ res.platform|upper }}</td>
+                        <td class="px-6 py-4">
+                            <div class="flex flex-wrap gap-2">
+                                {% for url in res.sources_cited %}
+                                    {% if run.brand_domain.lower() in url.lower() %}
+                                    <a href="{{ url }}" target="_blank" class="px-2.5 py-1 text-xs font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 rounded border border-emerald-300 transition-colors flex items-center gap-1">
+                                        <i class="fa-solid fa-bullseye"></i> {{ url }}
+                                    </a>
+                                    {% else %}
+                                    <a href="{{ url }}" target="_blank" class="px-2.5 py-1 text-xs font-medium bg-slate-100 text-slate-600 hover:bg-slate-200 rounded border border-slate-200 transition-colors inline-block truncate max-w-sm">
+                                        {{ url }}
+                                    </a>
+                                    {% endif %}
+                                {% endfor %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Table: Full AI Responses Accordion -->
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-message text-blue-500"></i>
+                Full AI Responses (Expanded Review)
+            </h3>
+        </div>
+        <div class="divide-y divide-slate-200">
+            {% for kw in keywords %}
+            <div class="accordion-item">
+                <!-- Accordion Header -->
+                <button type="button" class="w-full px-6 py-4 flex items-center justify-between text-left hover:bg-slate-50 transition-colors accordion-toggle font-semibold text-slate-800">
+                    <span>Keyword: "{{ kw }}"</span>
+                    <i class="fa-solid fa-chevron-down text-slate-400 transform transition-transform duration-200"></i>
+                </button>
+                <!-- Accordion Body -->
+                <div class="hidden px-6 pb-6 border-t border-slate-100 pt-4 space-y-4 bg-slate-50">
+                    <div class="grid grid-cols-1 gap-6">
+                        {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
+                            {% set match = results | selectattr('keyword', 'equalto', kw) | selectattr('platform', 'equalto', platform) | first %}
+                            <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-4">
+                                <div class="flex items-center justify-between border-b border-slate-100 pb-2 mb-3">
+                                    <span class="font-bold text-xs uppercase tracking-wider text-slate-500 font-mono">{{ platform|upper }}</span>
+                                    {% if match is not none %}
+                                        {% if match.mentioned %}
+                                        <span class="px-2 py-0.5 text-[10px] font-bold bg-emerald-100 text-emerald-700 rounded border border-emerald-200">
+                                            Mentioned (L{{ match.mention_position|round|int }})
+                                        </span>
+                                        {% elif match.mentioned is none %}
+                                        <span class="px-2 py-0.5 text-[10px] font-bold bg-slate-100 text-slate-400 rounded border border-slate-200">
+                                            No Data
+                                        </span>
+                                        {% else %}
+                                        <span class="px-2 py-0.5 text-[10px] font-bold bg-rose-100 text-rose-700 rounded border border-rose-200">
+                                            Unmentioned
+                                        </span>
+                                        {% endif %}
+                                    {% else %}
+                                    <span class="px-2 py-0.5 text-[10px] font-bold bg-slate-100 text-slate-400 rounded border border-slate-200">
+                                        No Data
+                                    </span>
+                                    {% endif %}
+                                </div>
+                                <div class="text-sm font-sans text-slate-700 leading-relaxed whitespace-pre-wrap ai-response-body">
+                                    {%- if match and match.ai_response_text -%}
+                                        {{- match.ai_response_text -}}
+                                    {%- else -%}
+                                        <em class="text-slate-400">No response data or API call failed.</em>
+                                    {%- endif -%}
+                                </div>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<!-- Embedded JSON Data for Chart.js -->
+<script id="metrics-data" type="application/json">
+    {{ metrics | tojson }}
+</script>
+<script id="platform-data" type="application/json">
+    {{ platform_breakdown | tojson }}
+</script>
+<script id="trend-data" type="application/json">
+    {{ trend_data | tojson }}
+</script>
+<script id="domains-data" type="application/json">
+    {{ top_domains | tojson }}
+</script>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const brandDomain = "{{ run.brand_domain }}";
+    const brandName = "{{ run.brand_name }}";
+
+    // 1. Accordion Toggle Logic
+    const accordions = document.querySelectorAll(".accordion-toggle");
+    accordions.forEach(acc => {
+        acc.addEventListener("click", () => {
+            const icon = acc.querySelector("i");
+            const body = acc.nextElementSibling;
+            icon.classList.toggle("rotate-180");
+            body.classList.toggle("hidden");
+        });
+    });
+
+    // 2. Highlighting Brand mentions in AI response bodies
+    const responseBodies = document.querySelectorAll(".ai-response-body");
+    responseBodies.forEach(div => {
+        let html = div.innerHTML;
+        if (!html || html.includes("<em")) return;
+        
+        // Brand Name highlight
+        const escName = brandName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+        const regexName = new RegExp(`(${escName})`, "gi");
+        html = html.replace(regexName, '<mark class="bg-yellow-200 text-slate-900 font-semibold px-0.5 rounded">$1</mark>');
+
+        // Brand Domain highlight
+        const escDomain = brandDomain.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+        const regexDomain = new RegExp(`(${escDomain})`, "gi");
+        html = html.replace(regexDomain, '<mark class="bg-yellow-200 text-slate-900 font-semibold px-0.5 rounded">$1</mark>');
+
+        div.innerHTML = html;
+    });
+
+    // 3. Load Chart Data from Embedded Script Tags
+    const metrics = JSON.parse(document.getElementById("metrics-data").textContent || "[]");
+    const platformData = JSON.parse(document.getElementById("platform-data").textContent || "{}");
+    const trendData = JSON.parse(document.getElementById("trend-data").textContent || "[]");
+    const domainsData = JSON.parse(document.getElementById("domains-data").textContent || "[]");
+
+    // 4. Competitor Share of Voice Chart (Horizontal Bar Chart)
+    const sovCtx = document.getElementById("sovChart");
+    if (sovCtx && metrics.length > 0) {
+        // Sort by share of voice or total mentions desc
+        metrics.sort((a, b) => b.total_mentions - a.total_mentions);
+        
+        const labels = metrics.map(m => m.domain);
+        const data = metrics.map(m => m.total_mentions);
+        
+        // Brand bar should stand out in blue, competitors in gray/indigo
+        const backgroundColors = metrics.map(m => 
+            m.domain.toLowerCase() === brandDomain.toLowerCase() ? '#4361ee' : '#a3b7fc'
+        );
+
+        new Chart(sovCtx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Total Mentions',
+                    data: data,
+                    backgroundColor: backgroundColors,
+                    borderRadius: 6,
+                    borderWidth: 0,
+                    barThickness: 16
+                }]
+            },
+            options: {
+                indexAxis: 'y',
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: {
+                        grid: { display: false },
+                        ticks: { stepSize: 1 }
+                    },
+                    y: {
+                        grid: { display: false }
+                    }
+                }
+            }
+        });
+    }
+
+    // 5. Platform Breakdown Chart (Doughnut)
+    const platformCtx = document.getElementById("platformChart");
+    if (platformCtx) {
+        const platforms = ['Google AI Mode', 'ChatGPT', 'Perplexity', 'Gemini', 'Claude'];
+        const keys = ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'];
+        const values = keys.map(k => platformData[k] || 0);
+
+        new Chart(platformCtx, {
+            type: 'doughnut',
+            data: {
+                labels: platforms,
+                datasets: [{
+                    data: values,
+                    backgroundColor: [
+                        '#4285F4', // Google Blue
+                        '#10a37f', // ChatGPT Teal
+                        '#19c37d', // Perplexity Green
+                        '#1a73e8', // Gemini Blue
+                        '#d97706'  // Claude Orange
+                    ],
+                    borderWidth: 2,
+                    hoverOffset: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            boxWidth: 12,
+                            font: { size: 11 }
+                        }
+                    }
+                },
+                cutout: '60%'
+            }
+        });
+    }
+
+    // 6. Trend Chart (Line Chart)
+    const trendCtx = document.getElementById("trendChart");
+    if (trendCtx && trendData.length >= 2) {
+        const dates = trendData.map(d => d.run_date);
+        
+        // Find all competitor lines
+        const domainsSet = new Set();
+        trendData.forEach(entry => {
+            Object.keys(entry).forEach(k => {
+                if (k !== 'run_date') domainsSet.add(k);
+            });
+        });
+
+        const datasets = [];
+        const domains = Array.from(domainsSet);
+        
+        // Color mapping for line datasets
+        const lineColors = {
+            'brand': '#4361ee',
+            'competitor1': '#fb7185',
+            'competitor2': '#38bdf8',
+            'competitor3': '#a78bfa',
+            'competitor4': '#fbbf24'
+        };
+
+        domains.forEach((dom, index) => {
+            const isBrand = dom === 'brand';
+            const dataPoints = trendData.map(entry => entry[dom] || 0);
+            const label = isBrand ? brandDomain : dom;
+            const color = isBrand ? '#4361ee' : (Object.values(lineColors)[index] || '#94a3b8');
+
+            datasets.push({
+                label: label,
+                data: dataPoints,
+                borderColor: color,
+                backgroundColor: color + '22',
+                tension: 0.25,
+                borderWidth: isBrand ? 3 : 2,
+                fill: isBrand,
+                pointRadius: 4
+            });
+        });
+
+        new Chart(trendCtx, {
+            type: 'line',
+            data: {
+                labels: dates,
+                datasets: datasets
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: { boxWidth: 12, font: { size: 11 } }
+                    }
+                },
+                scales: {
+                    x: { grid: { display: false } },
+                    y: { ticks: { stepSize: 1 } }
+                }
+            }
+        });
+    }
+
+    // 7. Top Domains Bar Chart (Grouped / Simple)
+    const domainsCtx = document.getElementById("domainsChart");
+    if (domainsCtx && domainsData.length > 0) {
+        // Take top 6 domains
+        const sliced = domainsData.slice(0, 6);
+        const labels = sliced.map(d => d.domain);
+        const counts = sliced.map(d => d.count);
+        
+        // Highlight brand domain in blue, others in gray
+        const bgColors = sliced.map(d => 
+            d.domain.toLowerCase() === brandDomain.toLowerCase() ? '#4361ee' : '#cbd5e1'
+        );
+
+        new Chart(domainsCtx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Citations',
+                    data: counts,
+                    backgroundColor: bgColors,
+                    borderRadius: 4,
+                    barThickness: 20
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: { grid: { display: false } },
+                    y: { ticks: { stepSize: 1 } }
+                }
+            }
+        });
+    }
+
+    // 8. Toast Helper
+    function showToast(text, type = "success") {
+        const container = document.getElementById("toast-container");
+        const toast = document.createElement("div");
+        toast.className = `p-4 rounded-lg shadow-lg text-white font-medium text-sm transition-all duration-300 transform translate-y-2 pointer-events-auto flex items-center gap-2 ${
+            type === "success" ? "bg-emerald-600" : "bg-rose-600"
+        }`;
+        
+        const icon = document.createElement("i");
+        icon.className = type === "success" ? "fa-solid fa-circle-check" : "fa-solid fa-triangle-exclamation";
+        toast.appendChild(icon);
+
+        const span = document.createElement("span");
+        span.textContent = text;
+        toast.appendChild(span);
+
+        container.appendChild(toast);
+        
+        // Animate entrance
+        setTimeout(() => {
+            toast.classList.remove("translate-y-2");
+            toast.classList.add("translate-y-0");
+        }, 10);
+
+        // Remove after 4s
+        setTimeout(() => {
+            toast.classList.add("opacity-0", "translate-y-2");
+            setTimeout(() => {
+                toast.remove();
+            }, 300);
+        }, 4000);
+    }
+
+    // 9. Email Report AJAX Request
+    const emailBtn = document.getElementById("email-report-btn");
+    if (emailBtn) {
+        emailBtn.addEventListener("click", async () => {
+            const runId = emailBtn.getAttribute("data-run-id");
+            
+            // Set loading state
+            emailBtn.disabled = true;
+            emailBtn.classList.add("opacity-75", "cursor-not-allowed");
+            document.getElementById("email-icon").classList.add("hidden");
+            document.getElementById("email-spinner").classList.remove("hidden");
+
+            try {
+                const response = await fetch("/api/email-report", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ run_id: runId })
+                });
+
+                const data = await response.json();
+                if (response.ok && data.status === "sent") {
+                    showToast(`Report emailed to ${data.to} ✓`, "success");
+                } else {
+                    showToast(`Email error: ${data.message || "Failed to deliver"}`, "error");
+                }
+            } catch (err) {
+                showToast(`Request failed: ${err.message}`, "error");
+            } finally {
+                // Restore state
+                emailBtn.disabled = false;
+                emailBtn.classList.remove("opacity-75", "cursor-not-allowed");
+                document.getElementById("email-icon").classList.remove("hidden");
+                document.getElementById("email-spinner").classList.add("hidden");
+            }
+        });
+    }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,1263 @@
+<div class="max-w-7xl mx-auto space-y-6">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div class="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+            <div>
+                <p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">{{ studio_label }}</p>
+                <h2 class="text-2xl font-semibold text-slate-900">{{ studio_heading }}</h2>
+                <p class="mt-2 text-sm text-slate-600">{{ studio_description }}</p>
+            </div>
+            <a href="/" class="inline-flex items-center gap-2 text-sm font-medium text-slate-600 hover:text-indigo-600">
+                <i class="fa-solid fa-arrow-left"></i>
+                Back to main app
+            </a>
+        </div>
+    </div>
+
+    <div class="agent-studio-layout">
+        <div class="agent-studio-sidebar bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-slate-900">Available agents</h3>
+                <span class="text-sm text-slate-500">{{ agents|length }} modular workflows</span>
+            </div>
+            <div class="agent-card-grid">
+                {% for agent in agents %}
+                <button type="button" class="agent-card agent-card-stable rounded-xl border border-slate-200 p-4 text-left hover:border-indigo-400 hover:shadow-sm transition" data-agent-id="{{ agent.id }}">
+                    <div class="flex items-center gap-2 text-indigo-600">
+                        <i class="fa-solid {{ agent.icon }}"></i>
+                        <span class="text-sm font-semibold">{{ agent.name }}</span>
+                    </div>
+                    <p class="mt-2 text-sm text-slate-600">{{ agent.description }}</p>
+                    <p class="mt-3 text-xs uppercase tracking-[0.2em] text-slate-400">{{ agent.category }}</p>
+                </button>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="agent-studio-main bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <script id="agents-data" type="application/json">{{ agents|tojson }}</script>
+            <form id="agent-form" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">{{ form_agent_label }}</label>
+                    <select id="agent" name="agent" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        {% for agent in agents %}
+                        <option value="{{ agent.id }}">{{ agent.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div id="agent-fields-container" class="grid gap-4 sm:grid-cols-2"></div>
+
+                <button type="submit" class="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 transition">
+                    <i class="fa-solid fa-play"></i>
+                    Run agent
+                </button>
+            </form>
+
+            <div class="mt-6">
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="text-lg font-semibold text-slate-900">Result</h3>
+                    <span id="result-status" class="text-xs uppercase tracking-[0.2em] text-slate-400">Idle</span>
+                </div>
+                <div id="result-shell" class="result-panel-shell min-h-48 rounded-xl border border-slate-200 bg-slate-50">
+                    <div id="result-empty" class="p-6 text-sm text-slate-500">Run an agent to see a structured result view.</div>
+                    <div id="result-view" class="hidden p-4 md:p-5 space-y-4"></div>
+                    <div id="raw-json-wrap" class="hidden border-t border-slate-200 bg-slate-950 rounded-b-xl">
+                        <pre id="result-output" class="overflow-auto p-4 text-sm text-slate-100"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatLabel(value) {
+        return String(value || '')
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, function(char) { return char.toUpperCase(); });
+    }
+
+    function formatValue(value) {
+        if (value === null || value === undefined || value === '') return 'N/A';
+        if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
+        if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+        return String(value);
+    }
+
+    function shortenUrl(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        try {
+            const url = new URL(raw);
+            return url.hostname.replace(/^www\./, '');
+        } catch (error) {
+            return raw;
+        }
+    }
+
+    function formatCellValue(value, column) {
+        if (value === null || value === undefined || value === '') return 'N/A';
+        if (typeof value === 'string' && (column === 'website' || column === 'url' || /^https?:\/\//.test(value))) {
+            const shortValue = shortenUrl(value);
+            return `<span title="${escapeHtml(value)}" class="inline-block max-w-full break-words">${escapeHtml(shortValue || value)}</span>`;
+        }
+        if (Array.isArray(value)) return escapeHtml(value.join(', '));
+        if (typeof value === 'object') return escapeHtml(JSON.stringify(value));
+        return escapeHtml(formatValue(value));
+    }
+
+    function cardSection(title, body, options = {}) {
+        const toneClass = options.toneClass || 'bg-white border-slate-200';
+        return `
+            <section class="rounded-xl border ${toneClass} p-4 animate-fade-in">
+                <div class="flex items-center justify-between gap-3 mb-3">
+                    <h4 class="text-sm font-semibold text-slate-900 uppercase tracking-[0.18em]">${escapeHtml(title)}</h4>
+                    ${options.badge ? `<span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">${escapeHtml(options.badge)}</span>` : ''}
+                </div>
+                ${body}
+            </section>
+        `;
+    }
+
+    function renderKeyValueGrid(items) {
+        return `
+            <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                ${items.map(function(item) {
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${escapeHtml(item.label)}</div>
+                            <div class="mt-1 text-sm font-medium text-slate-900 break-words">${escapeHtml(formatValue(item.value))}</div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderBulletList(items, icon, colorClass) {
+        const list = (items || []).filter(Boolean);
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No items reported.</div>`;
+        }
+        return `
+            <ul class="space-y-2">
+                ${list.map(function(item) {
+                    return `
+                        <li class="flex items-start gap-2 text-sm text-slate-700">
+                            <span class="mt-0.5 ${colorClass}"><i class="fa-solid ${icon}"></i></span>
+                            <span>${escapeHtml(typeof item === 'string' ? item : JSON.stringify(item))}</span>
+                        </li>
+                    `;
+                }).join('')}
+            </ul>
+        `;
+    }
+
+    function renderOrderedList(items) {
+        const list = (items || []).filter(Boolean);
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No recommendations available.</div>`;
+        }
+        return `
+            <ol class="space-y-2">
+                ${list.map(function(item, index) {
+                    return `
+                        <li class="flex items-start gap-3 text-sm text-slate-700">
+                            <span class="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-50 text-xs font-semibold text-indigo-600">${index + 1}</span>
+                            <span>${escapeHtml(typeof item === 'string' ? item : JSON.stringify(item))}</span>
+                        </li>
+                    `;
+                }).join('')}
+            </ol>
+        `;
+    }
+
+    function renderBadge(value, tone) {
+        const toneMap = {
+            good: 'bg-emerald-50 text-emerald-700',
+            warn: 'bg-amber-50 text-amber-700',
+            danger: 'bg-rose-50 text-rose-700',
+            info: 'bg-indigo-50 text-indigo-700',
+            neutral: 'bg-slate-100 text-slate-700'
+        };
+        return `<span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${toneMap[tone] || toneMap.neutral}">${escapeHtml(formatValue(value))}</span>`;
+    }
+
+    function renderTable(rows, preferredColumns) {
+        if (!rows || !rows.length) {
+            return `<div class="text-sm text-slate-500">No rows available.</div>`;
+        }
+        const columns = preferredColumns && preferredColumns.length
+            ? preferredColumns.filter(function(column) { return rows.some(function(row) { return row && row[column] !== undefined; }); })
+            : Array.from(rows.reduce(function(set, row) {
+                Object.keys(row || {}).forEach(function(key) { set.add(key); });
+                return set;
+            }, new Set()));
+        return `
+            <div class="overflow-x-auto rounded-lg border border-slate-200 result-table-wrap">
+                <table class="min-w-full divide-y divide-slate-200 text-sm">
+                    <thead class="bg-slate-100">
+                        <tr>
+                            ${columns.map(function(column) {
+                                return `<th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${escapeHtml(formatLabel(column))}</th>`;
+                            }).join('')}
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 bg-white">
+                        ${rows.map(function(row) {
+                            return `
+                                <tr>
+                                    ${columns.map(function(column) {
+                                        const value = row ? row[column] : '';
+                                        return `<td class="px-3 py-2 align-top text-slate-700 break-words">${formatCellValue(value, column)}</td>`;
+                                    }).join('')}
+                                </tr>
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    function keywordRowsToCsv(rows) {
+        const columns = ['keyword', 'keyword_type', 'search_intent', 'funnel_stage', 'relevance_score', 'relevance_priority', 'source', 'search_volume', 'cpc', 'competition', 'keyword_difficulty', 'metric_source'];
+        const escapeCsv = function(value) {
+            const text = formatValue(value).replace(/"/g, '""');
+            return `"${text}"`;
+        };
+        return [columns.join(',')].concat((rows || []).map(function(row) {
+            return columns.map(function(column) { return escapeCsv(row[column]); }).join(',');
+        })).join('\n');
+    }
+
+    function renderKeywordOpportunityTable(rows) {
+        const list = rows || [];
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No keyword opportunities available.</div>`;
+        }
+        const uniqueValues = function(key) {
+            return Array.from(new Set(list.map(function(item) { return item[key]; }).filter(Boolean))).sort();
+        };
+        const select = function(id, label, values) {
+            return `
+                <label class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+                    ${escapeHtml(label)}
+                    <select id="${id}" class="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm normal-case tracking-normal" onchange="applyKeywordResearchFilters()">
+                        <option value="">All</option>
+                        ${values.map(function(value) { return `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`; }).join('')}
+                    </select>
+                </label>
+            `;
+        };
+        return `
+            <div class="space-y-3">
+                <div class="grid gap-3 md:grid-cols-5">
+                    <label class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+                        Search
+                        <input id="keyword-search" class="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm normal-case tracking-normal" placeholder="Search keywords" oninput="applyKeywordResearchFilters()">
+                    </label>
+                    ${select('intent-filter', 'Intent', uniqueValues('search_intent'))}
+                    ${select('type-filter', 'Type', uniqueValues('keyword_type'))}
+                    ${select('funnel-filter', 'Funnel', uniqueValues('funnel_stage'))}
+                    ${select('priority-filter', 'Priority', uniqueValues('relevance_priority'))}
+                </div>
+                <div class="flex justify-end">
+                    <button type="button" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50" onclick="exportKeywordResearchCsv()">
+                        <i class="fa-solid fa-file-csv"></i> Export CSV
+                    </button>
+                </div>
+                <div class="overflow-x-auto rounded-lg border border-slate-200 result-table-wrap">
+                    <table class="min-w-full divide-y divide-slate-200 text-sm">
+                        <thead class="bg-slate-100">
+                            <tr>
+                                ${['Keyword', 'Type', 'Intent', 'Funnel', 'Relevance Score', 'Priority', 'Source', 'Search Volume', 'CPC', 'Competition', 'Difficulty', 'Metric Source', 'Copy'].map(function(column) {
+                                    return `<th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${column}</th>`;
+                                }).join('')}
+                            </tr>
+                        </thead>
+                        <tbody id="keyword-opportunity-body" class="divide-y divide-slate-100 bg-white">
+                            ${renderKeywordOpportunityRows(list)}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderKeywordOpportunityRows(rows) {
+        const list = rows || [];
+        const metricValue = function(value) {
+            return value === null || value === undefined || value === '' ? 'Unavailable in Free Mode' : value;
+        };
+        if (!list.length) {
+            return `<tr><td colspan="13" class="px-3 py-3 text-sm text-slate-500">No matching keywords.</td></tr>`;
+        }
+        return list.map(function(row) {
+            return `
+                <tr>
+                    <td class="px-3 py-2 align-top font-medium text-slate-900">${escapeHtml(row.keyword)}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(row.keyword_type)}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(row.search_intent)}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(row.funnel_stage)}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(formatValue(row.relevance_score))}</td>
+                    <td class="px-3 py-2 align-top">${renderBadge(row.relevance_priority, row.relevance_priority === 'High Priority' ? 'good' : (row.relevance_priority === 'Medium Priority' ? 'warn' : 'neutral'))}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(row.source || 'Local NLP')}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(formatValue(metricValue(row.search_volume)))}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(formatValue(metricValue(row.cpc)))}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(formatValue(metricValue(row.competition)))}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(formatValue(metricValue(row.keyword_difficulty)))}</td>
+                    <td class="px-3 py-2 align-top text-slate-700">${escapeHtml(row.metric_source)}</td>
+                    <td class="px-3 py-2 align-top">
+                        <button type="button" class="rounded-lg border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50" onclick="copyKeyword('${escapeHtml(row.keyword).replace(/'/g, '&#39;')}')">
+                            <i class="fa-solid fa-copy"></i>
+                        </button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    function renderResearchKeywordList(items) {
+        const rows = (items || []).map(function(item) {
+            return typeof item === 'string' ? { keyword: item } : item;
+        });
+        return renderTable(rows, ['keyword', 'search_intent', 'funnel_stage', 'relevance_score', 'relevance_priority', 'source', 'metric_source']);
+    }
+
+    function renderKeywordResearchView(data, payload) {
+        return [
+            renderSummaryBanner(data),
+            cardSection('Research Overview', renderMetricCards([
+                { label: 'Seed Keyword', value: payload.input_summary?.seed_keyword },
+                { label: 'Mode', value: payload.mode === 'premium' ? 'Premium API Mode' : 'Free Mode' },
+                { label: 'Opportunities', value: (payload.keyword_opportunities || []).length },
+                { label: 'Pages Crawled', value: payload.crawl_status?.pages_crawled },
+                { label: 'Premium Metrics', value: payload.premium_metrics_status || 'Unavailable in Free Mode' }
+            ])),
+            cardSection('Website Topics Detected', renderBulletList(payload.website_topics_detected, 'fa-tag', 'text-indigo-600')),
+            cardSection('Competitor Topics Detected', renderBulletList(payload.competitor_topics_detected, 'fa-chart-simple', 'text-sky-600')),
+            cardSection('Primary Keywords', renderResearchKeywordList(payload.primary_keywords)),
+            cardSection('Secondary Keywords', renderResearchKeywordList(payload.secondary_keywords)),
+            cardSection('Long-Tail Keywords', renderResearchKeywordList(payload.long_tail_keywords)),
+            cardSection('Question Keywords', renderResearchKeywordList(payload.question_keywords)),
+            cardSection('Commercial Keywords', renderResearchKeywordList(payload.commercial_keywords)),
+            cardSection('Transactional Keywords', renderResearchKeywordList(payload.transactional_keywords)),
+            cardSection('Local Keywords', renderResearchKeywordList(payload.local_keywords)),
+            cardSection('Comparison Keywords', renderResearchKeywordList(payload.comparison_keywords)),
+            cardSection('Problem/Solution Keywords', renderResearchKeywordList(payload.problem_solution_keywords)),
+            cardSection('Brand Keywords', renderResearchKeywordList(payload.brand_keywords)),
+            cardSection('Keyword Opportunity Table', renderKeywordOpportunityTable(payload.keyword_opportunities)),
+            cardSection('Data Sources', renderSourceStatusList(payload.data_sources)),
+            cardSection('Premium Metrics Status', renderTable(payload.unavailable_metrics, ['metric', 'status'])),
+            cardSection('Recommendations', renderOrderedList(payload.recommendations || data.recommendations)),
+            cardSection('Executive Summary', `<div class="text-sm leading-6 text-slate-700">${escapeHtml(payload.summary || data.summary)}</div>`)
+        ].join('');
+    }
+
+    function renderExpandableClusterCards(clusters) {
+        const list = clusters || [];
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No clusters available.</div>`;
+        }
+        return `
+            <div class="space-y-3">
+                ${list.map(function(cluster, index) {
+                    return `
+                        <details class="rounded-lg border border-slate-200 bg-white p-4" ${index === 0 ? 'open' : ''}>
+                            <summary class="cursor-pointer list-none">
+                                <div class="flex flex-wrap items-center justify-between gap-3">
+                                    <div>
+                                        <h5 class="text-sm font-semibold text-slate-900">${escapeHtml(cluster.cluster_name)}</h5>
+                                        <div class="mt-1 text-xs text-slate-500">Pillar: ${escapeHtml(cluster.pillar_keyword)}</div>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2">
+                                        ${renderBadge(cluster.dominant_search_intent, 'info')}
+                                        ${renderBadge(cluster.funnel_stage, 'neutral')}
+                                        ${renderBadge(cluster.confidence, cluster.confidence === 'High' ? 'good' : (cluster.confidence === 'Medium' ? 'warn' : 'neutral'))}
+                                    </div>
+                                </div>
+                            </summary>
+                            <div class="mt-4 grid gap-4 lg:grid-cols-2">
+                                <div>
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Supporting Keywords</div>
+                                    <div class="mt-2 flex flex-wrap gap-2">
+                                        ${(cluster.supporting_keywords || []).map(function(keyword) {
+                                            return `<span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">${escapeHtml(keyword)}</span>`;
+                                        }).join('') || '<span class="text-sm text-slate-500">No supporting keywords.</span>'}
+                                    </div>
+                                </div>
+                                <div>${renderKeyValueGrid([
+                                    { label: 'Page Type', value: cluster.recommended_page_type },
+                                    { label: 'Suggested URL', value: cluster.suggested_url_slug },
+                                    { label: 'Similarity Score', value: cluster.average_similarity_score },
+                                    { label: 'Confidence Score', value: cluster.confidence_score }
+                                ])}</div>
+                            </div>
+                            <div class="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+                                <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Content Angle</div>
+                                <div class="mt-2 text-sm leading-6 text-slate-700">${escapeHtml(cluster.suggested_content_angle || '')}</div>
+                            </div>
+                            <div class="mt-4">${renderTable(cluster.internal_linking_suggestions, ['source_keyword', 'destination_keyword', 'suggested_anchor_text', 'link_direction', 'relationship_reason'])}</div>
+                        </details>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderKeywordClusteringView(data, payload) {
+        return [
+            renderSummaryBanner(data),
+            cardSection('Clustering Overview', renderMetricCards([
+                { label: 'Total Keywords', value: payload.total_keywords_received },
+                { label: 'Valid Keywords', value: payload.valid_keywords },
+                { label: 'Duplicates Removed', value: payload.duplicates_removed },
+                { label: 'Number of Clusters', value: payload.number_of_clusters },
+                { label: 'Method Used', value: 'Local TF-IDF + token/entity/intent similarity' }
+            ])),
+            cardSection('Cluster Cards', renderExpandableClusterCards(payload.clusters)),
+            cardSection('Content Architecture', renderTable(payload.content_architecture, ['cluster_name', 'pillar_keyword', 'dominant_intent', 'funnel_stage', 'recommended_page_type', 'suggested_url_slug', 'suggested_content_angle'])),
+            cardSection('Internal Linking Plan', renderTable(payload.internal_linking_plan, ['pillar_page', 'supporting_page_idea', 'source_keyword', 'destination_keyword', 'suggested_anchor_text', 'link_direction', 'relationship_reason'])),
+            cardSection('Unclustered Keywords', renderBulletList(payload.unclustered_keywords, 'fa-circle', 'text-slate-400')),
+            cardSection('Methodology', renderGenericData(payload.methodology || {})),
+            cardSection('Recommendations', renderOrderedList(payload.recommendations || data.recommendations))
+        ].join('');
+    }
+
+    function renderClusterCards(clusters) {
+        if (!clusters || !clusters.length) {
+            return `<div class="text-sm text-slate-500">No clusters available.</div>`;
+        }
+        return `
+            <div class="grid gap-3 md:grid-cols-2">
+                ${clusters.map(function(cluster) {
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-white p-4">
+                            <div class="flex items-center justify-between gap-2">
+                                <h5 class="text-sm font-semibold text-slate-900">${escapeHtml(cluster.cluster_name || cluster.cluster || 'Cluster')}</h5>
+                                <span class="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">${escapeHtml(formatValue(cluster.search_intent || cluster.funnel_stage))}</span>
+                            </div>
+                            <div class="mt-2 text-xs uppercase tracking-[0.16em] text-slate-500">${escapeHtml(formatValue(cluster.recommended_page_type || 'Keywords'))}</div>
+                            <div class="mt-3 flex flex-wrap gap-2">
+                                ${(cluster.keywords || []).map(function(keyword) {
+                                    return `<span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">${escapeHtml(keyword)}</span>`;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderPromptCards(items) {
+        if (!items || !items.length) {
+            return `<div class="text-sm text-slate-500">No prompt cards available.</div>`;
+        }
+        return `
+            <div class="grid gap-3 md:grid-cols-2">
+                ${items.map(function(item) {
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-white p-4">
+                            <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${escapeHtml(item.label)}</div>
+                            <div class="mt-2 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(item.value)}</div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderBeforeAfter(data) {
+        return `
+            <div class="grid gap-4 md:grid-cols-2">
+                <div class="rounded-lg border border-slate-200 bg-white p-4">
+                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Before</div>
+                    <div class="mt-2 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(data.original_excerpt || data.checked_excerpt || 'N/A')}</div>
+                </div>
+                <div class="rounded-lg border border-slate-200 bg-white p-4">
+                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">After</div>
+                    <div class="mt-2 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(data.rewritten_excerpt || 'N/A')}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderChecklist(items) {
+        const list = (items || []).filter(Boolean);
+        return `
+            <ul class="space-y-2">
+                ${list.map(function(item) {
+                    return `
+                        <li class="flex items-start gap-2 text-sm text-slate-700">
+                            <span class="mt-0.5 text-emerald-600"><i class="fa-solid fa-check"></i></span>
+                            <span>${escapeHtml(item)}</span>
+                        </li>
+                    `;
+                }).join('')}
+            </ul>
+        `;
+    }
+
+    function mapMissingKeyToService(key) {
+        const mapping = {
+            SEMRUSH_API_KEY: 'Semrush',
+            AHREFS_API_KEY: 'Ahrefs',
+            MOZ_API_KEY: 'Moz',
+            DATAFORSEO_LOGIN: 'DataForSEO',
+            DATAFORSEO_PASSWORD: 'DataForSEO',
+            PAGESPEED_API_KEY: 'PageSpeed Insights',
+            SERPAPI_KEY: 'SerpAPI',
+            OPENAI_API_KEY: 'OpenAI'
+        };
+        return mapping[key] || key.replace(/_API_KEY|_LOGIN|_PASSWORD/g, '').replace(/_/g, ' ');
+    }
+
+    function renderMetricCards(items) {
+        const list = (items || []).filter(function(item) { return item && item.value !== undefined && item.value !== null && item.value !== ''; });
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No metrics available.</div>`;
+        }
+        return `
+            <div class="executive-card-grid">
+                ${list.map(function(item) {
+                    return `
+                        <div class="rounded-2xl border border-slate-200 bg-white p-5 metric-card executive-card">
+                            <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${escapeHtml(item.label)}</div>
+                            <div class="mt-2 text-2xl font-semibold text-slate-900">${escapeHtml(formatValue(item.value))}</div>
+                            ${item.meta ? `<div class="mt-1 text-sm text-slate-500">${escapeHtml(item.meta)}</div>` : ''}
+                            ${item.description ? `<div class="mt-2 text-sm leading-6 text-slate-600">${escapeHtml(item.description)}</div>` : ''}
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderIssueGroups(groups) {
+        const list = (groups || []).filter(Boolean);
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No issues reported.</div>`;
+        }
+        return `
+            <div class="space-y-3">
+                ${list.map(function(item) {
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-white p-4">
+                            <div class="flex flex-wrap items-center justify-between gap-3">
+                                <div>
+                                    <div class="text-sm font-semibold text-slate-900">${escapeHtml(item.issue || item.title || 'Issue')}</div>
+                                    <div class="mt-1 text-sm text-slate-600">${escapeHtml(item.summary || '')}</div>
+                                </div>
+                                ${renderBadge(item.severity || 'Info', (item.severity || '').toLowerCase() === 'critical' ? 'danger' : ((item.severity || '').toLowerCase() === 'high' ? 'warn' : 'info'))}
+                            </div>
+                            <div class="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                                <div class="rounded-lg bg-slate-50 p-3">
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Affected Pages</div>
+                                    <div class="mt-1 text-sm font-semibold text-slate-900">${escapeHtml(formatValue(item.affected_pages))}</div>
+                                </div>
+                                <div class="rounded-lg bg-slate-50 p-3">
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Affected Items</div>
+                                    <div class="mt-1 text-sm font-semibold text-slate-900">${escapeHtml(formatValue(item.affected_count))}</div>
+                                </div>
+                                <div class="rounded-lg bg-slate-50 p-3">
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">SEO Impact</div>
+                                    <div class="mt-1 text-sm font-semibold text-slate-900">${escapeHtml(formatValue(item.estimated_seo_impact))}</div>
+                                </div>
+                                <div class="rounded-lg bg-slate-50 p-3">
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Fix Time</div>
+                                    <div class="mt-1 text-sm font-semibold text-slate-900">${escapeHtml(formatValue(item.estimated_time_to_fix))}</div>
+                                </div>
+                            </div>
+                            ${(item.examples || []).length ? `
+                                <div class="mt-3">
+                                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Examples</div>
+                                    <div class="mt-2 flex flex-wrap gap-2">
+                                        ${(item.examples || []).slice(0, 3).map(function(example) {
+                                            return `<span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-700 break-all">${escapeHtml(example)}</span>`;
+                                        }).join('')}
+                                    </div>
+                                </div>
+                            ` : ''}
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderPriorityFixes(items) {
+        const list = (items || []).filter(Boolean);
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No priority fixes identified.</div>`;
+        }
+        return renderTable(list, ['issue', 'severity', 'affected_pages', 'estimated_seo_impact', 'recommended_fix', 'estimated_time_to_fix']);
+    }
+
+    function renderPassedChecks(checks) {
+        const list = (checks || []).filter(Boolean);
+        if (!list.length) {
+            return `<div class="text-sm text-slate-500">No passed checks available.</div>`;
+        }
+        const passed = list.filter(function(item) { return item.passed; });
+        const detailsId = `passed-checks-${Math.random().toString(36).slice(2, 9)}`;
+        return `
+            <div class="space-y-4">
+                <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    ${list.map(function(item) {
+                        return `
+                            <div class="rounded-lg border border-slate-200 bg-white p-4">
+                                <div class="flex items-center gap-2">
+                                    <span class="${item.passed ? 'text-emerald-600' : 'text-amber-600'}"><i class="fa-solid ${item.passed ? 'fa-check-circle' : 'fa-circle-minus'}"></i></span>
+                                    <span class="text-sm font-semibold text-slate-900">${escapeHtml(item.label)}</span>
+                                </div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+                <details id="${detailsId}" class="rounded-lg border border-slate-200 bg-white">
+                    <summary class="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-slate-700">
+                        View Details
+                    </summary>
+                    <div class="border-t border-slate-200 p-4">
+                        <ul class="space-y-2">
+                            ${list.map(function(item) {
+                                return `
+                                    <li class="flex items-start gap-2 text-sm text-slate-700">
+                                        <span class="mt-0.5 ${item.passed ? 'text-emerald-600' : 'text-amber-600'}"><i class="fa-solid ${item.passed ? 'fa-check' : 'fa-circle-minus'}"></i></span>
+                                        <span><span class="font-semibold text-slate-900">${escapeHtml(item.label)}:</span> ${escapeHtml(item.detail || '')}</span>
+                                    </li>
+                                `;
+                            }).join('')}
+                        </ul>
+                    </div>
+                </details>
+            </div>
+        `;
+    }
+
+    function renderPremiumApiCard(entries) {
+        const list = (entries || []).filter(Boolean);
+        if (!list.length) {
+            return '<div class="summary-card-value result-summary-card-value text-sm font-semibold text-slate-900">None</div>';
+        }
+        return `
+            <div class="space-y-3 premium-api-list">
+                ${list.map(function(item) {
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 premium-api-row">
+                            <div class="flex items-center justify-between gap-3">
+                                <div class="text-sm font-semibold text-slate-900">${escapeHtml(item.service || item.name || 'API')}</div>
+                                <div class="inline-flex items-center gap-2 text-sm font-medium text-slate-600">
+                                    <span class="premium-status-dot ${item.status === 'Connected' ? 'connected' : 'not-connected'}"></span>
+                                    <span>${escapeHtml(item.status || 'Unknown')}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderSourceStatusList(entries) {
+        const list = (entries || []).filter(Boolean);
+        if (!list.length) {
+            return '<div class="summary-card-value result-summary-card-value text-sm font-semibold text-slate-900">No source metadata</div>';
+        }
+        return `
+            <div class="space-y-3">
+                ${list.map(function(item) {
+                    const connected = item.status === 'Connected';
+                    return `
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 premium-api-row">
+                            <div class="flex items-center justify-between gap-3">
+                                <div class="min-w-0">
+                                    <div class="text-sm font-semibold text-slate-900">${escapeHtml(item.name || item.service || 'Source')}</div>
+                                    ${item.detail ? `<div class="mt-1 text-xs leading-5 text-slate-500">${escapeHtml(item.detail)}</div>` : ''}
+                                </div>
+                                <div class="inline-flex items-center gap-2 text-sm font-medium text-slate-600">
+                                    <span class="premium-status-dot ${connected ? 'connected' : 'not-connected'}"></span>
+                                    <span>${escapeHtml(item.status || 'Unknown')}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function renderTransparencyCards(payload) {
+        const unavailable = payload.unavailable_metrics || [];
+        const missingKeys = payload.missing_api_keys || [];
+        return renderMetricCards([
+            { label: 'Pages Crawled', value: payload.overview?.pages_crawled || payload.technical_summary?.pages_crawled },
+            { label: 'Crawl Duration', value: payload.overview?.crawl_duration_ms || payload.technical_summary?.crawl_duration_ms, meta: 'ms' },
+            { label: 'Missing API Keys', value: missingKeys.length ? missingKeys.length : 'None' },
+            { label: 'Unavailable Metrics', value: unavailable.length ? unavailable.length : 'None' }
+        ]);
+    }
+
+    function renderSummaryBanner(data) {
+        const source = data.data?.data_source || data.data_source || 'Unknown';
+        const dataSources = data.data?.data_sources || [];
+        const inferredCrawlStack = source === 'real_crawl' || source === 'real_crawl_and_pagespeed_api'
+            ? ['Real Crawl Engine', 'Requests', 'BeautifulSoup', 'Internal SEO Scoring']
+            : [];
+        const apiUsed = (data.data?.api_used && data.data.api_used.length) ? data.data.api_used : inferredCrawlStack;
+        const premiumApis = data.data?.premium_apis || [];
+        const missingKeys = data.data?.missing_api_keys || (data.missing_key ? [data.missing_key] : []);
+        const fallbackPremiumApis = premiumApis.length ? premiumApis : (missingKeys.length
+            ? Array.from(new Set(missingKeys.map(function(key) { return mapMissingKeyToService(key); }))).map(function(service) {
+                return { service: service, status: 'Not Connected' };
+            })
+            : []);
+        const apiUsedMarkup = apiUsed.length
+            ? `<ul class="api-key-list text-sm font-semibold text-slate-900">${apiUsed.map(function(item) {
+                return `<li>${escapeHtml(item)}</li>`;
+            }).join('')}</ul>`
+            : '<div class="summary-card-value result-summary-card-value text-sm font-semibold text-slate-900">None</div>';
+        return `
+            <div class="summary-grid">
+                <div class="summary-card result-summary-card rounded-xl border border-slate-200 bg-white p-4">
+                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Data Sources</div>
+                    <div class="mt-2">${renderSourceStatusList(dataSources)}</div>
+                </div>
+                <div class="summary-card result-summary-card rounded-xl border border-slate-200 bg-white p-4">
+                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">API Used</div>
+                    <div class="mt-2">${apiUsedMarkup}</div>
+                </div>
+                <div class="summary-card result-summary-card rounded-xl border border-slate-200 bg-white p-4">
+                    <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Premium APIs</div>
+                    <div class="mt-2">${renderPremiumApiCard(fallbackPremiumApis)}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderAnalyticsCards(analysis) {
+        const cards = [
+            { label: 'Impressions', value: analysis.impressions },
+            { label: 'Clicks', value: analysis.clicks },
+            { label: 'Engagement', value: analysis.engagement },
+            { label: 'Conversions', value: analysis.conversions },
+            { label: 'CTR', value: `${formatValue(analysis.ctr)}%` },
+            { label: 'Engagement Rate', value: `${formatValue(analysis.engagement_rate)}%` },
+            { label: 'Conversion Rate', value: `${formatValue(analysis.conversion_rate)}%` }
+        ];
+        return renderKeyValueGrid(cards);
+    }
+
+    function renderGenericData(data) {
+        if (!data || typeof data !== 'object') {
+            return `<div class="text-sm text-slate-500">No data available.</div>`;
+        }
+        return Object.keys(data).map(function(key) {
+            const value = data[key];
+            if (['context', 'api_used', 'missing_api_keys', 'data_source'].includes(key)) {
+                return '';
+            }
+            if (Array.isArray(value) && value.every(function(item) { return typeof item === 'object' && item !== null; })) {
+                return cardSection(formatLabel(key), renderTable(value));
+            }
+            if (Array.isArray(value)) {
+                return cardSection(formatLabel(key), renderBulletList(value, 'fa-circle', 'text-slate-400'));
+            }
+            if (typeof value === 'object' && value !== null) {
+                return cardSection(formatLabel(key), renderKeyValueGrid(Object.keys(value).map(function(subKey) {
+                    return { label: formatLabel(subKey), value: value[subKey] };
+                })));
+            }
+            return cardSection(formatLabel(key), `<div class="text-sm text-slate-700">${escapeHtml(formatValue(value))}</div>`);
+        }).join('');
+    }
+
+    function getScoreTone(score) {
+        if (score >= 90) return 'good';
+        if (score >= 80) return 'info';
+        if (score >= 70) return 'warn';
+        if (score >= 50) return 'warn';
+        return 'danger';
+    }
+
+    let latestKeywordOpportunityRows = [];
+
+    function applyKeywordResearchFilters() {
+        const search = (document.getElementById('keyword-search')?.value || '').toLowerCase();
+        const intent = document.getElementById('intent-filter')?.value || '';
+        const type = document.getElementById('type-filter')?.value || '';
+        const funnel = document.getElementById('funnel-filter')?.value || '';
+        const priority = document.getElementById('priority-filter')?.value || '';
+        const filtered = latestKeywordOpportunityRows.filter(function(row) {
+            return (!search || String(row.keyword || '').toLowerCase().includes(search))
+                && (!intent || row.search_intent === intent)
+                && (!type || row.keyword_type === type)
+                && (!funnel || row.funnel_stage === funnel)
+                && (!priority || row.relevance_priority === priority);
+        });
+        const body = document.getElementById('keyword-opportunity-body');
+        if (body) body.innerHTML = renderKeywordOpportunityRows(filtered);
+    }
+
+    function exportKeywordResearchCsv() {
+        const csv = keywordRowsToCsv(latestKeywordOpportunityRows);
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'keyword-opportunities.csv';
+        link.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function copyKeyword(keyword) {
+        navigator.clipboard?.writeText(keyword);
+    }
+
+    function renderAgentSpecificView(agentId, data) {
+        const payload = data.data || data || {};
+        if (!data.success) {
+            return [
+                renderSummaryBanner(data),
+                cardSection('Error', `
+                    <div class="space-y-2 text-sm text-slate-700">
+                        <div><span class="font-semibold text-slate-900">Message:</span> ${escapeHtml(data.message || data.error || 'Unable to complete the request.')}</div>
+                        ${data.missing_key ? `<div><span class="font-semibold text-slate-900">Missing Key:</span> ${escapeHtml(data.missing_key)}</div>` : ''}
+                        ${data.missing_field ? `<div><span class="font-semibold text-slate-900">Missing Field:</span> ${escapeHtml(data.missing_field)}</div>` : ''}
+                    </div>
+                `, { toneClass: 'bg-rose-50 border-rose-200' })
+            ].join('');
+        }
+
+        if (agentId === 'keyword_research') {
+            latestKeywordOpportunityRows = payload.keyword_opportunities || [];
+            return renderKeywordResearchView(data, payload);
+        }
+        if (agentId === 'keyword_clustering') {
+            return renderKeywordClusteringView(data, payload);
+        }
+
+        const sections = [renderSummaryBanner(data)];
+
+        if (agentId === 'technical_audit') {
+            sections.push(cardSection('Overview', renderMetricCards([
+                { label: 'Pages Crawled', value: payload.overview?.pages_crawled },
+                { label: 'Crawl Duration', value: payload.overview?.crawl_duration_ms, meta: 'ms' },
+                { label: 'Issue Groups', value: (payload.overview?.critical_issue_groups || 0) + (payload.overview?.warning_groups || 0) },
+                { label: 'Priority Fixes', value: payload.overview?.priority_fix_count },
+                { label: 'Top Issue', value: payload.technical_summary?.top_issue }
+            ])));
+            sections.push(cardSection('SEO Score', `
+                <div class="grid gap-4 md:grid-cols-[minmax(0,220px)_1fr]">
+                    <div class="rounded-xl border border-slate-200 bg-white p-5">
+                        <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Overall Score</div>
+                        <div class="mt-2 text-4xl font-semibold text-slate-900">${escapeHtml(formatValue(payload.seo_score))}<span class="text-lg text-slate-500">/100</span></div>
+                        <div class="mt-3">${renderBadge(payload.seo_status || 'Unknown', getScoreTone(Number(payload.seo_score || 0)))}</div>
+                    </div>
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-5">
+                        <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Assessment</div>
+                        <div class="mt-2 text-sm leading-6 text-slate-700">
+                            ${escapeHtml(payload.technical_summary?.executive_note || 'Technical assessment generated from live crawl data.')}
+                        </div>
+                    </div>
+                </div>
+            `));
+            sections.push(cardSection('Critical Errors', renderIssueGroups(payload.critical_errors), { badge: String((payload.critical_errors || []).length) }));
+            sections.push(cardSection('Warnings', renderIssueGroups(payload.warnings), { badge: String((payload.warnings || []).length) }));
+            sections.push(cardSection('Passed Checks', renderPassedChecks(payload.passed_checks)));
+            sections.push(cardSection('Technical Metrics', renderMetricCards([
+                { label: 'Pages Indexed', value: payload.technical_metrics?.pages_indexable },
+                { label: 'Broken Links', value: payload.technical_metrics?.broken_links },
+                { label: 'Redirect Chains', value: payload.technical_metrics?.redirect_chains },
+                { label: 'Canonical Errors', value: payload.technical_metrics?.canonical_errors },
+                { label: 'Duplicate Titles', value: payload.technical_metrics?.duplicate_titles },
+                { label: 'Duplicate Meta', value: payload.technical_metrics?.duplicate_meta_descriptions },
+                { label: 'Missing H1', value: payload.technical_metrics?.missing_h1 },
+                { label: 'Missing H2', value: payload.technical_metrics?.missing_h2 },
+                { label: 'Images Crawled', value: payload.technical_metrics?.images_total },
+                { label: 'Images Missing ALT', value: payload.technical_metrics?.images_missing_alt },
+                { label: 'Structured Data Pages', value: payload.technical_metrics?.structured_data_pages },
+                { label: 'Avg Response Time', value: payload.technical_metrics?.average_response_time_ms, meta: 'ms' },
+                { label: 'Avg Page Size', value: payload.technical_metrics?.average_page_size_kb, meta: 'KB' },
+                { label: 'Core Web Vitals', value: payload.technical_metrics?.core_web_vitals }
+            ])));
+            sections.push(cardSection('Report Transparency', renderTransparencyCards(payload)));
+            if ((payload.unavailable_metrics || []).length) {
+                sections.push(cardSection('Unavailable Metrics', renderBulletList(payload.unavailable_metrics, 'fa-lock', 'text-slate-500')));
+            }
+            if ((payload.score_breakdown || []).length) {
+                sections.push(cardSection('Score Breakdown', renderTable(payload.score_breakdown, ['label', 'earned_points', 'max_points'])));
+            }
+            sections.push(cardSection('Priority Fixes', renderPriorityFixes(payload.priority_fixes)));
+            if (payload.core_web_vitals && Object.keys(payload.core_web_vitals).length) {
+                sections.push(cardSection('Core Web Vitals', renderKeyValueGrid(Object.keys(payload.core_web_vitals).map(function(key) {
+                    return { label: formatLabel(key), value: payload.core_web_vitals[key] };
+                }))));
+            }
+            sections.push(cardSection('Recommendations', renderOrderedList(data.recommendations || payload.recommended_fixes)));
+        } else if (agentId === 'competitor_analysis') {
+            sections.push(cardSection('Executive Summary', renderMetricCards([
+                { label: 'Market Position', value: payload.executive_summary?.market_position, description: (payload.strengths || [])[0] || 'Competitive position based on measurable crawl signals.' },
+                { label: 'Fastest Site', value: shortenUrl(payload.executive_summary?.fastest_site), meta: (payload.competitor_comparison_table || []).find(function(row) { return row.website === payload.executive_summary?.fastest_site; })?.response_time_ms ? `${formatValue((payload.competitor_comparison_table || []).find(function(row) { return row.website === payload.executive_summary?.fastest_site; }).response_time_ms)} ms` : '', description: 'Lowest response time in the comparison set.' },
+                { label: 'Deepest Content', value: shortenUrl(payload.executive_summary?.deepest_content_site), meta: (payload.competitor_comparison_table || []).find(function(row) { return row.website === payload.executive_summary?.deepest_content_site; })?.word_count ? `Average ${formatValue((payload.competitor_comparison_table || []).find(function(row) { return row.website === payload.executive_summary?.deepest_content_site; }).word_count)} words/page` : '', description: 'Most content depth among the crawled pages.' },
+                { label: 'Strongest Internal Linking', value: shortenUrl(payload.executive_summary?.strongest_internal_linking_site), description: 'Best crawl-visible link support for topical authority.' },
+                { label: 'Overall Winner', value: shortenUrl(payload.executive_summary?.fastest_site || payload.executive_summary?.deepest_content_site), description: 'Current leader based on the clearest measurable crawl signals.' }
+            ])));
+            sections.push(cardSection('Report Transparency', renderTransparencyCards(payload)));
+            sections.push(cardSection('Competitor Comparison', renderTable(payload.competitor_comparison_table, ['website', 'status_code', 'https', 'title', 'title_length', 'meta', 'meta_description_length', 'h1', 'h2_count', 'canonical', 'robots', 'schema', 'structured_data', 'internal_links', 'external_links', 'images', 'images_missing_alt', 'word_count', 'response_time_ms', 'page_size_kb'])));
+            sections.push(cardSection('Strengths', renderBulletList(payload.strengths, 'fa-trophy', 'text-emerald-600')));
+            sections.push(cardSection('Weaknesses', renderBulletList(payload.weaknesses, 'fa-circle-exclamation', 'text-rose-600')));
+            sections.push(cardSection('Opportunities', renderBulletList(payload.opportunities, 'fa-lightbulb', 'text-indigo-600')));
+            sections.push(cardSection('Gap Analysis', renderBulletList(payload.gap_analysis, 'fa-chart-column', 'text-sky-600')));
+            sections.push(cardSection('Opportunity Report', renderBulletList(payload.opportunity_report, 'fa-compass', 'text-violet-600')));
+            sections.push(cardSection('Quick Wins', renderOrderedList(payload.quick_wins)));
+            if ((payload.unavailable_metrics || []).length) {
+                sections.push(cardSection('Premium Metrics', renderTable(payload.unavailable_metrics, ['metric', 'status'])));
+            }
+            if ((payload.warnings || []).length) {
+                sections.push(cardSection('Crawl Warnings', renderTable(payload.warnings, ['website', 'status', 'message'])));
+            }
+        } else if (agentId === 'content_gap') {
+            sections.push(cardSection('Coverage Snapshot', renderMetricCards([
+                { label: 'Missing Pages', value: (payload.missing_pages || []).length },
+                { label: 'Missing Topics', value: (payload.missing_topics || []).length },
+                { label: 'Missing FAQs', value: (payload.missing_faqs || []).length },
+                { label: 'Recommended Articles', value: (payload.recommended_articles || []).length }
+            ])));
+            sections.push(cardSection('Missing Pages', renderBulletList(payload.missing_pages, 'fa-file-circle-plus', 'text-indigo-600')));
+            sections.push(cardSection('Missing Topics', renderBulletList(payload.missing_topics, 'fa-lightbulb', 'text-amber-600')));
+            sections.push(cardSection('Missing FAQs', renderBulletList(payload.missing_faqs, 'fa-circle-question', 'text-sky-600')));
+            sections.push(cardSection('Recommended Articles', renderBulletList(payload.recommended_articles, 'fa-pen-nib', 'text-emerald-600')));
+        } else if (agentId === 'serp_analysis') {
+            sections.push(cardSection('SERP Overview', renderMetricCards([
+                { label: 'Search Intent', value: payload.search_intent },
+                { label: 'Top Results', value: (payload.top_results || []).length },
+                { label: 'SERP Features', value: (payload.serp_features || []).length },
+                { label: 'Suggested FAQs', value: (payload.faq_suggestions || []).length }
+            ])));
+            sections.push(cardSection('Top 10 Results', renderTable(payload.top_results, ['position', 'title', 'url', 'snippet'])));
+            sections.push(cardSection('SERP Features', renderBulletList(payload.serp_features, 'fa-layer-group', 'text-indigo-600')));
+            sections.push(cardSection('Recommended Outline', renderOrderedList(payload.recommended_outline)));
+            sections.push(cardSection('Suggested FAQs', renderBulletList(payload.faq_suggestions, 'fa-circle-question', 'text-sky-600')));
+        } else if (agentId === 'content_calendar' || agentId === 'social_calendar') {
+            sections.push(cardSection('Calendar', renderTable(payload.calendar)));
+        } else if (agentId === 'seo_brief') {
+            sections.push(cardSection('SEO Brief', renderGenericData(payload.brief || {})));
+        } else if (agentId === 'blog_writer') {
+            sections.push(cardSection('Article Draft', `
+                <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+                    <div class="text-xl font-semibold text-slate-900">${escapeHtml(payload.draft?.title || 'Untitled Draft')}</div>
+                    <div class="text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(payload.draft?.intro || '')}</div>
+                    ${(payload.draft?.sections || []).map(function(section) {
+                        return `
+                            <div class="border-t border-slate-100 pt-3">
+                                <div class="text-sm font-semibold text-slate-900">${escapeHtml(section.heading || 'Section')}</div>
+                                <div class="mt-1 text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(section.body || '')}</div>
+                            </div>
+                        `;
+                    }).join('')}
+                    <div class="border-t border-slate-100 pt-3 text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(payload.draft?.conclusion || '')}</div>
+                </div>
+            `));
+        } else if (agentId === 'humanizer') {
+            sections.push(cardSection('Before vs After', renderBeforeAfter(payload.humanized || {})));
+            sections.push(cardSection('Editing Notes', renderBulletList(payload.humanized?.editing_notes, 'fa-wand-magic-sparkles', 'text-indigo-600')));
+        } else if (agentId === 'fact_check') {
+            sections.push(cardSection('Fact Review', renderTable(payload.fact_check?.issues, ['type', 'severity', 'note'])));
+            sections.push(cardSection('Confidence', renderKeyValueGrid([
+                { label: 'Risk Level', value: payload.fact_check?.risk_level },
+                { label: 'Approval Status', value: payload.fact_check?.approval_status },
+                { label: 'Citation Needed', value: payload.fact_check?.citation_needed }
+            ])));
+        } else if (agentId === 'publisher' || agentId === 'social_publisher') {
+            const packageData = payload.publishing_package || payload.post_package || {};
+            sections.push(cardSection('Publishing Package', renderGenericData(packageData)));
+            sections.push(cardSection('Checklist', renderChecklist(packageData.checklist || packageData.approval_checklist || [])));
+        } else if (agentId === 'caption') {
+            sections.push(cardSection('Copy-ready Captions', renderPromptCards((payload.captions || []).map(function(item) {
+                return { label: item.platform || 'Caption', value: [item.hook, item.body, item.cta, (item.hashtags || []).join(' ')].filter(Boolean).join('\n\n') };
+            }))));
+        } else if (agentId === 'image_agent') {
+            sections.push(cardSection('Prompt Cards', renderPromptCards([
+                { label: 'Concept', value: payload.creative?.concept || '' },
+                { label: 'Thumbnail Prompt', value: payload.creative?.thumbnail_prompt || '' },
+                { label: 'Banner Idea', value: payload.creative?.banner_idea || '' },
+                { label: 'Alt Text', value: payload.creative?.alt_text || '' }
+            ])));
+            sections.push(cardSection('Design Direction', renderBulletList(payload.creative?.design_direction, 'fa-palette', 'text-indigo-600')));
+        } else if (agentId === 'video_agent') {
+            sections.push(cardSection('Video Script', renderPromptCards([
+                { label: 'Short-form Hook', value: payload.video?.short_form_hook || '' },
+                { label: 'Short Script', value: (payload.video?.short_script || []).join('\n') },
+                { label: 'Long-form Title', value: payload.video?.long_form_title || '' },
+                { label: 'Description', value: payload.video?.description || '' },
+                { label: 'CTA', value: payload.video?.cta || '' }
+            ])));
+            sections.push(cardSection('Shot Ideas', renderBulletList(payload.video?.shot_ideas, 'fa-video', 'text-rose-600')));
+        } else if (agentId === 'analytics') {
+            sections.push(cardSection('KPI Cards', renderAnalyticsCards(payload.analysis || {})));
+            sections.push(cardSection('Performance Snapshot', renderTable([
+                { metric: 'CTR', value: `${formatValue(payload.analysis?.ctr)}%` },
+                { metric: 'Engagement Rate', value: `${formatValue(payload.analysis?.engagement_rate)}%` },
+                { metric: 'Conversion Rate', value: `${formatValue(payload.analysis?.conversion_rate)}%` }
+            ], ['metric', 'value'])));
+            sections.push(cardSection('Recommendations', renderOrderedList(data.recommendations)));
+        } else {
+            sections.push(renderGenericData(payload));
+        }
+
+        if (data.summary) {
+            sections.push(cardSection('Summary', `<div class="text-sm leading-6 text-slate-700">${escapeHtml(data.summary)}</div>`));
+        }
+
+        sections.push(`
+            <div class="flex justify-end">
+                <button type="button" id="toggle-raw-json" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                    <i class="fa-solid fa-code"></i>
+                    View Raw JSON
+                </button>
+            </div>
+        `);
+
+        return sections.join('');
+    }
+
+    function attachRawToggle() {
+        const button = document.getElementById('toggle-raw-json');
+        const wrap = document.getElementById('raw-json-wrap');
+        if (!button || !wrap) return;
+        button.addEventListener('click', function() {
+            const isHidden = wrap.classList.contains('hidden');
+            wrap.classList.toggle('hidden', !isHidden);
+            button.innerHTML = isHidden
+                ? '<i class="fa-solid fa-eye-slash"></i> Hide Raw JSON'
+                : '<i class="fa-solid fa-code"></i> View Raw JSON';
+        });
+    }
+
+    // ── Schema-driven field renderer ────────────────────────────────────────
+    const AGENTS_BY_ID = {};
+    (JSON.parse(document.getElementById('agents-data').textContent || '[]')).forEach(function(agent) {
+        AGENTS_BY_ID[agent.id] = agent;
+    });
+
+    const fieldValues = {};
+    const MULTILINE_TYPES = ['textarea', 'keyword_list', 'url_list', 'multi_select'];
+
+    function optionValue(option) {
+        return typeof option === 'string' ? option : option.value;
+    }
+
+    function optionLabel(option) {
+        return typeof option === 'string' ? option : (option.label || option.value);
+    }
+
+    function nativeInputType(fieldType) {
+        if (fieldType === 'number') return 'number';
+        if (fieldType === 'date') return 'date';
+        if (fieldType === 'month') return 'month';
+        return 'text';
+    }
+
+    function captureFieldValue(field, control) {
+        if (field.type === 'checkbox') {
+            fieldValues[field.id] = control.checked;
+        } else if (field.type === 'multi_select') {
+            fieldValues[field.id] = Array.from(control.selectedOptions).map(function(option) { return option.value; });
+        } else {
+            fieldValues[field.id] = control.value;
+        }
+    }
+
+    function renderField(field) {
+        const wrap = document.createElement('div');
+        wrap.className = MULTILINE_TYPES.includes(field.type) ? 'sm:col-span-2' : '';
+
+        const label = document.createElement('label');
+        label.className = 'block text-sm font-medium text-slate-700 mb-1';
+        label.setAttribute('for', 'field-' + field.id);
+        label.textContent = field.label + (field.required ? ' *' : '');
+        wrap.appendChild(label);
+
+        const hasPreviousValue = Object.prototype.hasOwnProperty.call(fieldValues, field.id);
+        const previousValue = hasPreviousValue ? fieldValues[field.id] : (field.default !== undefined ? field.default : '');
+        const baseClass = 'w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500';
+        let control;
+
+        if (field.type === 'select') {
+            control = document.createElement('select');
+            control.className = baseClass;
+            (field.options || []).forEach(function(option) {
+                const optionEl = document.createElement('option');
+                optionEl.value = optionValue(option);
+                optionEl.textContent = optionLabel(option);
+                control.appendChild(optionEl);
+            });
+            control.value = previousValue || (field.default !== undefined ? field.default : '');
+        } else if (field.type === 'multi_select') {
+            control = document.createElement('select');
+            control.multiple = true;
+            control.className = baseClass + ' h-32';
+            (field.options || []).forEach(function(option) {
+                const optionEl = document.createElement('option');
+                optionEl.value = optionValue(option);
+                optionEl.textContent = optionLabel(option);
+                control.appendChild(optionEl);
+            });
+            const selected = new Set(Array.isArray(previousValue) ? previousValue : []);
+            Array.from(control.options).forEach(function(optionEl) { optionEl.selected = selected.has(optionEl.value); });
+        } else if (field.type === 'checkbox') {
+            control = document.createElement('input');
+            control.type = 'checkbox';
+            control.className = 'h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500';
+            control.checked = hasPreviousValue ? Boolean(previousValue) : Boolean(field.default);
+        } else if (field.type === 'textarea' || field.type === 'keyword_list' || field.type === 'url_list') {
+            control = document.createElement('textarea');
+            control.className = baseClass;
+            control.rows = 4;
+            control.value = Array.isArray(previousValue) ? previousValue.join('\n') : (previousValue || '');
+        } else {
+            control = document.createElement('input');
+            control.type = nativeInputType(field.type);
+            control.className = baseClass;
+            control.value = previousValue || '';
+            if (field.min !== undefined) control.min = field.min;
+            if (field.max !== undefined) control.max = field.max;
+        }
+
+        control.id = 'field-' + field.id;
+        control.name = field.id;
+        control.dataset.fieldId = field.id;
+        control.dataset.fieldType = field.type;
+        if (field.placeholder && 'placeholder' in control) control.placeholder = field.placeholder;
+        if (field.required && field.type !== 'checkbox') control.required = true;
+
+        control.addEventListener('input', function() { captureFieldValue(field, control); });
+        control.addEventListener('change', function() { captureFieldValue(field, control); });
+        wrap.appendChild(control);
+
+        if (field.help_text) {
+            const help = document.createElement('p');
+            help.className = 'mt-1 text-xs text-slate-500';
+            help.textContent = field.help_text;
+            wrap.appendChild(help);
+        }
+
+        return wrap;
+    }
+
+    function renderFieldsForAgent(agentId) {
+        const container = document.getElementById('agent-fields-container');
+        container.innerHTML = '';
+        const agent = AGENTS_BY_ID[agentId];
+        const schema = (agent && agent.input_schema) || [];
+        if (!schema.length) {
+            console.warn('Agent "' + agentId + '" has no input fields configured.');
+            return;
+        }
+        const seenIds = new Set();
+        schema.forEach(function(field) {
+            if (seenIds.has(field.id)) return;
+            seenIds.add(field.id);
+            container.appendChild(renderField(field));
+        });
+    }
+
+    function selectAgent(agentId) {
+        document.getElementById('agent').value = agentId;
+        document.querySelectorAll('.agent-card').forEach(function(card) {
+            const isActive = card.dataset.agentId === agentId;
+            card.classList.toggle('border-indigo-400', isActive);
+            card.classList.toggle('shadow-sm', isActive);
+        });
+        renderFieldsForAgent(agentId);
+    }
+
+    document.getElementById('agent').addEventListener('change', function() { renderFieldsForAgent(this.value); });
+    document.querySelectorAll('.agent-card').forEach(function(card) {
+        card.addEventListener('click', function() { selectAgent(this.dataset.agentId); });
+    });
+
+    renderFieldsForAgent(document.getElementById('agent').value);
+    if (window.__SEO_STUDIO_DEV__) {
+        console.log('Schema-driven SEO form renderer loaded');
+    }
+
+    // ── Payload builder ──────────────────────────────────────────────────────
+    function parseListValue(raw) {
+        if (Array.isArray(raw)) return raw.map(function(item) { return String(item).trim(); }).filter(Boolean);
+        return String(raw || '').split(/\r?\n|,/).map(function(item) { return item.trim(); }).filter(Boolean);
+    }
+
+    function collectPayload(agentId) {
+        const container = document.getElementById('agent-fields-container');
+        const payload = { agent: agentId, agent_id: agentId };
+        container.querySelectorAll('[data-field-id]').forEach(function(control) {
+            const id = control.dataset.fieldId;
+            const type = control.dataset.fieldType;
+            if (type === 'checkbox') {
+                payload[id] = control.checked;
+                return;
+            }
+            if (type === 'multi_select') {
+                payload[id] = Array.from(control.selectedOptions).map(function(option) { return option.value; });
+                return;
+            }
+            if (type === 'keyword_list' || type === 'url_list') {
+                payload[id] = parseListValue(control.value);
+                return;
+            }
+            if (type === 'number') {
+                if (control.value === '') return;
+                payload[id] = Number(control.value);
+                return;
+            }
+            if (control.value === '' && !control.required) return;
+            payload[id] = control.value;
+        });
+        return payload;
+    }
+
+    document.getElementById('agent-form').addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const selectedAgent = document.getElementById('agent').value;
+        const payload = collectPayload(selectedAgent);
+
+        document.getElementById('result-status').textContent = 'Running...';
+        document.getElementById('result-empty').classList.add('hidden');
+        document.getElementById('result-view').classList.remove('hidden');
+        document.getElementById('result-view').innerHTML = cardSection('Processing', '<div class="flex items-center gap-3 text-sm text-slate-600"><i class="fa-solid fa-spinner animate-spin text-indigo-600"></i><span>Sending request and waiting for a structured response...</span></div>');
+        document.getElementById('raw-json-wrap').classList.add('hidden');
+        document.getElementById('result-output').textContent = '';
+
+        try {
+            const response = await fetch('/run-agent', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            document.getElementById('result-status').textContent = data.success ? 'Success' : 'Error';
+            document.getElementById('result-output').textContent = JSON.stringify(data, null, 2);
+            document.getElementById('result-view').innerHTML = renderAgentSpecificView(selectedAgent, data);
+            attachRawToggle();
+        } catch (error) {
+            const data = { success: false, message: error.message || 'Request failed.', data: {} };
+            document.getElementById('result-status').textContent = 'Error';
+            document.getElementById('result-output').textContent = JSON.stringify(data, null, 2);
+            document.getElementById('result-view').innerHTML = renderAgentSpecificView(selectedAgent, data);
+            attachRawToggle();
+        }
+    });
+</script>

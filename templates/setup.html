@@ -1,0 +1,333 @@
+{% extends "layout.html" %}
+
+{% block title %}Setup Tracker Configuration{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+    <div class="mb-8">
+        <h2 class="text-2xl font-bold text-slate-900">Configure Mention Analysis</h2>
+        <p class="text-sm text-slate-500 mt-1">Set up your brand parameters, keywords, and API authentication details to run the analysis.</p>
+    </div>
+
+    <form id="setup-form" class="space-y-8 bg-white border border-slate-200 rounded-xl shadow-sm p-6 md:p-8">
+        
+        <!-- Section A: DataForSEO Credentials -->
+        <div>
+            <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                <i class="fa-solid fa-key text-blue-500 text-base"></i>
+                Section A: DataForSEO Credentials
+            </h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+                <div>
+                    <label for="api_login" class="block text-sm font-medium text-slate-700 mb-1">API Login <span class="text-red-500">*</span></label>
+                    <input type="text" id="api_login" name="api_login" placeholder="your-dataforseo-login@email.com" required
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="api_password" class="block text-sm font-medium text-slate-700 mb-1">API Password <span class="text-red-500">*</span></label>
+                    <input type="password" id="api_password" name="api_password" placeholder="••••••••" required
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+            </div>
+            <p class="mt-2 text-xs text-slate-500">
+                <i class="fa-solid fa-circle-info mr-1"></i>
+                Get your API key at <a href="https://dataforseo.com" target="_blank" class="text-blue-600 hover:underline font-medium">dataforseo.com</a>. You can use <code class="bg-slate-100 px-1 py-0.5 rounded text-red-600">mock</code> as login and password for testing.
+            </p>
+        </div>
+
+        <!-- Section B: Your Brand -->
+        <div>
+            <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                <i class="fa-solid fa-copyright text-blue-500 text-base"></i>
+                Section B: Your Brand
+            </h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+                <div>
+                    <label for="brand_domain" class="block text-sm font-medium text-slate-700 mb-1">Brand Domain <span class="text-red-500">*</span></label>
+                    <input type="text" id="brand_domain" name="brand_domain" placeholder="example.com" required
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="brand_name" class="block text-sm font-medium text-slate-700 mb-1">Brand Name <span class="text-red-500">*</span></label>
+                    <input type="text" id="brand_name" name="brand_name" placeholder="Your Brand" required
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="country" class="block text-sm font-medium text-slate-700 mb-1">Target Country <span class="text-red-500">*</span></label>
+                    <select id="country" name="country" class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                        <option value="India" selected>India</option>
+                        <option value="United States">United States</option>
+                        <option value="United Kingdom">United Kingdom</option>
+                        <option value="Canada">Canada</option>
+                        <option value="Australia">Australia</option>
+                        <option value="Germany">Germany</option>
+                        <option value="France">France</option>
+                        <option value="Japan">Japan</option>
+                        <option value="Brazil">Brazil</option>
+                        <option value="Singapore">Singapore</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="language" class="block text-sm font-medium text-slate-700 mb-1">Language <span class="text-red-500">*</span></label>
+                    <select id="language" name="language" class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                        <option value="en" selected>English (en)</option>
+                        <option value="es">Spanish (es)</option>
+                        <option value="de">German (de)</option>
+                        <option value="fr">French (fr)</option>
+                        <option value="ja">Japanese (ja)</option>
+                        <option value="pt">Portuguese (pt)</option>
+                        <option value="it">Italian (it)</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Section C: Competitor Domains -->
+        <div>
+            <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+                <h3 class="text-lg font-semibold text-slate-900 flex items-center gap-2">
+                    <i class="fa-solid fa-users-rectangle text-blue-500 text-base"></i>
+                    Section C: Competitor Domains
+                </h3>
+                <button type="button" id="add-competitor-btn" class="text-sm font-medium text-blue-600 hover:text-blue-700 flex items-center gap-1">
+                    <i class="fa-solid fa-plus"></i> Add Competitor
+                </button>
+            </div>
+            
+            <div id="competitors-container" class="mt-4 space-y-3">
+                <!-- Dynamically populated row 1 -->
+                <div class="flex items-center gap-3 competitor-row">
+                    <input type="text" name="competitors[]" placeholder="competitor1.com"
+                           class="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <button type="button" class="remove-competitor-btn p-2 text-slate-400 hover:text-red-500 transition-colors" title="Remove competitor">
+                        <i class="fa-solid fa-trash-can"></i>
+                    </button>
+                </div>
+                <!-- Row 2 -->
+                <div class="flex items-center gap-3 competitor-row">
+                    <input type="text" name="competitors[]" placeholder="competitor2.com"
+                           class="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <button type="button" class="remove-competitor-btn p-2 text-slate-400 hover:text-red-500 transition-colors" title="Remove competitor">
+                        <i class="fa-solid fa-trash-can"></i>
+                    </button>
+                </div>
+                <!-- Row 3 -->
+                <div class="flex items-center gap-3 competitor-row">
+                    <input type="text" name="competitors[]" placeholder="competitor3.com"
+                           class="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <button type="button" class="remove-competitor-btn p-2 text-slate-400 hover:text-red-500 transition-colors" title="Remove competitor">
+                        <i class="fa-solid fa-trash-can"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Section D: Keywords to Track -->
+        <div>
+            <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                <i class="fa-solid fa-tags text-blue-500 text-base"></i>
+                Section D: Keywords to Track
+            </h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+                <div>
+                    <label for="high_volume_keywords" class="block text-sm font-medium text-slate-700 mb-1">High-Volume Keywords <span class="text-xs text-slate-400">(one per line)</span></label>
+                    <textarea id="high_volume_keywords" name="high_volume_keywords" rows="5" placeholder="best marketing analytics platform&#10;top CRM software solution"
+                              class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all resize-none font-mono text-sm"></textarea>
+                </div>
+                <div>
+                    <label for="brand_keywords" class="block text-sm font-medium text-slate-700 mb-1">Brand/Niche Keywords <span class="text-xs text-slate-400">(one per line)</span></label>
+                    <textarea id="brand_keywords" name="brand_keywords" rows="5" placeholder="audilysis reviews&#10;audilysis vs competitors"
+                              class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all resize-none font-mono text-sm"></textarea>
+                </div>
+            </div>
+        </div>
+
+        <!-- Section E: Email Settings (OPTIONAL) -->
+        <div>
+            <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                <i class="fa-solid fa-envelope text-blue-500 text-base"></i>
+                Section E: Email Settings <span class="text-xs font-normal text-slate-400 ml-1">(Optional)</span>
+            </h3>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
+                <div>
+                    <label for="smtp_host" class="block text-sm font-medium text-slate-700 mb-1">SMTP Host</label>
+                    <input type="text" id="smtp_host" name="smtp_host" placeholder="smtp.gmail.com" value="smtp.gmail.com"
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="smtp_port" class="block text-sm font-medium text-slate-700 mb-1">SMTP Port</label>
+                    <input type="number" id="smtp_port" name="smtp_port" placeholder="587" value="587"
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="sender_email" class="block text-sm font-medium text-slate-700 mb-1">Sender Email</label>
+                    <input type="email" id="sender_email" name="sender_email" placeholder="you@gmail.com"
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div class="md:col-span-2">
+                    <label for="sender_password" class="block text-sm font-medium text-slate-700 mb-1">Sender App Password</label>
+                    <input type="password" id="sender_password" name="sender_password" placeholder="••••••••••••••••"
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label for="recipient_emails" class="block text-sm font-medium text-slate-700 mb-1">Recipient Email(s)</label>
+                    <input type="text" id="recipient_emails" name="recipient_emails" placeholder="recipient@email.com"
+                           class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                </div>
+            </div>
+            
+            <div class="mt-4 flex items-center gap-2">
+                <input type="checkbox" id="email_automatically" name="email_automatically" value="true"
+                       class="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 transition-all">
+                <label for="email_automatically" class="text-sm font-medium text-slate-700">Email report automatically when the run finishes</label>
+            </div>
+            
+            <p class="mt-2 text-xs text-slate-500">
+                <i class="fa-solid fa-lightbulb text-amber-500 mr-1"></i>
+                <strong>For Gmail or Outlook:</strong> Create an <strong>App Password</strong> (not your normal account password) and paste it here. SMTP configurations are strictly held in-session and never written to disk.
+            </p>
+        </div>
+
+        <!-- Section F: Submit -->
+        <div class="pt-4 border-t border-slate-100 flex justify-end">
+            <button type="submit" class="w-full md:w-auto px-8 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2">
+                <i class="fa-solid fa-play text-xs"></i>
+                Run Audilysis 2.0 Tracker
+            </button>
+        </div>
+    </form>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const container = document.getElementById("competitors-container");
+    const addBtn = document.getElementById("add-competitor-btn");
+    
+    // Add competitor input row
+    addBtn.addEventListener("click", () => {
+        const div = document.createElement("div");
+        div.className = "flex items-center gap-3 competitor-row";
+        div.innerHTML = `
+            <input type="text" name="competitors[]" placeholder="competitor.com"
+                   class="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+            <button type="button" class="remove-competitor-btn p-2 text-slate-400 hover:text-red-500 transition-colors" title="Remove competitor">
+                <i class="fa-solid fa-trash-can"></i>
+            </button>
+        `;
+        container.appendChild(div);
+    });
+
+    // Remove competitor row (delegated event)
+    container.addEventListener("click", (e) => {
+        const removeBtn = e.target.closest(".remove-competitor-btn");
+        if (removeBtn) {
+            const row = removeBtn.closest(".competitor-row");
+            if (row) {
+                row.remove();
+            }
+        }
+    });
+
+    // Form validation and submit
+    const form = document.getElementById("setup-form");
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        
+        // Clear previous notifications/errors if any
+        
+        // Basic parameters
+        const brandDomain = document.getElementById("brand_domain").value.trim();
+        const brandName = document.getElementById("brand_name").value.trim();
+        const country = document.getElementById("country").value;
+        const language = document.getElementById("language").value;
+        
+        const apiLogin = document.getElementById("api_login").value.trim();
+        const apiPassword = document.getElementById("api_password").value.trim();
+        
+        // Competitors
+        const competitorInputs = document.getElementsByName("competitors[]");
+        const competitors = [];
+        competitorInputs.forEach(input => {
+            const val = input.value.trim();
+            if (val) competitors.push(val);
+        });
+
+        // Keywords
+        const hvKws = document.getElementById("high_volume_keywords").value.split("\n").map(k => k.trim()).filter(k => k);
+        const bKws = document.getElementById("brand_keywords").value.split("\n").map(k => k.trim()).filter(k => k);
+        const keywords = [...hvKws, ...bKws];
+
+        // Email settings
+        const smtpHost = document.getElementById("smtp_host").value.trim();
+        const smtpPort = document.getElementById("smtp_port").value.trim();
+        const senderEmail = document.getElementById("sender_email").value.trim();
+        const senderPassword = document.getElementById("sender_password").value.trim();
+        const recipientEmails = document.getElementById("recipient_emails").value.trim();
+        const emailAutomatically = document.getElementById("email_automatically").checked;
+
+        // Validations
+        if (!brandDomain || !brandName || !apiLogin || !apiPassword) {
+            alert("Please fill in all required brand and credentials fields.");
+            return;
+        }
+
+        if (keywords.length === 0) {
+            alert("Please enter at least one keyword in the high-volume or brand/niche textareas.");
+            return;
+        }
+
+        if (emailAutomatically) {
+            if (!smtpHost || !smtpPort || !senderEmail || !senderPassword || !recipientEmails) {
+                alert("Please fill in all SMTP Host, Port, Sender details, and Recipient Email(s) when automatic emailing is enabled.");
+                return;
+            }
+        }
+
+        // Construct config
+        const payload = {
+            credentials: {
+                login: apiLogin,
+                password: apiPassword
+            },
+            config: {
+                brand_domain: brandDomain,
+                brand_name: brandName,
+                country: country,
+                language: language,
+                competitors: competitors,
+                keywords: keywords
+            },
+            email_settings: {
+                smtp_host: smtpHost,
+                smtp_port: smtpPort,
+                sender_email: senderEmail,
+                sender_password: senderPassword,
+                recipient_emails: recipientEmails,
+                email_automatically: emailAutomatically
+            }
+        };
+
+        try {
+            const response = await fetch("/api/run", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+            if (response.ok && data.status === "success") {
+                // Redirect to running progress screen
+                window.location.href = "/running";
+            } else {
+                alert("Setup failed: " + (data.message || "Unknown error"));
+            }
+        } catch (err) {
+            alert("Error sending settings: " + err.message);
+        }
+    });
+});
+</script>
+{% endblock %}

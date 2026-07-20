@@ -1,0 +1,77 @@
+{% extends 'layout.html' %}
+
+{% block title %}SEO Reports{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">SEO Tools</p>
+        <h2 class="text-2xl font-semibold text-slate-900">SEO Reports</h2>
+        <p class="mt-2 text-sm text-slate-600">Choose a reporting workflow for weekly and monthly SEO performance summaries.</p>
+    </div>
+
+    <div class="agent-page-equal-col">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <div class="flex items-center gap-2 text-indigo-600 mb-3">
+                <i class="fa-solid fa-calendar-week"></i>
+                <h3 class="text-lg font-semibold text-slate-900">Weekly Report Agent</h3>
+            </div>
+            <p class="text-sm text-slate-600">Summarize weekly SEO changes, wins, and the next optimization steps.</p>
+            <form id="weekly-report-form" class="mt-4 space-y-4">
+                <input id="weekly_website_url" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="https://example.com">
+                <input id="weekly_keyword" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="digital marketing agency">
+                <button type="submit" class="w-full rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white">Run Weekly Report</button>
+            </form>
+            <pre id="weekly-output" class="result-code-block mt-4 min-h-32 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">{}</pre>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <div class="flex items-center gap-2 text-indigo-600 mb-3">
+                <i class="fa-solid fa-calendar-days"></i>
+                <h3 class="text-lg font-semibold text-slate-900">Monthly Report Agent</h3>
+            </div>
+            <p class="text-sm text-slate-600">Compile a concise monthly SEO snapshot with goals, progress, and next actions.</p>
+            <form id="monthly-report-form" class="mt-4 space-y-4">
+                <input id="monthly_website_url" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="https://example.com">
+                <input id="monthly_keyword" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="seo agency">
+                <button type="submit" class="w-full rounded-lg bg-slate-800 px-4 py-2.5 text-sm font-semibold text-white">Run Monthly Report</button>
+            </form>
+            <pre id="monthly-output" class="result-code-block mt-4 min-h-32 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">{}</pre>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('weekly-report-form').addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const payload = {
+            agent: 'weekly_report',
+            website_url: document.getElementById('weekly_website_url').value,
+            keyword: document.getElementById('weekly_keyword').value
+        };
+        const response = await fetch('/run-agent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        document.getElementById('weekly-output').textContent = JSON.stringify(data, null, 2);
+    });
+
+    document.getElementById('monthly-report-form').addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const payload = {
+            agent: 'monthly_report',
+            website_url: document.getElementById('monthly_website_url').value,
+            keyword: document.getElementById('monthly_keyword').value
+        };
+        const response = await fetch('/run-agent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        document.getElementById('monthly-output').textContent = JSON.stringify(data, null, 2);
+    });
+</script>
+{% endblock %}

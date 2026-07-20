@@ -1,0 +1,11 @@
+{% extends 'layout.html' %}
+
+{% block title %}SEO Agent Studio{% endblock %}
+
+{% block content %}
+{% set studio_label = 'SEO AI Agents' %}
+{% set studio_heading = 'Run modular SEO workflows directly in Audilysis' %}
+{% set studio_description = 'Select an agent, provide campaign context, and receive a structured recommendation payload.' %}
+{% set form_agent_label = 'SEO Agent' %}
+{% include '_agent_studio.html' %}
+{% endblock %}

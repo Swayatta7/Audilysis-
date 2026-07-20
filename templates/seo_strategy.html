@@ -1,0 +1,66 @@
+{% extends 'layout.html' %}
+
+{% block title %}SEO Strategy{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto space-y-6">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">SEO Tools</p>
+        <h2 class="text-2xl font-semibold text-slate-900">SEO Strategy</h2>
+        <p class="mt-2 text-sm text-slate-600">Create a long-term SEO strategy aligned to your business goals and target market.</p>
+    </div>
+
+    <div class="agent-page-two-col">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <div class="flex items-center gap-2 text-indigo-600 mb-4">
+                <i class="fa-solid fa-bullseye"></i>
+                <h3 class="text-lg font-semibold text-slate-900">Strategy Agent</h3>
+            </div>
+            <form id="strategy-form" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Website URL</label>
+                    <input id="strategy_website_url" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="https://example.com">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Keyword</label>
+                    <input id="strategy_keyword" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="digital marketing agency">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Business Goal</label>
+                    <input id="strategy_goal" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Generate SEO leads">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Location</label>
+                    <input id="strategy_location" type="text" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="United States">
+                </div>
+                <button type="submit" class="w-full rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white">Run Strategy</button>
+            </form>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+            <h3 class="text-lg font-semibold text-slate-900 mb-2">Strategy Output</h3>
+            <pre id="strategy-output" class="result-code-block min-h-72 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">{}</pre>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('strategy-form').addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const payload = {
+            agent: 'strategy',
+            website_url: document.getElementById('strategy_website_url').value,
+            keyword: document.getElementById('strategy_keyword').value,
+            business_goal: document.getElementById('strategy_goal').value,
+            location: document.getElementById('strategy_location').value
+        };
+        const response = await fetch('/run-agent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        document.getElementById('strategy-output').textContent = JSON.stringify(data, null, 2);
+    });
+</script>
+{% endblock %}

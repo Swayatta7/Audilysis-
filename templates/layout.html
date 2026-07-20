@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audilysis 2.0 — AI Mention Tracker</title>
+    <!-- Google Fonts Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        brand: {
+                            50: '#f0f3ff',
+                            100: '#e1e7fe',
+                            200: '#c8d4fe',
+                            300: '#a3b7fc',
+                            400: '#7992fa',
+                            50: '#4361ee', // Custom accent
+                            600: '#2b3ff2',
+                            700: '#1e2bd9',
+                            800: '#1b23af',
+                            900: '#1a1f8b',
+                            dark: '#1a1a2e',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+</head>
+<body class="h-full flex flex-col md:flex-row overflow-hidden text-slate-800">
+    <!-- Sidebar -->
+    <aside class="w-full md:w-64 bg-brand-dark text-slate-100 flex flex-col flex-shrink-0 z-30">
+        <!-- Logo Header -->
+        <div class="h-16 flex items-center justify-between px-6 border-b border-slate-800">
+            <a href="/" class="flex items-center gap-2 font-extrabold text-xl tracking-tight">
+                <span class="bg-gradient-to-r from-blue-500 to-indigo-400 bg-clip-text text-transparent">Audilysis</span>
+                <span class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded-full font-semibold">2.0</span>
+            </a>
+            <button class="md:hidden text-slate-400 hover:text-white" id="mobile-menu-btn">
+                <i class="fa-solid fa-bars text-xl"></i>
+            </button>
+        </div>
+        
+        <!-- Navigation Links -->
+        <nav class="flex-1 px-4 py-6 space-y-2 overflow-y-auto" id="sidebar-nav">
+            <a href="/setup" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                <i class="fa-solid fa-square-plus text-slate-400 group-hover:text-blue-400 text-base"></i>
+                Run New Tracker
+            </a>
+            <a href="/dashboard" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                <i class="fa-solid fa-chart-line text-slate-400 group-hover:text-blue-400 text-base"></i>
+                Dashboard View
+            </a>
+
+            <div class="pt-3 mt-2 border-t border-slate-800">
+                <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">SEO Agents</p>
+                <a href="/agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                    <i class="fa-solid fa-robot text-slate-400 group-hover:text-blue-400 text-base"></i>
+                    SEO Agent Studio
+                </a>
+                <a href="/seo-reports" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                    <i class="fa-solid fa-file-lines text-slate-400 group-hover:text-blue-400 text-base"></i>
+                    SEO Reports
+                </a>
+                <a href="/seo-strategy" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                    <i class="fa-solid fa-bullseye text-slate-400 group-hover:text-blue-400 text-base"></i>
+                    SEO Strategy
+                </a>
+            </div>
+
+            <div class="pt-3 mt-2 border-t border-slate-800">
+                <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">Content Agents</p>
+                <a href="/content-agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                    <i class="fa-solid fa-pen-nib text-slate-400 group-hover:text-blue-400 text-base"></i>
+                    Content Agent Studio
+                </a>
+            </div>
+
+            <div class="pt-3 mt-2 border-t border-slate-800">
+                <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">Social Agents</p>
+                <a href="/social-agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
+                    <i class="fa-solid fa-share-nodes text-slate-400 group-hover:text-blue-400 text-base"></i>
+                    Social Agent Studio
+                </a>
+            </div>
+        </nav>
+
+        <!-- Sidebar Footer -->
+        <div class="p-6 border-t border-slate-800 text-xs text-slate-500 space-y-1">
+            <p class="font-medium text-slate-400">Audilysis 2.0</p>
+            <p>AI Mention Tracker</p>
+            <p class="mt-2 text-[10px]">Cross-Platform Engine</p>
+        </div>
+    </aside>
+
+    <!-- Main Content Container -->
+    <div class="flex-1 flex flex-col overflow-hidden">
+        <!-- Top Bar (Header) -->
+        <header class="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-6 md:px-8 flex-shrink-0">
+            <div class="flex items-center gap-2">
+                <h1 class="text-lg font-semibold text-slate-900">
+                    {% block title %}Brand Mentions{% endblock %}
+                </h1>
+            </div>
+            <div class="flex items-center gap-4">
+                <span class="text-xs px-2.5 py-1 font-medium bg-emerald-50 text-emerald-700 rounded-full border border-emerald-200 flex items-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    API Connected
+                </span>
+            </div>
+        </header>
+
+        <!-- Page Content -->
+        <main class="flex-1 overflow-y-auto p-6 md:p-8 bg-slate-50">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    <!-- Mobile Menu Toggle Script -->
+    <script>
+        document.getElementById('mobile-menu-btn')?.addEventListener('click', function() {
+            const nav = document.getElementById('sidebar-nav');
+            nav.classList.toggle('hidden');
+        });
+    </script>
+</body>
+</html>

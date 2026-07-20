@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audilysis 2.0 AI Mention Report — {{ run.brand_domain }}</title>
+    <!-- Google Fonts Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        mark {
+            background-color: rgba(253, 224, 71, 0.4);
+            color: #1e293b;
+            font-weight: 600;
+            border-radius: 0.25rem;
+            padding: 0.1rem 0.25rem;
+            border: 1px solid rgba(234, 179, 8, 0.3);
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 p-6 md:p-12">
+    <div class="max-w-6xl mx-auto space-y-8">
+        
+        <!-- Header -->
+        <div class="bg-slate-900 text-white rounded-2xl p-6 md:p-8 shadow-md flex flex-col md:flex-row md:items-center justify-between gap-6">
+            <div>
+                <span class="text-xs px-2.5 py-1 bg-blue-600 text-white font-semibold rounded-full uppercase tracking-wider">Audilysis 2.0 Report</span>
+                <h1 class="text-2xl md:text-3xl font-extrabold mt-2">{{ run.brand_name }} ({{ run.brand_domain }})</h1>
+                <p class="text-sm text-slate-400 mt-2">
+                    Report generated on <strong class="text-white">{{ run.run_date }}</strong>
+                </p>
+            </div>
+            <div class="text-left md:text-right text-xs text-slate-400 space-y-1">
+                <p>Target Country: <strong class="text-white">{{ run.country }}</strong></p>
+                <p>Language: <strong class="text-white">{{ run.language }}</strong></p>
+                <p>Engine: <strong class="text-white">AI Mention Tracker</strong></p>
+            </div>
+        </div>
+
+        <!-- Executive Summary Section -->
+        <div class="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+            <h2 class="text-lg font-bold text-slate-900 border-b border-slate-100 pb-3 mb-4">Executive Summary</h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-6">
+                <div class="p-4 bg-slate-50 rounded-lg">
+                    <span class="text-xs text-slate-500 font-semibold uppercase block">Total Keywords</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">{{ keywords|length }}</span>
+                </div>
+                <div class="p-4 bg-slate-50 rounded-lg">
+                    <span class="text-xs text-slate-500 font-semibold uppercase block">Platforms Audited</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">5 Platforms</span>
+                </div>
+                <div class="p-4 bg-slate-50 rounded-lg">
+                    <span class="text-xs text-slate-500 font-semibold uppercase block">Brand Mention Rate</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">{{ stat_brand_sov }}%</span>
+                    <span class="text-[10px] text-slate-400">Mentioned in {{ stat_brand_mentions }} of {{ stat_total_checks }} checks</span>
+                </div>
+                <div class="p-4 bg-slate-50 rounded-lg">
+                    <span class="text-xs text-slate-500 font-semibold uppercase block">Top Competitor</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block truncate" title="{{ top_competitor_name }}">{{ top_competitor_name }}</span>
+                    <span class="text-[10px] text-slate-400">{{ top_competitor_mentions }} mentions across run</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Mention Heatmap Grid -->
+        <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div class="p-5 border-b border-slate-100 bg-slate-50">
+                <h3 class="font-bold text-slate-900">Mention Heatmap</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse text-sm">
+                    <thead>
+                        <tr class="bg-slate-100 border-b border-slate-200 text-slate-600 font-semibold">
+                            <th class="px-6 py-4">Keyword</th>
+                            <th class="px-6 py-4 text-center">Google AI</th>
+                            <th class="px-6 py-4 text-center">ChatGPT</th>
+                            <th class="px-6 py-4 text-center">Perplexity</th>
+                            <th class="px-6 py-4 text-center">Gemini</th>
+                            <th class="px-6 py-4 text-center">Claude</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100">
+                        {% for kw in keywords %}
+                        <tr>
+                            <td class="px-6 py-4 font-medium text-slate-800">{{ kw }}</td>
+                            {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
+                                {% set res = heatmap_data[kw][platform] %}
+                                <td class="px-4 py-4 text-center">
+                                    {% if res is none %}
+                                        <span class="inline-block px-3 py-1 bg-slate-200 text-slate-600 rounded text-xs font-semibold">Error</span>
+                                    {% elif res.mentioned %}
+                                        <span class="inline-block px-3 py-1 bg-emerald-500 text-white rounded text-xs font-bold">
+                                            Mentioned {% if res.position %}(L{{ res.position|round|int }}){% endif %}
+                                        </span>
+                                    {% else %}
+                                        <span class="inline-block px-3 py-1 bg-rose-500 text-white rounded text-xs font-semibold">No Mention</span>
+                                    {% endif %}
+                                </td>
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Charts Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+                <h3 class="font-bold text-slate-900 mb-4">Competitor Share of Voice</h3>
+                <div class="h-64"><canvas id="exportSOV"></canvas></div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+                <h3 class="font-bold text-slate-900 mb-4">Platform Breakdown</h3>
+                <div class="h-64"><canvas id="exportPlatform"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Sources Table -->
+        <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div class="p-5 border-b border-slate-100 bg-slate-50">
+                <h3 class="font-bold text-slate-900">Sources Cited</h3>
+            </div>
+            <table class="w-full text-left border-collapse text-sm">
+                <thead>
+                    <tr class="bg-slate-100 border-b border-slate-200 text-slate-600 font-semibold">
+                        <th class="px-6 py-3">Keyword</th>
+                        <th class="px-6 py-3">Platform</th>
+                        <th class="px-6 py-3">Cited URLs</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                    {% for res in results %}
+                    {% if res.sources_cited %}
+                    <tr>
+                        <td class="px-6 py-4 font-medium text-slate-800">{{ res.keyword }}</td>
+                        <td class="px-6 py-4 font-mono text-xs uppercase">{{ res.platform }}</td>
+                        <td class="px-6 py-4">
+                            <div class="flex flex-col gap-1 text-xs">
+                                {% for url in res.sources_cited %}
+                                    <span class="{% if run.brand_domain.lower() in url.lower() %}text-emerald-600 font-bold{% else %}text-slate-600{% endif %}">
+                                        {{ url }}
+                                    </span>
+                                {% endfor %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <!-- Embedded data scripts -->
+    <script id="exp-metrics" type="application/json">{{ metrics|tojson }}</script>
+    <script id="exp-platform" type="application/json">{{ platform_breakdown|tojson }}</script>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const brandDomain = "{{ run.brand_domain }}";
+
+            // Share of voice chart
+            const metrics = JSON.parse(document.getElementById("exp-metrics").textContent || "[]");
+            const sovCtx = document.getElementById("exportSOV");
+            if (sovCtx && metrics.length > 0) {
+                metrics.sort((a,b) => b.total_mentions - a.total_mentions);
+                new Chart(sovCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: metrics.map(m => m.domain),
+                        datasets: [{
+                            data: metrics.map(m => m.total_mentions),
+                            backgroundColor: metrics.map(m => m.domain.toLowerCase() === brandDomain.toLowerCase() ? '#4361ee' : '#a3b7fc'),
+                            borderRadius: 4
+                        }]
+                    },
+                    options: {
+                        indexAxis: 'y',
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: { x: { ticks: { stepSize: 1 } } }
+                    }
+                });
+            }
+
+            // Platform breakdown
+            const platformData = JSON.parse(document.getElementById("exp-platform").textContent || "{}");
+            const platCtx = document.getElementById("exportPlatform");
+            if (platCtx) {
+                new Chart(platCtx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: ['Google AI', 'ChatGPT', 'Perplexity', 'Gemini', 'Claude'],
+                        datasets: [{
+                            data: ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'].map(k => platformData[k] || 0),
+                            backgroundColor: ['#4285F4', '#10a37f', '#19c37d', '#1a73e8', '#d97706']
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: 'bottom' } }
+                    }
+                });
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+{% extends "layout.html" %}
+
+{% block title %}Running Tracker{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+    <!-- Header -->
+    <div class="p-6 md:p-8 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+        <div>
+            <h2 class="text-xl font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-spinner animate-spin text-blue-500"></i>
+                Audilysis Tracker Active
+            </h2>
+            <p class="text-xs text-slate-500 mt-1">Analyzing search layouts and LLM responses for brand mentions...</p>
+        </div>
+        <button id="cancel-btn" class="px-4 py-2 border border-slate-300 text-slate-700 font-medium text-sm rounded-lg hover:bg-slate-50 transition-colors">
+            Cancel Run
+        </button>
+    </div>
+
+    <!-- Progress Body -->
+    <div class="p-6 md:p-8 space-y-6">
+        <!-- Progress Bar & Details -->
+        <div>
+            <div class="flex items-center justify-between mb-2 text-sm font-semibold">
+                <span id="progress-percentage" class="text-blue-600">0% Complete</span>
+                <span id="progress-steps" class="text-slate-500">0 / 0 Tasks Done</span>
+            </div>
+            <div class="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
+                <div id="progress-bar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+            <div class="flex justify-between items-center mt-2 text-xs text-slate-400">
+                <span id="estimated-time">Estimating time remaining...</span>
+                <span>Seq-Scan Active</span>
+            </div>
+        </div>
+
+        <!-- Log Area -->
+        <div>
+            <h3 class="text-sm font-semibold text-slate-700 mb-2">Real-Time Execution Logs</h3>
+            <div id="log-box" class="h-80 bg-slate-900 text-slate-300 p-4 rounded-lg font-mono text-xs overflow-y-auto space-y-1.5 scrollbar-thin">
+                <div class="text-blue-400">[SYSTEM] Starting engine session...</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const logBox = document.getElementById("log-box");
+    const progressBar = document.getElementById("progress-bar");
+    const progressPercentage = document.getElementById("progress-percentage");
+    const progressSteps = document.getElementById("progress-steps");
+    const estimatedTime = document.getElementById("estimated-time");
+    const cancelBtn = document.getElementById("cancel-btn");
+
+    let eventSource = new EventSource("/stream");
+    let startTime = Date.now();
+
+    // Utility to add a log line
+    function addLog(text, type = "normal") {
+        const line = document.createElement("div");
+        if (type === "error") {
+            line.className = "text-red-400";
+        } else if (type === "success") {
+            line.className = "text-emerald-400";
+        } else if (type === "system") {
+            line.className = "text-blue-400";
+        } else {
+            line.className = "text-slate-300";
+        }
+        line.textContent = text;
+        logBox.appendChild(line);
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        // Update progress bar
+        const percent = Math.round(data.progress);
+        progressBar.style.width = `${percent}%`;
+        progressPercentage.textContent = `${percent}% Complete`;
+        progressSteps.textContent = `${data.current_step} / ${data.total_steps} API checks`;
+
+        // Update logs
+        if (data.message) {
+            let logType = "normal";
+            if (data.message.includes("✓ mentioned")) {
+                logType = "success";
+            } else if (data.message.includes("not mentioned")) {
+                logType = "normal";
+            } else if (data.message.includes("error") || data.message.includes("failed")) {
+                logType = "error";
+            } else if (data.message.includes("Emailing")) {
+                logType = "system";
+            }
+            addLog(data.message, logType);
+        }
+
+        // Calculate estimated time remaining
+        if (data.current_step > 0 && percent < 100) {
+            const elapsed = (Date.now() - startTime) / 1000; // in seconds
+            const avgTimePerStep = elapsed / data.current_step;
+            const remainingSteps = data.total_steps - data.current_step;
+            const remainingSeconds = Math.round(remainingSteps * avgTimePerStep);
+            
+            if (remainingSeconds > 60) {
+                const mins = Math.floor(remainingSeconds / 60);
+                const secs = remainingSeconds % 60;
+                estimatedTime.textContent = `Estimated remaining: ${mins}m ${secs}s`;
+            } else {
+                estimatedTime.textContent = `Estimated remaining: ${remainingSeconds}s`;
+            }
+        }
+
+        // Check overall completion state
+        if (data.status === "completed") {
+            addLog("[SYSTEM] Execution finished successfully. Redirecting to dashboard...", "system");
+            eventSource.close();
+            setTimeout(() => {
+                window.location.href = data.redirect_url;
+            }, 1500);
+        } else if (data.status === "error") {
+            addLog("[ERROR] Engine failure: " + data.error_message, "error");
+            eventSource.close();
+            alert("Execution stopped: " + data.error_message);
+        }
+    };
+
+    eventSource.onerror = (err) => {
+        // Since EventSource retries automatically, we close on error to avoid looping
+        addLog("[ERROR] Lost connection to server stream.", "error");
+        eventSource.close();
+    };
+
+    // Cancel Button click
+    cancelBtn.addEventListener("click", async () => {
+        if (confirm("Are you sure you want to cancel the current mention tracker run?")) {
+            addLog("[SYSTEM] Cancelling run...", "error");
+            eventSource.close();
+            try {
+                const response = await fetch("/api/cancel", { method: "POST" });
+                if (response.ok) {
+                    addLog("[SYSTEM] Run cancelled. Redirecting back to setup...", "system");
+                }
+            } catch (e) {
+                console.error("Cancel API failed", e);
+            }
+            setTimeout(() => {
+                window.location.href = "/setup";
+            }, 1000);
+        }
+    });
+});
+</script>
+{% endblock %}

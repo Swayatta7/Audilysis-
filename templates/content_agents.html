@@ -1,0 +1,11 @@
+{% extends 'layout.html' %}
+
+{% block title %}Content Agent Studio{% endblock %}
+
+{% block content %}
+{% set studio_label = 'Content AI Agents' %}
+{% set studio_heading = 'Plan, brief, draft, polish, verify, and package content' %}
+{% set studio_description = 'Use content marketing agents to turn audience, keyword, brand, and business context into structured publishing assets.' %}
+{% set form_agent_label = 'Content Agent' %}
+{% include '_agent_studio.html' %}
+{% endblock %}
