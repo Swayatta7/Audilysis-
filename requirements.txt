@@ -2,3 +2,7 @@ flask
 requests
 reportlab
 matplotlib
+beautifulsoup4
+gunicorn
+youtube-transcript-api==1.2.4
+python-dotenv

@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import time
 import uuid
@@ -18,6 +19,15 @@ from db.storage import (
 from api.dataforseo import query_platform
 from services.mailer import send_report_email
 from services.pdf_generator import generate_pdf_report
+from services.youtube_transcript_service import (
+    YouTubeTranscriptError,
+    build_download_from_url,
+    fetch_transcript,
+    get_languages,
+    get_youtube_transcript_api_version,
+    translate_existing_payload,
+)
+from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
     SEO_GROUP,
@@ -28,7 +38,8 @@ from agents.agent_manager import (
 )
 
 app = Flask(__name__)
-app.secret_key = "audilysis_secure_session_key_2.0"
+app.secret_key = get_env_value("FLASK_SECRET_KEY") or os.urandom(32)
+init_db()
 
 # Thread-safe tracker cancellation map
 cancelled_runs = set()
@@ -143,6 +154,16 @@ def setup():
 def favicon():
     """Prevent browser favicon requests from generating noisy 404 logs."""
     return Response(status=204)
+
+
+def youtube_transcript_error_response(error):
+    """Return user-safe JSON errors for the YouTube transcript feature."""
+    return jsonify({
+        "success": False,
+        "status": "error",
+        "error": getattr(error, "error_code", "transcript_error"),
+        "message": str(error),
+    }), getattr(error, "status_code", 400)
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
@@ -414,6 +435,71 @@ def social_agents_page():
     return render_template("social_agents.html", agents=get_agents_by_group(SOCIAL_GROUP))
 
 
+@app.route("/youtube-multilingual-transcripter")
+def youtube_multilingual_transcripter_page():
+    """YouTube multilingual transcript tool UI."""
+    return render_template("youtube_multilingual_transcripter.html")
+
+
+@app.route("/api/youtube-transcript/health")
+def youtube_transcript_health():
+    """Health endpoint for the YouTube transcript feature."""
+    return jsonify({
+        "success": True,
+        "status": "ok",
+        "service": "youtube_transcript",
+        "youtube_transcript_api_version": get_youtube_transcript_api_version(),
+        "translation_provider": "google_cloud_translation",
+    })
+
+
+@app.route("/api/youtube-transcript/languages")
+def youtube_transcript_languages():
+    """Return backend-controlled supported translation languages."""
+    return jsonify({
+        "success": True,
+        "languages": get_languages(),
+    })
+
+
+@app.route("/api/youtube-transcript/generate", methods=["POST"])
+def youtube_transcript_generate():
+    """Fetch a real YouTube transcript and optionally translate it."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = fetch_transcript(payload.get("url", ""), payload.get("target_language", "original"))
+    except YouTubeTranscriptError as error:
+        return youtube_transcript_error_response(error)
+    return jsonify({"success": True, "transcript": result})
+
+
+@app.route("/api/youtube-transcript/translate", methods=["POST"])
+def youtube_transcript_translate():
+    """Translate existing normalized transcript segments with Google Translation."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = translate_existing_payload(payload)
+    except YouTubeTranscriptError as error:
+        return youtube_transcript_error_response(error)
+    return jsonify({"success": True, "translation": result})
+
+
+@app.route("/api/youtube-transcript/download/<path:video_id>")
+def youtube_transcript_download(video_id):
+    """Download a validated transcript as TXT, SRT, JSON, or VTT."""
+    target_language = request.args.get("lang", "original")
+    fmt = request.args.get("format", "txt")
+    try:
+        content, mimetype, filename = build_download_from_url(video_id, target_language, fmt)
+    except YouTubeTranscriptError as error:
+        return youtube_transcript_error_response(error)
+    return Response(
+        content,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 @app.route("/seo-reports")
 def seo_reports_page():
     """SEO reports page showing reporting agents."""
@@ -627,4 +713,5 @@ if __name__ == "__main__":
     threading.Thread(target=open_browser, args=(port,), daemon=True).start()
     
     # Start Flask (Local-only binding)
-    app.run(host=host, port=port, debug=True, use_reloader=False)
+    debug_enabled = get_env_value("FLASK_DEBUG").lower() in {"1", "true", "yes", "on"}
+    app.run(host=host, port=port, debug=debug_enabled, use_reloader=False)

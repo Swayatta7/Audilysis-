@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV='/home/zebratech/Pictures/Audylysis 3 testing codex 2/.venv'
+VIRTUAL_ENV='/home/zebratech/Pictures/Audylysis 3 testing codex 3 (work on this only)/.venv'
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

@@ -1,0 +1,266 @@
+{% extends "layout.html" %}
+
+{% block title %}Free YouTube Multilingual Transcripter{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+    <section class="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
+        <div class="flex flex-col lg:flex-row lg:items-end gap-4">
+            <div class="flex-1">
+                <label for="youtube-url" class="block text-sm font-semibold text-slate-700 mb-2">YouTube URL</label>
+                <div class="relative">
+                    <i class="fa-brands fa-youtube absolute left-4 top-1/2 -translate-y-1/2 text-red-500"></i>
+                    <input id="youtube-url" type="text" maxlength="512" class="w-full pl-11 pr-4 py-3 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500" placeholder="https://www.youtube.com/watch?v=...">
+                </div>
+            </div>
+            <div class="w-full lg:w-72">
+                <label for="target-language" class="block text-sm font-semibold text-slate-700 mb-2">Target Language</label>
+                <select id="target-language" class="w-full px-4 py-3 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                    <option value="original">Original Language</option>
+                </select>
+            </div>
+            <button id="generate-transcript" type="button" class="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800 transition-colors">
+                <i class="fa-solid fa-closed-captioning"></i>
+                Generate Transcript
+            </button>
+        </div>
+    </section>
+
+    <div id="transcript-alert" class="hidden rounded-lg border p-4 text-sm"></div>
+
+    <section id="empty-state" class="bg-white border border-dashed border-slate-300 rounded-xl p-10 text-center">
+        <div class="mx-auto h-12 w-12 rounded-full bg-red-50 text-red-500 flex items-center justify-center">
+            <i class="fa-brands fa-youtube text-xl"></i>
+        </div>
+        <h2 class="mt-4 text-lg font-semibold text-slate-900">Free YouTube Multilingual Transcripter</h2>
+        <p class="mt-2 text-sm text-slate-500 max-w-2xl mx-auto">Paste a public YouTube URL to fetch real caption data, keep timestamps intact, and translate with Google Cloud Translation when requested.</p>
+    </section>
+
+    <section id="loading-state" class="hidden bg-white border border-slate-200 rounded-xl shadow-sm p-8">
+        <div class="flex items-center gap-4">
+            <div class="h-10 w-10 rounded-full border-4 border-slate-200 border-t-blue-600 animate-spin"></div>
+            <div>
+                <h2 class="text-base font-semibold text-slate-900">Fetching transcript</h2>
+                <p class="text-sm text-slate-500">Requesting real caption segments from the backend.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="result-state" class="hidden space-y-6">
+        <div class="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
+            <div class="flex flex-col lg:flex-row gap-5">
+                <img id="video-thumbnail" class="w-full lg:w-56 aspect-video object-cover rounded-lg border border-slate-200 bg-slate-100" alt="Video thumbnail">
+                <div class="flex-1 min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span id="translation-status" class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200"></span>
+                        <span id="generation-status" class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200"></span>
+                    </div>
+                    <h2 id="video-title" class="mt-3 text-xl font-semibold text-slate-900 break-words">YouTube Video</h2>
+                    <dl class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div class="rounded-lg border border-slate-200 p-3">
+                            <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Source</dt>
+                            <dd id="source-language" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                        </div>
+                        <div class="rounded-lg border border-slate-200 p-3">
+                            <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Segments</dt>
+                            <dd id="segment-count" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                        </div>
+                        <div class="rounded-lg border border-slate-200 p-3">
+                            <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Words</dt>
+                            <dd id="word-count" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                        </div>
+                        <div class="rounded-lg border border-slate-200 p-3">
+                            <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Duration</dt>
+                            <dd id="duration" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                        </div>
+                    </dl>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 px-5 py-4 border-b border-slate-200">
+                <div class="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+                    <button type="button" data-view="segments" class="view-toggle px-3 py-1.5 rounded-md text-sm font-semibold bg-white text-slate-900 shadow-sm">Segments</button>
+                    <button type="button" data-view="plain" class="view-toggle px-3 py-1.5 rounded-md text-sm font-semibold text-slate-500">Plain Text</button>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="copy-transcript" type="button" class="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                        <i class="fa-solid fa-copy"></i>
+                        Copy
+                    </button>
+                    <button data-download-format="txt" type="button" class="download-btn inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 hover:bg-slate-50">TXT</button>
+                    <button data-download-format="srt" type="button" class="download-btn inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 hover:bg-slate-50">SRT</button>
+                    <button data-download-format="json" type="button" class="download-btn inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 hover:bg-slate-50">JSON</button>
+                    <button data-download-format="vtt" type="button" class="download-btn inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 hover:bg-slate-50">VTT</button>
+                </div>
+            </div>
+            <div id="segments-view" class="max-h-[560px] overflow-y-auto divide-y divide-slate-100"></div>
+            <pre id="plain-view" class="hidden max-h-[560px] overflow-y-auto whitespace-pre-wrap p-5 text-sm leading-7 text-slate-700 font-sans"></pre>
+        </div>
+    </section>
+</div>
+
+<script>
+(() => {
+    const state = { transcript: null, view: 'segments' };
+    const urlInput = document.getElementById('youtube-url');
+    const languageSelect = document.getElementById('target-language');
+    const generateButton = document.getElementById('generate-transcript');
+    const alertBox = document.getElementById('transcript-alert');
+    const emptyState = document.getElementById('empty-state');
+    const loadingState = document.getElementById('loading-state');
+    const resultState = document.getElementById('result-state');
+    const segmentsView = document.getElementById('segments-view');
+    const plainView = document.getElementById('plain-view');
+
+    function setText(id, value) {
+        document.getElementById(id).textContent = value == null ? '' : String(value);
+    }
+
+    function showAlert(type, message) {
+        alertBox.className = `rounded-lg border p-4 text-sm ${type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`;
+        alertBox.textContent = message;
+        alertBox.classList.remove('hidden');
+    }
+
+    function hideAlert() {
+        alertBox.classList.add('hidden');
+        alertBox.textContent = '';
+    }
+
+    function setLoading(isLoading) {
+        generateButton.disabled = isLoading;
+        generateButton.innerHTML = isLoading ? '<span class="h-4 w-4 rounded-full border-2 border-white/40 border-t-white animate-spin"></span> Generating' : '<i class="fa-solid fa-closed-captioning"></i> Generate Transcript';
+        loadingState.classList.toggle('hidden', !isLoading);
+        emptyState.classList.toggle('hidden', isLoading || Boolean(state.transcript));
+    }
+
+    async function loadLanguages() {
+        const response = await fetch('/api/youtube-transcript/languages');
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.message || 'Unable to load languages.');
+        }
+        languageSelect.textContent = '';
+        data.languages.forEach((item) => {
+            const option = document.createElement('option');
+            option.value = item.code;
+            option.textContent = item.code === 'original' ? item.name : `${item.name} (${item.code})`;
+            languageSelect.appendChild(option);
+        });
+    }
+
+    function formatTime(seconds) {
+        const total = Math.max(0, Math.floor(Number(seconds) || 0));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+        if (hours) return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+
+    function renderTranscript(transcript) {
+        state.transcript = transcript;
+        hideAlert();
+        emptyState.classList.add('hidden');
+        resultState.classList.remove('hidden');
+        document.getElementById('video-thumbnail').src = transcript.thumbnail_url || '';
+        setText('video-title', transcript.video_title || 'YouTube Video');
+        setText('translation-status', transcript.translated ? `Translated to ${transcript.target_language_name}` : 'Original transcript');
+        setText('generation-status', transcript.is_generated ? 'Auto-generated captions' : 'Manual captions');
+        setText('source-language', transcript.source_language_name || transcript.source_language || 'Unknown');
+        setText('segment-count', transcript.segment_count);
+        setText('word-count', transcript.word_count);
+        setText('duration', formatTime(transcript.duration));
+
+        segmentsView.textContent = '';
+        plainView.textContent = '';
+        const plainLines = [];
+        transcript.segments.forEach((segment) => {
+            const row = document.createElement('div');
+            row.className = 'grid grid-cols-[72px_minmax(0,1fr)] gap-4 px-5 py-3 hover:bg-slate-50';
+            const time = document.createElement('div');
+            time.className = 'text-xs font-semibold text-blue-600 tabular-nums pt-1';
+            time.textContent = formatTime(segment.start);
+            const text = document.createElement('div');
+            text.className = 'text-sm leading-6 text-slate-700 break-words';
+            text.textContent = segment.text || '';
+            row.append(time, text);
+            segmentsView.appendChild(row);
+            plainLines.push(`[${formatTime(segment.start)}] ${segment.text || ''}`);
+        });
+        plainView.textContent = plainLines.join('\n');
+        switchView(state.view);
+    }
+
+    function switchView(view) {
+        state.view = view;
+        segmentsView.classList.toggle('hidden', view !== 'segments');
+        plainView.classList.toggle('hidden', view !== 'plain');
+        document.querySelectorAll('.view-toggle').forEach((button) => {
+            const active = button.dataset.view === view;
+            button.classList.toggle('bg-white', active);
+            button.classList.toggle('text-slate-900', active);
+            button.classList.toggle('shadow-sm', active);
+            button.classList.toggle('text-slate-500', !active);
+        });
+    }
+
+    async function generateTranscript() {
+        hideAlert();
+        resultState.classList.add('hidden');
+        state.transcript = null;
+        setLoading(true);
+        try {
+            const response = await fetch('/api/youtube-transcript/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: urlInput.value,
+                    target_language: languageSelect.value || 'original'
+                })
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) {
+                throw new Error(data.message || 'Transcript generation failed.');
+            }
+            renderTranscript(data.transcript);
+            showAlert('success', 'Transcript generated successfully.');
+        } catch (error) {
+            emptyState.classList.remove('hidden');
+            showAlert('error', error.message || 'Transcript generation failed.');
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    async function copyTranscript() {
+        if (!state.transcript) return;
+        await navigator.clipboard.writeText(plainView.textContent || '');
+        showAlert('success', 'Transcript copied to clipboard.');
+    }
+
+    function downloadTranscript(format) {
+        if (!state.transcript) return;
+        const lang = encodeURIComponent(state.transcript.target_language || 'original');
+        const videoId = encodeURIComponent(state.transcript.video_id);
+        window.location.href = `/api/youtube-transcript/download/${videoId}?format=${encodeURIComponent(format)}&lang=${lang}`;
+    }
+
+    generateButton.addEventListener('click', generateTranscript);
+    urlInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') generateTranscript();
+    });
+    document.querySelectorAll('.view-toggle').forEach((button) => {
+        button.addEventListener('click', () => switchView(button.dataset.view));
+    });
+    document.getElementById('copy-transcript').addEventListener('click', copyTranscript);
+    document.querySelectorAll('.download-btn').forEach((button) => {
+        button.addEventListener('click', () => downloadTranscript(button.dataset.downloadFormat));
+    });
+
+    loadLanguages().catch((error) => showAlert('error', error.message));
+})();
+</script>
+{% endblock %}

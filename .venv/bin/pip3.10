@@ -1,5 +1,5 @@
 #!/bin/sh
-'''exec' "/home/zebratech/Pictures/Audylysis 3 testing codex 2/.venv/bin/python" "$0" "$@"
+'''exec' "/home/zebratech/Pictures/Audylysis 3 testing codex 3 (work on this only)/.venv/bin/python3" "$0" "$@"
 ' '''
 # -*- coding: utf-8 -*-
 import re

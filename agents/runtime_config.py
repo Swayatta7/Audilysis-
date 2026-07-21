@@ -1,4 +1,11 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 
 REQUIRED_ENV_KEYS = [
@@ -11,6 +18,14 @@ REQUIRED_ENV_KEYS = [
     "AHREFS_API_KEY",
     "MOZ_API_KEY",
     "OPENAI_API_KEY",
+    "FLASK_SECRET_KEY",
+    "FLASK_DEBUG",
+    "GOOGLE_TRANSLATE_API_KEY",
+    "WEBSHARE_PROXY_USERNAME",
+    "WEBSHARE_PROXY_PASSWORD",
+    "YOUTUBE_PROXY_HTTP_URL",
+    "YOUTUBE_PROXY_HTTPS_URL",
+    "AUDILYSIS_TRANSCRIPT_DEBUG",
 ]
 
 

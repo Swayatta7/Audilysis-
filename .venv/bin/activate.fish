@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV '/home/zebratech/Pictures/Audylysis 3 testing codex 2/.venv'
+set -gx VIRTUAL_ENV '/home/zebratech/Pictures/Audylysis 3 testing codex 3 (work on this only)/.venv'
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH
