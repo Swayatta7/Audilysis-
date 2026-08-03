@@ -1,0 +1,1 @@
+from services.glossary import get_technical_glossary

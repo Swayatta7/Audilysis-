@@ -24,9 +24,11 @@ from services.youtube_transcript_service import (
     build_download_from_url,
     fetch_transcript,
     get_languages,
+    get_proxy_diagnostics,
     get_youtube_transcript_api_version,
     translate_existing_payload,
 )
+from services.diarization import get_speaker_detection_diagnostics, log_speaker_detection_diagnostics
 from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
@@ -40,6 +42,7 @@ from agents.agent_manager import (
 app = Flask(__name__)
 app.secret_key = get_env_value("FLASK_SECRET_KEY") or os.urandom(32)
 init_db()
+log_speaker_detection_diagnostics()
 
 # Thread-safe tracker cancellation map
 cancelled_runs = set()
@@ -450,6 +453,8 @@ def youtube_transcript_health():
         "service": "youtube_transcript",
         "youtube_transcript_api_version": get_youtube_transcript_api_version(),
         "translation_provider": "google_cloud_translation",
+        "speaker_detection": get_speaker_detection_diagnostics(),
+        "youtube_proxy": get_proxy_diagnostics(),
     })
 
 
@@ -467,7 +472,11 @@ def youtube_transcript_generate():
     """Fetch a real YouTube transcript and optionally translate it."""
     payload = request.get_json(silent=True) or {}
     try:
-        result = fetch_transcript(payload.get("url", ""), payload.get("target_language", "original"))
+        result = fetch_transcript(
+            payload.get("url", ""),
+            payload.get("target_language", "original"),
+            enable_speaker_detection=bool(payload.get("enable_speaker_detection")),
+        )
     except YouTubeTranscriptError as error:
         return youtube_transcript_error_response(error)
     return jsonify({"success": True, "transcript": result})

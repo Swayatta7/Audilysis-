@@ -42,6 +42,14 @@ class FakeAlwaysIpBlockedTranscript(FakeTranscript):
         raise service.IpBlocked("abcDEF123_4")
 
 
+class FakeAlwaysProxyAuthFailingApi:
+    def __init__(self, proxy_config=None):
+        self.proxy_config = proxy_config
+
+    def list(self, video_id):
+        raise service.requests.exceptions.ProxyError("Tunnel connection failed: 407 Proxy Authentication Required")
+
+
 class FakeTranscriptList:
     def __init__(self, transcripts):
         self._transcripts = transcripts
@@ -94,13 +102,16 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
             "YOUTUBE_PROXY_HTTPS_URL": "",
         }, clear=True):
             result = service.fetch_transcript("abcDEF123_4", "original")
-        self.assertEqual(result["segment_count"], 2)
+        self.assertEqual(result["segment_count"], 1)
         self.assertIsNone(FakeNewYouTubeTranscriptApi.instances[0].proxy_config)
 
     def test_webshare_proxy_configuration(self):
         with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
             "WEBSHARE_PROXY_USERNAME": "webshare-user",
             "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
             "YOUTUBE_PROXY_HTTP_URL": "",
             "YOUTUBE_PROXY_HTTPS_URL": "",
         }, clear=True):
@@ -109,12 +120,68 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(proxy_config.proxy_username, "webshare-user")
         self.assertEqual(proxy_config.proxy_password, "webshare-pass")
 
+    def test_webshare_proxy_url_configuration_takes_precedence(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "http://user:pass@proxy.example.test:1234",
+            "WEBSHARE_PROXY_USERNAME": "webshare-user",
+            "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            proxy_config = service.build_proxy_config()
+            diagnostics = service.get_proxy_diagnostics()
+        self.assertIsInstance(proxy_config, service.GenericProxyConfig)
+        self.assertEqual(service.get_proxy_mode(), "webshare_url")
+        self.assertEqual(diagnostics["webshare_proxy_url"], "Configured")
+        self.assertNotIn("user:pass", str(diagnostics))
+
+    def test_webshare_proxy_configuration_accepts_optional_host_and_port(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
+            "WEBSHARE_PROXY_USERNAME": "webshare-user",
+            "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "proxy.example.test",
+            "WEBSHARE_PROXY_PORT": "1234",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            proxy_config = service.build_proxy_config()
+            diagnostics = service.get_proxy_diagnostics()
+        self.assertIsInstance(proxy_config, service.WebshareProxyConfig)
+        self.assertEqual(proxy_config.domain_name, "proxy.example.test")
+        self.assertEqual(proxy_config.proxy_port, 1234)
+        self.assertEqual(diagnostics["webshare_host"], "Configured")
+        self.assertEqual(diagnostics["webshare_port"], "Configured")
+
+    def test_proxy_diagnostics_reports_webshare_without_secret_values(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
+            "WEBSHARE_PROXY_USERNAME": "webshare-user",
+            "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            diagnostics = service.get_proxy_diagnostics()
+        self.assertEqual(diagnostics["mode"], "webshare")
+        self.assertTrue(diagnostics["available"])
+        self.assertEqual(diagnostics["webshare_username"], "Configured")
+        self.assertEqual(diagnostics["webshare_password"], "Configured")
+        self.assertNotIn("webshare-user", str(diagnostics))
+        self.assertNotIn("webshare-pass", str(diagnostics))
+
     @patch.object(service, "YouTubeTranscriptApi")
     def test_webshare_proxy_is_passed_to_youtube_api(self, transcript_api):
         transcript_api.return_value.list.return_value = FakeTranscriptList([FakeTranscript()])
         with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
             "WEBSHARE_PROXY_USERNAME": "webshare-user",
             "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
             "YOUTUBE_PROXY_HTTP_URL": "",
             "YOUTUBE_PROXY_HTTPS_URL": "",
         }, clear=True):
@@ -136,8 +203,11 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
 
     def test_missing_optional_proxy_credentials_do_not_break_direct_mode(self):
         with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
             "WEBSHARE_PROXY_USERNAME": "webshare-user",
             "WEBSHARE_PROXY_PASSWORD": "",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
             "YOUTUBE_PROXY_HTTP_URL": "",
             "YOUTUBE_PROXY_HTTPS_URL": "",
         }, clear=True):
@@ -157,6 +227,24 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         proxy_config = transcript_api.call_args.kwargs["proxy_config"]
         self.assertIsInstance(proxy_config, service.GenericProxyConfig)
 
+    @patch.object(service, "YouTubeTranscriptApi", FakeAlwaysProxyAuthFailingApi)
+    def test_proxy_authentication_failure_returns_clear_error(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "http://user:pass@proxy.example.test:1234",
+            "WEBSHARE_PROXY_USERNAME": "",
+            "WEBSHARE_PROXY_PASSWORD": "",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        data = response.get_json()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(data["error"], "youtube_proxy_auth_failed")
+        self.assertIn("Proxy authentication failed", data["message"])
+
     @patch.object(service, "YouTubeTranscriptApi")
     def test_generate_original_transcript_without_google_key(self, transcript_api):
         transcript_api.return_value.list.return_value = FakeTranscriptList([FakeTranscript()])
@@ -170,7 +258,76 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertTrue(data["success"])
         self.assertFalse(data["transcript"]["translated"])
         self.assertEqual(data["transcript"]["video_id"], "abcDEF123_4")
-        self.assertEqual(data["transcript"]["segment_count"], 2)
+        self.assertEqual(data["transcript"]["segment_count"], 1)
+        self.assertIn("end", data["transcript"]["segments"][0])
+        self.assertGreater(data["transcript"]["segments"][0]["end"], data["transcript"]["segments"][0]["start"])
+
+    @patch("app.fetch_transcript")
+    def test_generate_passes_optional_speaker_detection_flag(self, fetch_transcript):
+        fetch_transcript.return_value = {
+            "video_id": "abcDEF123_4",
+            "segments": [],
+            "segment_count": 0,
+            "translated": False,
+        }
+        response = self.client.post("/api/youtube-transcript/generate", json={
+            "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+            "target_language": "original",
+            "enable_speaker_detection": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        fetch_transcript.assert_called_once_with(
+            "https://www.youtube.com/watch?v=abcDEF123_4",
+            "original",
+            enable_speaker_detection=True,
+        )
+
+    @patch.object(service, "YouTubeTranscriptApi")
+    @patch("services.diarization.shutil.which", return_value=None)
+    @patch("services.diarization.is_python_module_installed", return_value=False)
+    def test_generate_continues_when_speaker_detection_setup_is_missing(self, _modules, _which, transcript_api):
+        transcript_api.return_value.list.return_value = FakeTranscriptList([FakeTranscript()])
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+                "enable_speaker_detection": True,
+            })
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["transcript"]["speaker_detection"]["status"], "Disabled")
+        self.assertIn("Missing HUGGINGFACE_TOKEN", data["transcript"]["speaker_detection"]["reason"])
+
+    @patch("app.get_speaker_detection_diagnostics")
+    def test_health_reports_speaker_detection_diagnostics(self, diagnostics):
+        diagnostics.return_value = {
+            "available": False,
+            "status": "Disabled",
+            "reason": "Missing HUGGINGFACE_TOKEN",
+        }
+        response = self.client.get("/api/youtube-transcript/health")
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["speaker_detection"]["status"], "Disabled")
+        self.assertEqual(data["speaker_detection"]["reason"], "Missing HUGGINGFACE_TOKEN")
+
+    def test_health_reports_proxy_diagnostics(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
+            "WEBSHARE_PROXY_USERNAME": "webshare-user",
+            "WEBSHARE_PROXY_PASSWORD": "webshare-pass",
+            "WEBSHARE_PROXY_HOST": "",
+            "WEBSHARE_PROXY_PORT": "",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            response = self.client.get("/api/youtube-transcript/health")
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["youtube_proxy"]["mode"], "webshare")
+        self.assertEqual(data["youtube_proxy"]["webshare_password"], "Configured")
+        self.assertNotIn("webshare-pass", str(data["youtube_proxy"]))
 
     @patch.object(service, "YouTubeTranscriptApi")
     def test_missing_google_key_only_blocks_translation(self, transcript_api):
@@ -189,7 +346,7 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         transcript_api.return_value.list.return_value = FakeTranscriptList([FakeTranscript()])
         post.return_value = Mock(status_code=200)
         post.return_value.json.return_value = {
-            "data": {"translations": [{"translatedText": "Hola mundo"}, {"translatedText": "Transcripcion real"}]}
+            "data": {"translations": [{"translatedText": "Hola mundo. Transcripcion real"}]}
         }
         with patch.dict(os.environ, {"GOOGLE_TRANSLATE_API_KEY": "test-key"}, clear=True):
             response = self.client.post("/api/youtube-transcript/generate", json={
@@ -199,9 +356,8 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         segments = response.get_json()["transcript"]["segments"]
         self.assertEqual(segments[0]["start"], 0.0)
-        self.assertEqual(segments[0]["duration"], 2.5)
-        self.assertEqual(segments[0]["text"], "Hola mundo")
-        self.assertEqual(segments[1]["start"], 2.5)
+        self.assertEqual(segments[0]["end"], 5.5)
+        self.assertEqual(segments[0]["text"], "Hola mundo. Transcripcion real")
 
     @patch.object(service.requests, "post")
     def test_translation_failure_does_not_return_success(self, post):
@@ -332,7 +488,7 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
 
     def test_download_formatters(self):
         segments = [{"start": 3661.234, "duration": 2.5, "text": "Long video text"}]
-        self.assertIn("[01:01:01] Long video text", service.format_transcript_download({
+        self.assertIn("[01:01:01 - 01:01:03] Long video text", service.format_transcript_download({
             "video_id": "abcDEF123_4",
             "target_language": "en",
             "segments": segments,
@@ -348,7 +504,7 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         response = self.client.get("/api/youtube-transcript/download/abcDEF123_4?format=srt&lang=original")
         self.assertEqual(response.status_code, 200)
         self.assertIn("attachment;", response.headers["Content-Disposition"])
-        self.assertIn("1\n00:00:00,000 --> 00:00:02,500", response.data.decode("utf-8"))
+        self.assertIn("1\n00:00:00,000 --> 00:00:05,500", response.data.decode("utf-8"))
 
         response = self.client.get("/api/youtube-transcript/download/abcDEF123_4?format=zip&lang=original")
         self.assertEqual(response.status_code, 400)

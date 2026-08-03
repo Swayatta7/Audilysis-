@@ -15,6 +15,17 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from agents.runtime_config import get_env_value
+from services.subtitle_quality import (
+    format_caption_text,
+    process_transcript_segments,
+    repair_caption_timing,
+    validate_captions,
+)
+from services.diarization import get_diarizer
+from services.translation_quality import (
+    protect_segments_for_translation,
+    restore_translated_segments,
+)
 
 YOUTUBE_TRANSCRIPT_IMPORT_ERROR = None
 try:
@@ -169,6 +180,7 @@ class TranscriptPayload:
     target_language_name: str
     translated: bool
     is_generated: bool
+    speaker_detection: dict
     segments: list[dict]
     thumbnail_url: str
 
@@ -184,6 +196,7 @@ class TranscriptPayload:
             "target_language_name": self.target_language_name,
             "translated": self.translated,
             "is_generated": self.is_generated,
+            "speaker_detection": self.speaker_detection,
             "segment_count": len(self.segments),
             "word_count": word_count(self.segments),
             "duration": duration,
@@ -246,10 +259,10 @@ def extract_video_id(value: str, allow_raw_id: bool = True) -> str:
     return video_id
 
 
-def fetch_transcript(url_or_id: str, target_language: str = "original") -> dict:
+def fetch_transcript(url_or_id: str, target_language: str = "original", enable_speaker_detection: bool = False) -> dict:
     video_id = extract_video_id(url_or_id)
     target_language = validate_language_code(target_language)
-    transcript = _fetch_source_transcript(video_id)
+    transcript = _fetch_source_transcript(video_id, enable_speaker_detection=enable_speaker_detection)
     source_segments = transcript["segments"]
     source_language = transcript["source_language"]
     source_language_name = transcript["source_language_name"]
@@ -269,13 +282,14 @@ def fetch_transcript(url_or_id: str, target_language: str = "original") -> dict:
         target_language_name=LANGUAGE_NAMES.get(effective_language, effective_language),
         translated=translated,
         is_generated=transcript["is_generated"],
+        speaker_detection=transcript.get("speaker_detection") or {"enabled": False, "speaker_labels_available": False, "message": ""},
         segments=segments,
         thumbnail_url=get_thumbnail_url(video_id),
     )
     return payload.to_dict()
 
 
-def _fetch_source_transcript(video_id: str) -> dict:
+def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = False) -> dict:
     if not VIDEO_ID_RE.match(video_id):
         raise ValidationError("The YouTube video ID is invalid.", error_code="invalid_video_id")
 
@@ -333,6 +347,17 @@ def _fetch_source_transcript(video_id: str) -> dict:
             403,
             "youtube_po_token_required",
         ) from exc
+    except requests.exceptions.ProxyError as exc:
+        log_transcript_exception(exc, video_id, "fetch")
+        if is_proxy_authentication_error(exc):
+            raise UpstreamError(
+                "Proxy authentication failed. Check the configured Webshare proxy credentials in the environment.",
+                error_code="youtube_proxy_auth_failed",
+            ) from exc
+        raise UpstreamError(
+            "Could not connect through the configured YouTube proxy.",
+            error_code="youtube_proxy_connection_failed",
+        ) from exc
     except requests.exceptions.ConnectionError as exc:
         log_transcript_exception(exc, video_id, "fetch")
         raise UpstreamError(
@@ -361,7 +386,8 @@ def _fetch_source_transcript(video_id: str) -> dict:
         log_transcript_exception(exc, video_id, "fetch")
         raise UpstreamError("Transcript retrieval failed. Please try another video or try again later.") from exc
 
-    segments = normalize_segments(raw_segments)
+    diarization = get_diarizer(enabled=enable_speaker_detection).apply(normalize_segments(raw_segments), video_id=video_id)
+    segments = diarization.segments
     if not segments:
         raise YouTubeTranscriptError("No transcript segments were found for this video.", 404, "empty_transcript")
 
@@ -370,6 +396,17 @@ def _fetch_source_transcript(video_id: str) -> dict:
         "source_language": source_language,
         "source_language_name": getattr(transcript, "language", "") or LANGUAGE_NAMES.get(source_language, source_language),
         "is_generated": bool(getattr(transcript, "is_generated", False)),
+        "speaker_detection": {
+            "enabled": diarization.enabled,
+            "speaker_labels_available": diarization.speaker_labels_available,
+            "message": diarization.message,
+            "status": diarization.status,
+            "model": diarization.model,
+            "detected_speakers": diarization.detected_speakers,
+            "confidence": diarization.confidence,
+            "reason": diarization.reason,
+            "timings_ms": diarization.timings_ms or {},
+        },
         "segments": segments,
     }
 
@@ -455,7 +492,13 @@ def safe_exception_diagnostic(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
+def is_proxy_authentication_error(exc: Exception) -> bool:
+    return "407" in str(exc) or "Proxy Authentication Required" in str(exc)
+
+
 def get_proxy_mode() -> str:
+    if get_env_value("WEBSHARE_PROXY"):
+        return "webshare_url"
     if get_env_value("WEBSHARE_PROXY_USERNAME") and get_env_value("WEBSHARE_PROXY_PASSWORD"):
         return "webshare"
     if get_env_value("YOUTUBE_PROXY_HTTP_URL") or get_env_value("YOUTUBE_PROXY_HTTPS_URL"):
@@ -463,20 +506,78 @@ def get_proxy_mode() -> str:
     return "direct"
 
 
+def get_proxy_diagnostics() -> dict:
+    webshare_url = bool(get_env_value("WEBSHARE_PROXY"))
+    webshare_username = bool(get_env_value("WEBSHARE_PROXY_USERNAME"))
+    webshare_password = bool(get_env_value("WEBSHARE_PROXY_PASSWORD"))
+    webshare_host = bool(get_env_value("WEBSHARE_PROXY_HOST"))
+    webshare_port = bool(get_env_value("WEBSHARE_PROXY_PORT"))
+    generic_http = bool(get_env_value("YOUTUBE_PROXY_HTTP_URL"))
+    generic_https = bool(get_env_value("YOUTUBE_PROXY_HTTPS_URL"))
+    mode = get_proxy_mode()
+    if mode == "webshare_url":
+        reason = "Webshare proxy URL configured."
+    elif mode == "webshare":
+        reason = "Webshare proxy configured."
+    elif mode == "generic":
+        reason = "Generic proxy configured."
+    elif webshare_username != webshare_password:
+        reason = "Incomplete Webshare proxy credentials."
+    else:
+        reason = "No proxy configured; YouTube transcript requests use direct mode."
+    return {
+        "mode": mode,
+        "webshare_proxy_url": "Configured" if webshare_url else "Missing",
+        "webshare_username": "Configured" if webshare_username else "Missing",
+        "webshare_password": "Configured" if webshare_password else "Missing",
+        "webshare_host": "Configured" if webshare_host else "Default",
+        "webshare_port": "Configured" if webshare_port else "Default",
+        "generic_http_url": "Configured" if generic_http else "Missing",
+        "generic_https_url": "Configured" if generic_https else "Missing",
+        "available": mode != "direct",
+        "reason": reason,
+    }
+
+
 def build_proxy_config():
+    webshare_proxy_url = get_env_value("WEBSHARE_PROXY")
+    if webshare_proxy_url:
+        return GenericProxyConfig(http_url=webshare_proxy_url, https_url=webshare_proxy_url)
+
     webshare_username = get_env_value("WEBSHARE_PROXY_USERNAME")
     webshare_password = get_env_value("WEBSHARE_PROXY_PASSWORD")
     if webshare_username and webshare_password:
-        return WebshareProxyConfig(
-            proxy_username=webshare_username,
-            proxy_password=webshare_password,
-        )
+        kwargs = {
+            "proxy_username": webshare_username,
+            "proxy_password": webshare_password,
+        }
+        webshare_host = get_env_value("WEBSHARE_PROXY_HOST")
+        webshare_port = parse_proxy_port(get_env_value("WEBSHARE_PROXY_PORT"))
+        if webshare_host:
+            kwargs["domain_name"] = webshare_host
+        if webshare_port:
+            kwargs["proxy_port"] = webshare_port
+        return WebshareProxyConfig(**kwargs)
 
     http_url = get_env_value("YOUTUBE_PROXY_HTTP_URL")
     https_url = get_env_value("YOUTUBE_PROXY_HTTPS_URL")
     if http_url or https_url:
         return GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
 
+    return None
+
+
+def parse_proxy_port(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        port = int(value)
+    except ValueError:
+        logger.warning("youtube_transcript_invalid_proxy_port")
+        return None
+    if 1 <= port <= 65535:
+        return port
+    logger.warning("youtube_transcript_invalid_proxy_port")
     return None
 
 
@@ -497,21 +598,13 @@ def _select_transcript(transcript_list):
 
 
 def normalize_segments(raw_segments: Iterable[dict]) -> list[dict]:
-    normalized = []
-    for item in raw_segments or []:
-        text = unescape(str(get_segment_value(item, "text", "")).replace("\n", " ")).strip()
-        start = safe_float(get_segment_value(item, "start", 0.0), 0.0)
-        duration = safe_float(get_segment_value(item, "duration", 0.0), 0.0)
-        if start < 0:
-            start = 0.0
-        if duration < 0:
-            duration = 0.0
-        if text:
-            normalized.append({
-                "start": round(start, 3),
-                "duration": round(duration, 3),
-                "text": text,
-            })
+    try:
+        normalized = process_transcript_segments(raw_segments, max_segments=MAX_SEGMENTS)
+    except ValueError as exc:
+        if str(exc) == "too_many_segments":
+            raise ValidationError("Transcript is too large to process safely.", error_code="too_many_segments") from exc
+        logger.warning("subtitle_quality_validation_failed", extra={"reason": str(exc)})
+        raise UpstreamError("Transcript timing or subtitle formatting could not be validated.", error_code="subtitle_quality_failed") from exc
     if len(normalized) > MAX_SEGMENTS:
         raise ValidationError("Transcript is too large to process safely.", error_code="too_many_segments")
     return normalized
@@ -556,8 +649,10 @@ def translate_segments(segments: list[dict], target_language: str, source_langua
     if total_chars > MAX_TRANSLATION_CHARS:
         raise ValidationError("Transcript text is too large to translate in one request.", error_code="translation_too_large")
 
+    protected_segments, protection_metadata = protect_segments_for_translation(segments)
+
     translated_texts = []
-    for batch in _translation_batches(segments):
+    for batch in _translation_batches(protected_segments):
         payload = {
             "q": [item["text"] for item in batch],
             "target": target_language,
@@ -588,9 +683,21 @@ def translate_segments(segments: list[dict], target_language: str, source_langua
     for segment, translated_text in zip(segments, translated_texts):
         translated_segments.append({
             "start": segment["start"],
+            "end": segment["end"],
             "duration": segment["duration"],
+            "timing_source": segment.get("timing_source", "youtube_caption"),
+            "speaker": segment.get("speaker"),
             "text": translated_text,
         })
+    try:
+        translated_segments = restore_translated_segments(segments, translated_segments, protection_metadata, target_language=target_language)
+    except ValueError as exc:
+        raise UpstreamError("Google Translation changed protected terms or facts.", error_code="translation_validation_failed") from exc
+    translated_segments = repair_caption_timing([format_caption_text(item) for item in translated_segments])
+    try:
+        validate_captions(translated_segments)
+    except ValueError as exc:
+        raise UpstreamError("Translated subtitles failed quality validation.", error_code="translated_subtitle_quality_failed") from exc
     return translated_segments
 
 
@@ -615,7 +722,7 @@ def format_transcript_download(transcript: dict, fmt: str) -> tuple[str, str, st
         raise ValidationError("Unsupported download format.", error_code="unsupported_format")
     segments = normalize_segments(transcript.get("segments") or [])
     if fmt == "txt":
-        content = "\n".join(f"[{format_plain_timestamp(item['start'])}] {item['text']}" for item in segments)
+        content = "\n".join(f"[{format_plain_timestamp(item['start'])} - {format_plain_timestamp(segment_end(item))}] {format_segment_text(item)}" for item in segments)
     elif fmt == "srt":
         content = format_srt(segments)
     elif fmt == "vtt":
@@ -632,8 +739,8 @@ def format_srt(segments: list[dict]) -> str:
     blocks = []
     for index, segment in enumerate(segments, start=1):
         start = format_subtitle_timestamp(segment["start"], separator=",")
-        end = format_subtitle_timestamp(segment["start"] + safe_duration(segment), separator=",")
-        blocks.append(f"{index}\n{start} --> {end}\n{segment['text']}\n")
+        end = format_subtitle_timestamp(segment_end(segment), separator=",")
+        blocks.append(f"{index}\n{start} --> {end}\n{format_segment_text(segment)}\n")
     return "\n".join(blocks).strip() + "\n"
 
 
@@ -641,8 +748,8 @@ def format_vtt(segments: list[dict]) -> str:
     lines = ["WEBVTT", ""]
     for segment in segments:
         start = format_subtitle_timestamp(segment["start"], separator=".")
-        end = format_subtitle_timestamp(segment["start"] + safe_duration(segment), separator=".")
-        lines.extend([f"{start} --> {end}", segment["text"], ""])
+        end = format_subtitle_timestamp(segment_end(segment), separator=".")
+        lines.extend([f"{start} --> {end}", format_segment_text(segment), ""])
     return "\n".join(lines)
 
 
@@ -674,6 +781,12 @@ def build_download_from_url(url: str, target_language: str, fmt: str) -> tuple[s
     return format_transcript_download(transcript, fmt)
 
 
+def format_segment_text(segment: dict) -> str:
+    speaker = (segment.get("speaker") or "").strip()
+    text = segment.get("text", "")
+    return f"{speaker}: {text}" if speaker else text
+
+
 def safe_float(value, default: float) -> float:
     try:
         return float(value)
@@ -686,10 +799,17 @@ def safe_duration(segment: dict) -> float:
     return duration if duration > 0 else 1.0
 
 
+def segment_end(segment: dict) -> float:
+    end = safe_float(segment.get("end"), None)
+    if end is not None and end > safe_float(segment.get("start"), 0.0):
+        return end
+    return safe_float(segment.get("start"), 0.0) + safe_duration(segment)
+
+
 def calculate_duration(segments: list[dict]) -> float:
     if not segments:
         return 0.0
-    return round(max(item["start"] + safe_duration(item) for item in segments), 3)
+    return round(max(segment_end(item) for item in segments), 3)
 
 
 def word_count(segments: list[dict]) -> int:
