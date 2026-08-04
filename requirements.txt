@@ -6,3 +6,7 @@ beautifulsoup4
 gunicorn
 youtube-transcript-api==1.2.4
 python-dotenv
+openpyxl
+cryptography
+google-ads
+google-auth-oauthlib

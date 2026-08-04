@@ -7,6 +7,7 @@ from datetime import datetime
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_DIR = BASE_DIR / "data"
 DB_PATH = DB_DIR / "tracker.db"
+SYSTEM_OWNER_KEY = "__system__"
 
 def get_connection():
     """Returns a SQLite connection to tracker.db."""
@@ -21,6 +22,16 @@ def init_db():
     cursor = conn.cursor()
     
     # Create runs table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,9 +77,136 @@ def init_db():
             FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE
         )
     """)
-    
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS google_ads_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            owner_key TEXT,
+            owner_type TEXT,
+            session_id TEXT,
+            refresh_token_encrypted TEXT NOT NULL,
+            token_expiry TEXT,
+            scopes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS negative_keyword_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            owner_key TEXT,
+            name TEXT NOT NULL,
+            terms TEXT NOT NULL,
+            classification TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            match_type TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS negative_keyword_settings_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            owner_key TEXT NOT NULL,
+            custom_instructions TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS negative_keyword_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            owner_key TEXT,
+            session_id TEXT,
+            customer_id TEXT,
+            campaign_id TEXT,
+            campaign_name TEXT,
+            negative_keyword TEXT,
+            match_type TEXT,
+            action_status TEXT NOT NULL,
+            action_message TEXT,
+            recommendation_snapshot TEXT,
+            upstream_response TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS negative_keyword_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            owner_key TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            storage_path TEXT NOT NULL,
+            source_type TEXT,
+            summary_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
+
+    ensure_column(cursor, "google_ads_connections", "user_id", "INTEGER")
+    ensure_column(cursor, "google_ads_connections", "owner_key", "TEXT")
+    ensure_column(cursor, "google_ads_connections", "owner_type", "TEXT")
+    ensure_column(cursor, "negative_keyword_rules", "user_id", "INTEGER")
+    ensure_column(cursor, "negative_keyword_rules", "owner_key", "TEXT")
+    ensure_column(cursor, "negative_keyword_settings_v2", "user_id", "INTEGER")
+    ensure_column(cursor, "negative_keyword_audit", "user_id", "INTEGER")
+    ensure_column(cursor, "negative_keyword_audit", "owner_key", "TEXT")
+    ensure_column(cursor, "negative_keyword_reports", "user_id", "INTEGER")
+    backfill_owner_scope(cursor)
+    migrate_negative_keyword_settings(cursor)
+
     conn.commit()
     conn.close()
+
+
+def ensure_column(cursor, table_name: str, column_name: str, column_type: str):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [col[1] for col in cursor.fetchall()]
+    if column_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def backfill_owner_scope(cursor):
+    cursor.execute("UPDATE google_ads_connections SET owner_key = COALESCE(owner_key, session_id, ?) WHERE owner_key IS NULL OR owner_key = ''", (SYSTEM_OWNER_KEY,))
+    cursor.execute("UPDATE google_ads_connections SET owner_type = COALESCE(owner_type, 'session') WHERE owner_type IS NULL OR owner_type = ''")
+    cursor.execute("UPDATE negative_keyword_rules SET owner_key = COALESCE(owner_key, ?) WHERE owner_key IS NULL OR owner_key = ''", (SYSTEM_OWNER_KEY,))
+    cursor.execute("UPDATE negative_keyword_audit SET owner_key = COALESCE(owner_key, session_id, ?) WHERE owner_key IS NULL OR owner_key = ''", (SYSTEM_OWNER_KEY,))
+
+
+def migrate_negative_keyword_settings(cursor):
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='negative_keyword_settings'")
+    legacy_exists = cursor.fetchone()
+    if not legacy_exists:
+        return
+    cursor.execute("SELECT custom_instructions, updated_at FROM negative_keyword_settings ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    if row and row["custom_instructions"]:
+        cursor.execute(
+            """
+            INSERT INTO negative_keyword_settings_v2 (owner_key, custom_instructions, updated_at)
+            SELECT ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM negative_keyword_settings_v2 WHERE owner_key = ?
+            )
+            """,
+            (SYSTEM_OWNER_KEY, row["custom_instructions"], row["updated_at"], SYSTEM_OWNER_KEY),
+        )
 
 def create_run(brand_domain, brand_name, country, language, competitors=None):
     """Inserts a new run and returns the run_id."""
@@ -209,3 +347,366 @@ def get_trend_data(brand_domain, competitor_domains):
         
     conn.close()
     return trend
+
+
+def create_user(email: str, password_hash: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        INSERT INTO users (email, password_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (email.lower().strip(), password_hash, timestamp, timestamp),
+    )
+    user_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return user_id
+
+
+def get_user_by_email(email: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE lower(email) = lower(?)", (email.strip(),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_by_id(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _scope_selector(user_id: int | None, owner_key: str | None):
+    if user_id is not None:
+        return "user_id = ?", (int(user_id),)
+    return "owner_key = ?", (owner_key or SYSTEM_OWNER_KEY,)
+
+
+def get_google_ads_connection(user_id: int | None = None, owner_key: str | None = None):
+    """Fetch the Google Ads connection stored for an owner scope."""
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM google_ads_connections WHERE {where_clause}", params)
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def upsert_google_ads_connection(user_id: int | None, owner_key: str, refresh_token_encrypted, token_expiry=None, scopes=None, owner_type="session"):
+    """Create or update the Google Ads connection for an owner scope."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    existing = get_google_ads_connection(user_id=user_id, owner_key=owner_key)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scopes_payload = json.dumps(scopes) if scopes is not None else None
+    if existing:
+        where_clause, scope_params = _scope_selector(user_id, owner_key)
+        cursor.execute(
+            f"""
+            UPDATE google_ads_connections
+            SET refresh_token_encrypted = ?, token_expiry = ?, scopes = ?, owner_type = ?, owner_key = ?, user_id = ?, updated_at = ?
+            WHERE {where_clause}
+            """,
+            (refresh_token_encrypted, token_expiry, scopes_payload, owner_type, owner_key, user_id, timestamp, *scope_params),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO google_ads_connections (user_id, owner_key, owner_type, session_id, refresh_token_encrypted, token_expiry, scopes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, owner_key, owner_type, owner_key, refresh_token_encrypted, token_expiry, scopes_payload, timestamp, timestamp),
+        )
+    conn.commit()
+    conn.close()
+
+
+def delete_google_ads_connection(user_id: int | None = None, owner_key: str | None = None):
+    """Delete the Google Ads connection for an owner scope."""
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM google_ads_connections WHERE {where_clause}", params)
+    conn.commit()
+    conn.close()
+
+
+def get_negative_keyword_rules(user_id: int | None = None, owner_key: str | None = SYSTEM_OWNER_KEY):
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM negative_keyword_rules
+        WHERE """ + where_clause + """
+        ORDER BY priority DESC, id ASC
+        """,
+        params,
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["terms"] = json.loads(item["terms"]) if item.get("terms") else []
+        item["enabled"] = bool(item.get("enabled"))
+        results.append(item)
+    return results
+
+
+def get_negative_keyword_rule_by_id(rule_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM negative_keyword_rules WHERE id = ?", (int(rule_id),))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["terms"] = json.loads(item["terms"]) if item.get("terms") else []
+    item["enabled"] = bool(item.get("enabled"))
+    return item
+
+
+def get_scoped_negative_keyword_rule(rule_id: int, user_id: int | None = None, owner_key: str | None = SYSTEM_OWNER_KEY):
+    where_clause, scope_params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT * FROM negative_keyword_rules WHERE id = ? AND {where_clause}",
+        (int(rule_id), *scope_params),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["terms"] = json.loads(item["terms"]) if item.get("terms") else []
+    item["enabled"] = bool(item.get("enabled"))
+    return item
+
+
+def create_negative_keyword_rule(user_id: int | None, owner_key: str, rule: dict):
+    conn = get_connection()
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        INSERT INTO negative_keyword_rules
+        (user_id, owner_key, name, terms, classification, reason, confidence, risk, match_type, enabled, priority, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            owner_key,
+            rule["name"],
+            json.dumps(rule.get("terms") or []),
+            rule["classification"],
+            rule["reason"],
+            rule["confidence"],
+            rule["risk"],
+            rule["match_type"],
+            1 if rule.get("enabled", True) else 0,
+            int(rule.get("priority", 0)),
+            timestamp,
+            timestamp,
+        ),
+    )
+    rule_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return rule_id
+
+
+def update_negative_keyword_rule(user_id: int | None, owner_key: str, rule_id: int, fields: dict):
+    updates = []
+    params = []
+    for key in ("name", "classification", "reason", "confidence", "risk", "match_type", "priority"):
+        if key in fields:
+            updates.append(f"{key} = ?")
+            params.append(fields[key])
+    if "terms" in fields:
+        updates.append("terms = ?")
+        params.append(json.dumps(fields.get("terms") or []))
+    if "enabled" in fields:
+        updates.append("enabled = ?")
+        params.append(1 if fields["enabled"] else 0)
+    updates.append("updated_at = ?")
+    params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    conn = get_connection()
+    cursor = conn.cursor()
+    where_clause, scope_params = _scope_selector(user_id, owner_key)
+    cursor.execute(
+        f"UPDATE negative_keyword_rules SET {', '.join(updates)} WHERE id = ? AND {where_clause}",
+        params + [rule_id, *scope_params],
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_negative_keyword_rule(user_id: int | None, owner_key: str, rule_id: int):
+    where_clause, scope_params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM negative_keyword_rules WHERE id = ? AND {where_clause}", (rule_id, *scope_params))
+    conn.commit()
+    conn.close()
+
+
+def reorder_negative_keyword_rules(user_id: int | None, owner_key: str, rule_ids: list[int]):
+    conn = get_connection()
+    cursor = conn.cursor()
+    total = len(rule_ids)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    where_clause, scope_params = _scope_selector(user_id, owner_key)
+    for index, rule_id in enumerate(rule_ids):
+        priority = total - index
+        cursor.execute(
+            f"""
+            UPDATE negative_keyword_rules
+            SET priority = ?, updated_at = ?
+            WHERE id = ? AND {where_clause}
+            """,
+            (priority, timestamp, int(rule_id), *scope_params),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_negative_keyword_instructions(user_id: int | None = None, owner_key: str | None = SYSTEM_OWNER_KEY):
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT custom_instructions, updated_at FROM negative_keyword_settings_v2 WHERE {where_clause} ORDER BY id DESC LIMIT 1",
+        params,
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {"custom_instructions": "", "updated_at": None}
+    return dict(row)
+
+
+def set_negative_keyword_instructions(user_id: int | None, owner_key: str, custom_instructions: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        INSERT INTO negative_keyword_settings_v2 (user_id, owner_key, custom_instructions, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, owner_key, custom_instructions, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_negative_keyword_audit(record: dict):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO negative_keyword_audit
+        (user_id, owner_key, session_id, customer_id, campaign_id, campaign_name, negative_keyword, match_type, action_status, action_message, recommendation_snapshot, upstream_response)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record.get("user_id"),
+            record.get("owner_key"),
+            record.get("session_id"),
+            record.get("customer_id"),
+            record.get("campaign_id"),
+            record.get("campaign_name"),
+            record.get("negative_keyword"),
+            record.get("match_type"),
+            record.get("action_status"),
+            record.get("action_message"),
+            json.dumps(record.get("recommendation_snapshot")) if record.get("recommendation_snapshot") is not None else None,
+            json.dumps(record.get("upstream_response")) if record.get("upstream_response") is not None else None,
+        ),
+    )
+    audit_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return audit_id
+
+
+def list_negative_keyword_audit(user_id: int | None = None, owner_key: str | None = SYSTEM_OWNER_KEY, limit: int = 100):
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM negative_keyword_audit
+        WHERE """ + where_clause + """
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["recommendation_snapshot"] = json.loads(item["recommendation_snapshot"]) if item.get("recommendation_snapshot") else None
+        item["upstream_response"] = json.loads(item["upstream_response"]) if item.get("upstream_response") else None
+        results.append(item)
+    return results
+
+
+def create_negative_keyword_report(user_id: int | None, owner_key: str, filename: str, storage_path: str, source_type: str, summary_json: dict | None = None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO negative_keyword_reports
+        (user_id, owner_key, filename, storage_path, source_type, summary_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            owner_key,
+            filename,
+            storage_path,
+            source_type,
+            json.dumps(summary_json) if summary_json is not None else None,
+        ),
+    )
+    report_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return report_id
+
+
+def get_negative_keyword_report(user_id: int | None = None, owner_key: str | None = SYSTEM_OWNER_KEY, filename: str = ""):
+    where_clause, params = _scope_selector(user_id, owner_key)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM negative_keyword_reports
+        WHERE """ + where_clause + """ AND filename = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (*params, filename),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["summary_json"] = json.loads(item["summary_json"]) if item.get("summary_json") else None
+    return item

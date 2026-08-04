@@ -45,6 +45,7 @@
                     </select>
                 </div>
 
+                <div id="agent-custom-panel" class="hidden"></div>
                 <div id="agent-fields-container" class="grid gap-4 sm:grid-cols-2"></div>
 
                 <button type="submit" class="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 transition">
@@ -792,6 +793,8 @@
     }
 
     let latestKeywordOpportunityRows = [];
+    let latestNegativeKeywordPayload = null;
+    let selectedNegativeRecommendationKeys = new Set();
 
     function applyKeywordResearchFilters() {
         const search = (document.getElementById('keyword-search')?.value || '').toLowerCase();
@@ -825,6 +828,185 @@
         navigator.clipboard?.writeText(keyword);
     }
 
+    function negativeRecommendationKey(row) {
+        return [row.campaign_id || '', row.negative_keyword || '', row.match_type || '', row.search_term || ''].join('||');
+    }
+
+    function selectedNegativeRecommendations(payload) {
+        const negatives = (payload.negative_keywords || []).filter(function(row) {
+            return selectedNegativeRecommendationKeys.has(negativeRecommendationKey(row));
+        });
+        return negatives;
+    }
+
+    function renderNegativeKeywordRecommendationsTable(rows) {
+        if (!rows || !rows.length) {
+            return `<div class="text-sm text-slate-500">No negative keyword recommendations available.</div>`;
+        }
+        return `
+            <div class="overflow-x-auto rounded-lg border border-slate-200 result-table-wrap">
+                <table class="min-w-full divide-y divide-slate-200 text-sm">
+                    <thead class="bg-slate-100">
+                        <tr>
+                            <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Select</th>
+                            ${['search_term', 'campaign', 'negative_keyword', 'match_type', 'matched_rule', 'reason', 'confidence', 'risk', 'clicks', 'cost', 'conversions'].map(function(column) {
+                                return `<th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">${escapeHtml(formatLabel(column))}</th>`;
+                            }).join('')}
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 bg-white">
+                        ${rows.map(function(row) {
+                            const key = negativeRecommendationKey(row);
+                            const checked = selectedNegativeRecommendationKeys.has(key) ? 'checked' : '';
+                            return `
+                                <tr>
+                                    <td class="px-3 py-2 align-top">
+                                        <input type="checkbox" ${checked} onchange="toggleNegativeRecommendationSelection('${escapeHtml(key)}', this.checked)" class="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
+                                    </td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.search_term, 'search_term')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.campaign, 'campaign')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.negative_keyword, 'negative_keyword')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.match_type, 'match_type')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.matched_rule, 'matched_rule')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.reason, 'reason')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.confidence, 'confidence')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.risk, 'risk')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.clicks, 'clicks')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.cost, 'cost')}</td>
+                                    <td class="px-3 py-2 align-top text-slate-700">${formatCellValue(row.conversions, 'conversions')}</td>
+                                </tr>
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    function renderNegativeKeywordView(data, payload) {
+        latestNegativeKeywordPayload = payload;
+        const summary = payload.summary || {};
+        const negatives = payload.negative_keywords || [];
+        const reviewTerms = payload.review_terms || [];
+        const reportUrl = payload.report_url || '';
+        if (!selectedNegativeRecommendationKeys.size) {
+            negatives.forEach(function(row) {
+                selectedNegativeRecommendationKeys.add(negativeRecommendationKey(row));
+            });
+        } else {
+            selectedNegativeRecommendationKeys = new Set(Array.from(selectedNegativeRecommendationKeys).filter(function(key) {
+                return negatives.some(function(row) { return negativeRecommendationKey(row) === key; });
+            }));
+        }
+        const selectedCount = selectedNegativeRecommendations(payload).length;
+        return [
+            renderSummaryBanner(data),
+            cardSection('PPC Summary', renderMetricCards([
+                { label: 'Search Terms', value: summary.total_search_terms },
+                { label: 'Negatives', value: summary.negative_count },
+                { label: 'Review Terms', value: summary.review_count },
+                { label: 'Keep Terms', value: summary.keep_count },
+                { label: 'Spend', value: summary.total_cost !== undefined ? `$${formatValue(summary.total_cost)}` : '' },
+                { label: 'Wasted Spend', value: summary.estimated_wasted_spend !== undefined ? `$${formatValue(summary.estimated_wasted_spend)}` : '' }
+            ])),
+            reportUrl ? cardSection('Download Report', `
+                <div class="flex flex-wrap gap-2">
+                    <a href="${escapeHtml(reportUrl)}" class="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
+                        <i class="fa-solid fa-file-excel"></i>
+                        Download Excel Workbook
+                    </a>
+                    <button type="button" onclick="exportNegativeKeywordCsv()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                        <i class="fa-solid fa-file-csv"></i>
+                        Export CSV
+                    </button>
+                    <button type="button" onclick="copySelectedNegativeKeywords()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                        <i class="fa-solid fa-copy"></i>
+                        Copy Selected
+                    </button>
+                    <button type="button" onclick="applySelectedNegativeKeywords()" class="inline-flex items-center gap-2 rounded-lg border border-emerald-300 bg-white px-4 py-2 text-sm font-semibold text-emerald-700 hover:bg-emerald-50">
+                        <i class="fa-solid fa-cloud-arrow-up"></i>
+                        Apply Selected to Google Ads
+                    </button>
+                </div>
+            `) : '',
+            cardSection('Recommended Negative Keywords', `
+                <div class="mb-3 text-sm text-slate-600">Selected recommendations: <span class="font-semibold text-slate-900">${selectedCount}</span></div>
+                ${renderNegativeKeywordRecommendationsTable(negatives)}
+            `),
+            cardSection('Copy-Paste Ready', `
+                <pre class="max-h-80 overflow-auto rounded-lg border border-slate-200 bg-slate-950 p-4 text-xs leading-5 text-slate-100 whitespace-pre-wrap">${escapeHtml(payload.copy_paste_text || 'No negative keywords generated.')}</pre>
+            `),
+            payload.active_rules ? cardSection('Active Rules Used', renderTable(payload.active_rules, ['priority', 'name', 'classification', 'reason', 'enabled'])) : '',
+            payload.custom_instructions ? cardSection('Saved Instructions Used', `<div class="text-sm leading-6 text-slate-700 whitespace-pre-wrap">${escapeHtml(payload.custom_instructions)}</div>`) : '',
+            cardSection('Review Before Excluding', renderTable(reviewTerms, ['search_term', 'campaign', 'reason', 'confidence', 'clicks', 'cost', 'conversions'])),
+            data.summary ? cardSection('Summary', `<div class="text-sm leading-6 text-slate-700">${escapeHtml(data.summary)}</div>`) : ''
+        ].join('');
+    }
+
+    function toggleNegativeRecommendationSelection(key, checked) {
+        if (checked) selectedNegativeRecommendationKeys.add(key);
+        else selectedNegativeRecommendationKeys.delete(key);
+        if (latestNegativeKeywordPayload) {
+            document.getElementById('result-view').innerHTML = renderNegativeKeywordView({ success: true, summary: '', data: latestNegativeKeywordPayload }, latestNegativeKeywordPayload);
+            attachRawToggle();
+        }
+    }
+
+    async function exportNegativeKeywordCsv() {
+        const rows = latestNegativeKeywordPayload ? selectedNegativeRecommendations(latestNegativeKeywordPayload) : [];
+        const response = await fetch('/api/negative-keywords/export/csv', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rows: rows })
+        });
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'negative-keywords.csv';
+        link.click();
+        URL.revokeObjectURL(url);
+    }
+
+    async function copySelectedNegativeKeywords() {
+        const rows = latestNegativeKeywordPayload ? selectedNegativeRecommendations(latestNegativeKeywordPayload) : [];
+        const text = rows.map(function(row) {
+            return `${row.campaign}\t${row.match_type}\t${row.negative_keyword}`;
+        }).join('\n');
+        await navigator.clipboard?.writeText(text || '');
+    }
+
+    async function applySelectedNegativeKeywords() {
+        if (!latestNegativeKeywordPayload) return;
+        const recommendations = selectedNegativeRecommendations(latestNegativeKeywordPayload);
+        if (!recommendations.length) {
+            alert('Select at least one NEGATIVE recommendation first.');
+            return;
+        }
+        if (!negativeKeywordState.selectedCustomerId) {
+            alert('Select a Google Ads account first.');
+            return;
+        }
+        if (!window.confirm(`Apply ${recommendations.length} selected negative keyword recommendation(s) to Google Ads?`)) {
+            return;
+        }
+        const response = await fetch('/api/negative-keywords/google-ads/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customer_id: negativeKeywordState.selectedCustomerId,
+                confirm: true,
+                recommendations: recommendations,
+            })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            alert(data.message || 'Unable to apply selected negative keywords.');
+            return;
+        }
+        alert(`Applied ${data.applied_count} negative keyword(s). Failed: ${data.failed_count}.`);
+    }
+
     function renderAgentSpecificView(agentId, data) {
         const payload = data.data || data || {};
         if (!data.success) {
@@ -846,6 +1028,9 @@
         }
         if (agentId === 'keyword_clustering') {
             return renderKeywordClusteringView(data, payload);
+        }
+        if (agentId === 'negative_keyword') {
+            return renderNegativeKeywordView(data, payload);
         }
 
         const sections = [renderSummaryBanner(data)];
@@ -1052,8 +1237,800 @@
         AGENTS_BY_ID[agent.id] = agent;
     });
 
+    const negativeKeywordState = {
+        activeTab: 'google_ads',
+        status: null,
+        accounts: [],
+        campaigns: [],
+        rules: [],
+        customInstructions: '',
+        ownership: null,
+        selectedCustomerId: '',
+        selectedCampaignIds: new Set(),
+        campaignSearch: '',
+        loading: false,
+        error: '',
+        notice: '',
+        editingRuleId: null,
+    };
     const fieldValues = {};
-    const MULTILINE_TYPES = ['textarea', 'keyword_list', 'url_list', 'multi_select'];
+    const MULTILINE_TYPES = ['textarea', 'keyword_list', 'url_list', 'multi_select', 'file'];
+
+    function primarySubmitButton() {
+        return document.querySelector('#agent-form button[type="submit"]');
+    }
+
+    function isNegativeKeywordAgent(agentId) {
+        return agentId === 'negative_keyword';
+    }
+
+    function selectedAgentId() {
+        return document.getElementById('agent').value;
+    }
+
+    function filteredNegativeKeywordCampaigns() {
+        const search = (negativeKeywordState.campaignSearch || '').toLowerCase();
+        return (negativeKeywordState.campaigns || []).filter(function(campaign) {
+            if (!search) return true;
+            return String(campaign.campaign_name || '').toLowerCase().includes(search)
+                || String(campaign.campaign_id || '').includes(search)
+                || String(campaign.campaign_status || '').toLowerCase().includes(search);
+        });
+    }
+
+    function negativeKeywordStatusBadge(status) {
+        const state = negativeKeywordConnectionState(status);
+        const toneMap = {
+            connected: 'bg-emerald-50 text-emerald-700',
+            disconnected: 'bg-amber-50 text-amber-700',
+            reauth: 'bg-rose-50 text-rose-700',
+            config: 'bg-slate-100 text-slate-700',
+        };
+        return `<span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${toneMap[state.tone]}">${escapeHtml(state.label)}</span>`;
+    }
+
+    function negativeKeywordConnectionState(status) {
+        const current = status || {};
+        if (current.connected) {
+            return {
+                label: 'Connected',
+                tone: 'connected',
+                helper: current.reason || 'Google Ads is connected for this account.',
+                connectLabel: 'Reconnect Google Ads',
+                showConnect: true,
+                showDisconnect: true,
+            };
+        }
+        if (current.configured && current.has_stored_token) {
+            return {
+                label: 'Reauthorization Required',
+                tone: 'reauth',
+                helper: current.reason || 'Reconnect Google Ads to refresh or restore authorization.',
+                connectLabel: 'Reconnect Google Ads',
+                showConnect: true,
+                showDisconnect: true,
+            };
+        }
+        if (!current.configured) {
+            return {
+                label: 'Configuration Required',
+                tone: 'config',
+                helper: current.reason || 'Add the missing Google Ads environment variables first.',
+                connectLabel: '',
+                showConnect: false,
+                showDisconnect: false,
+            };
+        }
+        return {
+            label: 'Not Connected',
+            tone: 'disconnected',
+            helper: current.reason || 'Authorize Google Ads to load accounts, campaigns, and live search terms.',
+            connectLabel: 'Connect Google Ads',
+            showConnect: true,
+            showDisconnect: false,
+        };
+    }
+
+    function canRunNegativeKeywordGoogleAds() {
+        const status = negativeKeywordState.status || {};
+        if (!status.connected) return false;
+        if (!negativeKeywordState.selectedCustomerId) return false;
+        if (!negativeKeywordState.selectedCampaignIds.size) return false;
+        const startInput = document.getElementById('nk-start-date');
+        const endInput = document.getElementById('nk-end-date');
+        return Boolean(startInput && startInput.value && endInput && endInput.value);
+    }
+
+    function negativeKeywordRunDisabledReason() {
+        const status = negativeKeywordState.status || {};
+        if (!status.configured) return 'Complete Google Ads configuration to analyze live campaigns.';
+        if (!status.connected) return status.has_stored_token
+            ? 'Reconnect Google Ads before analyzing campaigns.'
+            : 'Connect Google Ads before analyzing campaigns.';
+        if (!negativeKeywordState.selectedCustomerId) return 'Select a Google Ads account to continue.';
+        if (!negativeKeywordState.selectedCampaignIds.size) return 'Select at least one campaign to analyze.';
+        const startInput = document.getElementById('nk-start-date');
+        const endInput = document.getElementById('nk-end-date');
+        if (!(startInput && startInput.value && endInput && endInput.value)) return 'Choose a valid date range to continue.';
+        return '';
+    }
+
+    function submitNegativeKeywordGoogleAdsConnect() {
+        window.location.href = '/integrations/google-ads/connect';
+    }
+
+    function negativeKeywordCampaignStatusBadge(status) {
+        const tone = status === 'ENABLED' ? 'bg-emerald-50 text-emerald-700'
+            : status === 'PAUSED' ? 'bg-amber-50 text-amber-700'
+            : 'bg-slate-100 text-slate-700';
+        return `<span class="inline-flex items-center rounded-full px-2 py-1 text-xs font-semibold ${tone}">${escapeHtml(status || 'UNKNOWN')}</span>`;
+    }
+
+    function negativeKeywordRuleKey(rule) {
+        return String(rule.id || rule.name || Math.random());
+    }
+
+    function renderRuleTerms(terms) {
+        return (terms || []).map(function(term) {
+            return `<span class="inline-flex items-center rounded-full bg-slate-100 px-2 py-1 text-xs font-medium text-slate-700">${escapeHtml(term)}</span>`;
+        }).join(' ');
+    }
+
+    function renderNegativeKeywordRulesTab() {
+        const rules = negativeKeywordState.rules || [];
+        return `
+            <section class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                        <div class="text-sm font-semibold text-slate-900">Rule Library</div>
+                        <div class="mt-1 text-sm text-slate-600">Enabled rules run from highest priority to lowest priority before spend and CTR heuristics.</div>
+                    </div>
+                    <button type="button" onclick="openNegativeKeywordRuleEditor()" class="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700">
+                        <i class="fa-solid fa-plus"></i>
+                        Add Rule
+                    </button>
+                </div>
+                <div id="negative-keyword-rule-editor" class="hidden rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <div class="grid gap-3 md:grid-cols-2">
+                        <label class="block text-sm font-medium text-slate-700">Rule Name
+                            <input id="nk-rule-name" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Example: Career Queries">
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Terms
+                            <input id="nk-rule-terms" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="job, jobs, career">
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Classification
+                            <select id="nk-rule-classification" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                                <option value="NEGATIVE">NEGATIVE</option>
+                                <option value="REVIEW">REVIEW</option>
+                                <option value="KEEP">KEEP</option>
+                            </select>
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Priority
+                            <input id="nk-rule-priority" type="number" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" value="500">
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Confidence
+                            <select id="nk-rule-confidence" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                                <option value="HIGH">HIGH</option>
+                                <option value="MEDIUM">MEDIUM</option>
+                                <option value="LOW">LOW</option>
+                            </select>
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Risk
+                            <select id="nk-rule-risk" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                                <option value="LOW">LOW</option>
+                                <option value="MEDIUM">MEDIUM</option>
+                                <option value="HIGH">HIGH</option>
+                            </select>
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Match Type
+                            <select id="nk-rule-match-type" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                                <option value="PHRASE">PHRASE</option>
+                                <option value="EXACT">EXACT</option>
+                                <option value="BROAD">BROAD</option>
+                            </select>
+                        </label>
+                        <label class="block text-sm font-medium text-slate-700">Enabled
+                            <select id="nk-rule-enabled" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                                <option value="true">Enabled</option>
+                                <option value="false">Disabled</option>
+                            </select>
+                        </label>
+                    </div>
+                    <label class="block text-sm font-medium text-slate-700">Reason
+                        <textarea id="nk-rule-reason" rows="3" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Why should this rule classify the search term this way?"></textarea>
+                    </label>
+                    <div class="flex flex-wrap gap-2">
+                        <button type="button" onclick="saveNegativeKeywordRule()" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">
+                            <i class="fa-solid fa-floppy-disk"></i>
+                            Save Rule
+                        </button>
+                        <button type="button" onclick="closeNegativeKeywordRuleEditor()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                            <i class="fa-solid fa-xmark"></i>
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+                <div class="space-y-3">
+                    ${rules.map(function(rule, index) {
+                        return `
+                            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                                <div class="flex flex-wrap items-start justify-between gap-3">
+                                    <div class="space-y-2">
+                                        <div class="flex flex-wrap items-center gap-2">
+                                            <span class="text-sm font-semibold text-slate-900">${escapeHtml(rule.name)}</span>
+                                            ${renderBadge(rule.classification, rule.classification === 'NEGATIVE' ? 'danger' : (rule.classification === 'REVIEW' ? 'warn' : 'good'))}
+                                            ${renderBadge(rule.enabled ? 'Enabled' : 'Disabled', rule.enabled ? 'good' : 'neutral')}
+                                            <span class="text-xs text-slate-500">Priority ${escapeHtml(rule.priority)}</span>
+                                        </div>
+                                        <div class="text-sm text-slate-600">${escapeHtml(rule.reason)}</div>
+                                        <div class="flex flex-wrap gap-2">${renderRuleTerms(rule.terms)}</div>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2">
+                                        <button type="button" onclick="moveNegativeKeywordRule(${index}, -1)" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"><i class="fa-solid fa-arrow-up"></i></button>
+                                        <button type="button" onclick="moveNegativeKeywordRule(${index}, 1)" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"><i class="fa-solid fa-arrow-down"></i></button>
+                                        <button type="button" onclick="editNegativeKeywordRule('${escapeHtml(String(rule.id))}')" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"><i class="fa-solid fa-pen"></i>Edit</button>
+                                        <button type="button" onclick="toggleNegativeKeywordRuleEnabled('${escapeHtml(String(rule.id))}', ${rule.enabled ? 'false' : 'true'})" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"><i class="fa-solid fa-toggle-${rule.enabled ? 'on' : 'off'}"></i>${rule.enabled ? 'Disable' : 'Enable'}</button>
+                                        <button type="button" onclick="deleteNegativeKeywordRule('${escapeHtml(String(rule.id))}')" class="inline-flex items-center gap-2 rounded-lg border border-rose-300 bg-white px-3 py-2 text-sm text-rose-700 hover:bg-rose-50"><i class="fa-solid fa-trash"></i>Delete</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('') || '<div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">No rules saved yet.</div>'}
+                </div>
+            </section>
+        `;
+    }
+
+    function renderNegativeKeywordInstructionsTab() {
+        return `
+            <section class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+                <div>
+                    <div class="text-sm font-semibold text-slate-900">Custom Instructions</div>
+                    <div class="mt-1 text-sm text-slate-600">These instructions are saved in the database and included in the LLM prompt alongside the active rules.</div>
+                </div>
+                <textarea id="nk-custom-instructions" rows="10" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Example: Prefer cautious reviews for branded search terms unless a rule clearly marks them as negative.">${escapeHtml(negativeKeywordState.customInstructions || '')}</textarea>
+                <div class="flex flex-wrap gap-2">
+                    <button type="button" onclick="saveNegativeKeywordInstructions()" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                        Save Instructions
+                    </button>
+                    <button type="button" onclick="loadNegativeKeywordWorkspace()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                        <i class="fa-solid fa-rotate"></i>
+                        Reload Saved State
+                    </button>
+                </div>
+            </section>
+        `;
+    }
+
+    function renderNegativeKeywordGoogleTab() {
+        const status = negativeKeywordState.status || {};
+        const connectionState = negativeKeywordConnectionState(status);
+        const connected = Boolean(status.connected);
+        const configured = Boolean(status.configured);
+        const campaigns = filteredNegativeKeywordCampaigns();
+        const selectedCount = negativeKeywordState.selectedCampaignIds.size;
+        const allVisibleSelected = campaigns.length && campaigns.every(function(campaign) {
+            return negativeKeywordState.selectedCampaignIds.has(String(campaign.campaign_id));
+        });
+        return `
+            <section class="rounded-xl border border-slate-200 bg-white p-4">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                        <div class="text-sm font-semibold text-slate-900">Google Ads Connection</div>
+                        <div class="mt-1 text-sm text-slate-600">${escapeHtml(connectionState.helper)}</div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        ${negativeKeywordStatusBadge(status)}
+                        ${connectionState.showConnect ? `<button type="button" onclick="submitNegativeKeywordGoogleAdsConnect()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><i class="fa-solid fa-link"></i>${escapeHtml(connectionState.connectLabel)}</button>` : ''}
+                        ${connectionState.showDisconnect ? `<button type="button" onclick="disconnectNegativeKeywordGoogleAds()" class="inline-flex items-center gap-2 rounded-lg border border-rose-300 bg-white px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-50"><i class="fa-solid fa-link-slash"></i>Disconnect</button>` : ''}
+                    </div>
+                </div>
+                ${status.missing_configuration && status.missing_configuration.length ? `<div class="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Missing configuration: ${escapeHtml(status.missing_configuration.join(', '))}</div>` : ''}
+                ${negativeKeywordState.ownership && negativeKeywordState.ownership.show_session_warning ? `<div class="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-800">Audilysis does not yet expose a real user login layer in this Flask codebase. Negative Keyword data is isolated by current browser session through a replaceable ownership abstraction until authenticated user IDs are available.</div>` : ''}
+                ${negativeKeywordState.notice ? `<div class="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">${escapeHtml(negativeKeywordState.notice)}</div>` : ''}
+                ${negativeKeywordState.error ? `<div class="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">${escapeHtml(negativeKeywordState.error)}</div>` : ''}
+                ${!configured ? `<div class="mt-3 text-sm text-slate-600">Add the required Google Ads environment variables, restart Flask, then return here to connect.</div>` : ''}
+                ${configured && !connected ? `<div class="mt-3 text-sm text-slate-600">${status.has_stored_token ? 'A previous Google Ads authorization exists, but it needs to be refreshed before live account access can continue.' : 'Connect Google Ads to load accessible accounts, campaigns, and live search terms.'}</div>` : ''}
+            </section>
+            ${connected ? `
+                <section class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+                    <div class="grid gap-4 md:grid-cols-2">
+                        <label class="block text-sm font-medium text-slate-700">
+                            Google Ads Account
+                            <select id="nk-customer-select" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" onchange="setNegativeKeywordCustomer(this.value)">
+                                <option value="">Select an account</option>
+                                ${(negativeKeywordState.accounts || []).map(function(account) {
+                                    const selected = negativeKeywordState.selectedCustomerId === account.customer_id ? 'selected' : '';
+                                    return `<option value="${escapeHtml(account.customer_id)}" ${selected}>${escapeHtml(account.name)} (${escapeHtml(account.customer_id)})</option>`;
+                                }).join('')}
+                            </select>
+                        </label>
+                        <div class="space-y-3">
+                            <div class="flex flex-wrap gap-2">
+                                <button type="button" onclick="refreshNegativeKeywordAccounts()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                                    <i class="fa-solid fa-arrows-rotate"></i>
+                                    Refresh Accounts
+                                </button>
+                                ${negativeKeywordState.selectedCustomerId ? `<span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">Selected Account: ${escapeHtml(negativeKeywordState.selectedCustomerId)}</span>` : ''}
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <button type="button" onclick="setNegativeKeywordDatePreset('yesterday')" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Yesterday</button>
+                                <button type="button" onclick="setNegativeKeywordDatePreset('last_7_days')" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Last 7 Days</button>
+                                <button type="button" onclick="setNegativeKeywordDatePreset('last_30_days')" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Last 30 Days</button>
+                                <button type="button" onclick="setNegativeKeywordDatePreset('custom')" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Custom</button>
+                            </div>
+                            <div class="grid gap-4 sm:grid-cols-2">
+                            <label class="block text-sm font-medium text-slate-700">
+                                Start Date
+                                <input id="nk-start-date" type="date" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                            </label>
+                            <label class="block text-sm font-medium text-slate-700">
+                                End Date
+                                <input id="nk-end-date" type="date" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                            </label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-end">
+                        <label class="block text-sm font-medium text-slate-700">
+                            Campaign Filter
+                            <input id="nk-campaign-search" value="${escapeHtml(negativeKeywordState.campaignSearch)}" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Search campaigns" oninput="setNegativeKeywordCampaignSearch(this.value)">
+                        </label>
+                        <button type="button" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50" onclick="loadNegativeKeywordCampaigns()">
+                            <i class="fa-solid fa-rotate"></i>
+                            Refresh Campaigns
+                        </button>
+                        <div class="text-sm font-medium text-slate-600">Selected: <span class="text-slate-900">${selectedCount}</span></div>
+                    </div>
+                    <div class="rounded-lg border border-slate-200">
+                        <div class="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
+                            <div class="flex flex-wrap gap-2">
+                                <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                                    <input type="checkbox" class="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" ${allVisibleSelected ? 'checked' : ''} onchange="toggleAllNegativeKeywordCampaigns(this.checked)">
+                                    <span>Select All</span>
+                                </label>
+                                <button type="button" onclick="clearNegativeKeywordCampaignSelection()" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50">
+                                    <i class="fa-solid fa-list-check"></i>
+                                    Deselect All
+                                </button>
+                            </div>
+                            <div class="text-xs uppercase tracking-[0.16em] text-slate-500">${campaigns.length} campaign${campaigns.length === 1 ? '' : 's'}</div>
+                        </div>
+                        <div class="max-h-80 overflow-auto divide-y divide-slate-100 bg-white">
+                            ${campaigns.length ? campaigns.map(function(campaign) {
+                                const campaignId = String(campaign.campaign_id);
+                                const checked = negativeKeywordState.selectedCampaignIds.has(campaignId) ? 'checked' : '';
+                                return `
+                                    <label class="flex items-start gap-3 px-4 py-3 hover:bg-slate-50">
+                                        <input type="checkbox" class="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" ${checked} onchange="toggleNegativeKeywordCampaign('${escapeHtml(campaignId)}', this.checked)">
+                                        <div class="min-w-0 flex-1">
+                                            <div class="flex flex-wrap items-center gap-2">
+                                                <span class="text-sm font-semibold text-slate-900">${escapeHtml(campaign.campaign_name)}</span>
+                                                ${negativeKeywordCampaignStatusBadge(campaign.campaign_status)}
+                                            </div>
+                                            <div class="mt-1 text-xs text-slate-500">ID: ${escapeHtml(campaignId)}${campaign.campaign_type ? ` · Type: ${escapeHtml(campaign.campaign_type)}` : ''}</div>
+                                        </div>
+                                    </label>
+                                `;
+                            }).join('') : '<div class="px-4 py-6 text-sm text-slate-500">No campaigns available for the selected account.</div>'}
+                        </div>
+                    </div>
+                </section>
+            ` : ''}
+        `;
+    }
+
+    function renderNegativeKeywordCustomPanel() {
+        return `
+            <div class="space-y-4">
+                <div class="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-1">
+                    ${[
+                        ['google_ads', 'Google Ads', 'fa-link'],
+                        ['upload', 'Upload Report', 'fa-file-arrow-up'],
+                        ['rules', 'Rules', 'fa-scale-balanced'],
+                        ['instructions', 'Instructions', 'fa-circle-info'],
+                    ].map(function(item) {
+                        const active = negativeKeywordState.activeTab === item[0];
+                        return `<button type="button" class="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${active ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}" onclick="setNegativeKeywordTab('${item[0]}')"><i class="fa-solid ${item[2]}"></i>${item[1]}</button>`;
+                    }).join('')}
+                </div>
+                ${negativeKeywordState.activeTab === 'google_ads' ? renderNegativeKeywordGoogleTab() : ''}
+                ${negativeKeywordState.activeTab === 'upload' ? `<section class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">Upload a Google Ads search-term report below, then run the agent to analyze the file with the same rule engine and workbook output used for live Google Ads data.</section>` : ''}
+                ${negativeKeywordState.activeTab === 'rules' ? renderNegativeKeywordRulesTab() : ''}
+                ${negativeKeywordState.activeTab === 'instructions' ? renderNegativeKeywordInstructionsTab() : ''}
+            </div>
+        `;
+    }
+
+    function updateNegativeKeywordFieldVisibility() {
+        const container = document.getElementById('agent-fields-container');
+        const fileWrap = container.querySelector('[data-field-wrap="search_terms_file"]');
+        if (fileWrap) {
+            fileWrap.classList.toggle('hidden', isNegativeKeywordAgent(selectedAgentId()) && negativeKeywordState.activeTab === 'google_ads');
+        }
+    }
+
+    function updatePrimaryButtonLabel() {
+        const button = primarySubmitButton();
+        if (!button) return;
+        if (isNegativeKeywordAgent(selectedAgentId()) && negativeKeywordState.activeTab === 'google_ads') {
+            button.innerHTML = '<i class="fa-solid fa-play"></i> Analyze Selected Campaigns';
+            button.disabled = !canRunNegativeKeywordGoogleAds();
+            button.title = button.disabled ? negativeKeywordRunDisabledReason() : 'Analyze the selected Google Ads campaigns.';
+            button.classList.toggle('opacity-50', button.disabled);
+            button.classList.toggle('cursor-not-allowed', button.disabled);
+        } else if (isNegativeKeywordAgent(selectedAgentId()) && negativeKeywordState.activeTab === 'upload') {
+            button.innerHTML = '<i class="fa-solid fa-play"></i> Analyze Uploaded Report';
+            button.disabled = false;
+            button.title = '';
+            button.classList.remove('opacity-50', 'cursor-not-allowed');
+        } else {
+            button.innerHTML = '<i class="fa-solid fa-play"></i> Run agent';
+            button.disabled = false;
+            button.title = '';
+            button.classList.remove('opacity-50', 'cursor-not-allowed');
+        }
+    }
+
+    function updateCustomPanel() {
+        const panel = document.getElementById('agent-custom-panel');
+        if (!panel) return;
+        if (isNegativeKeywordAgent(selectedAgentId())) {
+            panel.classList.remove('hidden');
+            panel.innerHTML = renderNegativeKeywordCustomPanel();
+            setNegativeKeywordDateDefaults();
+            updateNegativeKeywordFieldVisibility();
+        } else {
+            panel.classList.add('hidden');
+            panel.innerHTML = '';
+        }
+        updatePrimaryButtonLabel();
+    }
+
+    function setNegativeKeywordDateDefaults() {
+        const startInput = document.getElementById('nk-start-date');
+        const endInput = document.getElementById('nk-end-date');
+        if (startInput && endInput && !startInput.value && !endInput.value) {
+            setNegativeKeywordDatePreset('last_7_days');
+        }
+        if (startInput && endInput) {
+            const maxDate = formatNegativeKeywordDate(new Date(Date.now() - 86400000));
+            startInput.max = maxDate;
+            endInput.max = maxDate;
+        }
+    }
+
+    function formatNegativeKeywordDate(value) {
+        return value.toISOString().slice(0, 10);
+    }
+
+    function setNegativeKeywordDatePreset(preset) {
+        const startInput = document.getElementById('nk-start-date');
+        const endInput = document.getElementById('nk-end-date');
+        if (!startInput || !endInput) return;
+        const today = new Date();
+        const end = new Date(today);
+        end.setDate(end.getDate() - 1);
+        const start = new Date(end);
+        if (preset === 'yesterday') {
+            startInput.value = formatNegativeKeywordDate(end);
+            endInput.value = formatNegativeKeywordDate(end);
+            return;
+        }
+        if (preset === 'last_30_days') {
+            start.setDate(start.getDate() - 29);
+            startInput.value = formatNegativeKeywordDate(start);
+            endInput.value = formatNegativeKeywordDate(end);
+            return;
+        }
+        if (preset === 'custom') {
+            return;
+        }
+        start.setDate(start.getDate() - 6);
+        startInput.value = formatNegativeKeywordDate(start);
+        endInput.value = formatNegativeKeywordDate(end);
+    }
+
+    async function loadNegativeKeywordStatus() {
+        try {
+            const response = await fetch('/api/negative-keywords/google-ads/status');
+            const data = await response.json();
+            negativeKeywordState.status = data.google_ads || {};
+            negativeKeywordState.ownership = data.ownership || null;
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = '';
+            updateCustomPanel();
+            await loadNegativeKeywordWorkspace();
+            if (negativeKeywordState.status.connected) {
+                await loadNegativeKeywordAccounts();
+            }
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to load Google Ads status.';
+            updateCustomPanel();
+        }
+    }
+
+    async function loadNegativeKeywordWorkspace() {
+        try {
+            const response = await fetch('/api/negative-keywords/rules');
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.message || 'Unable to load rules.');
+            negativeKeywordState.rules = data.rules || [];
+            negativeKeywordState.customInstructions = data.custom_instructions || '';
+            negativeKeywordState.ownership = data.ownership || negativeKeywordState.ownership;
+            negativeKeywordState.notice = '';
+            updateCustomPanel();
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to load rules and instructions.';
+            updateCustomPanel();
+        }
+    }
+
+    async function loadNegativeKeywordAccounts() {
+        try {
+            const response = await fetch('/api/negative-keywords/google-ads/accounts');
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.message || data.error || 'Unable to load Google Ads accounts.');
+            negativeKeywordState.accounts = data.accounts || [];
+            if (!negativeKeywordState.selectedCustomerId && negativeKeywordState.accounts.length) {
+                negativeKeywordState.selectedCustomerId = negativeKeywordState.accounts[0].customer_id;
+                await loadNegativeKeywordCampaigns();
+            } else {
+                updateCustomPanel();
+            }
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to load Google Ads accounts.';
+            updateCustomPanel();
+        }
+    }
+
+    async function refreshNegativeKeywordAccounts() {
+        negativeKeywordState.selectedCustomerId = '';
+        negativeKeywordState.selectedCampaignIds = new Set();
+        negativeKeywordState.campaigns = [];
+        await loadNegativeKeywordAccounts();
+    }
+
+    async function loadNegativeKeywordCampaigns() {
+        if (!negativeKeywordState.selectedCustomerId) {
+            updateCustomPanel();
+            return;
+        }
+        try {
+            const response = await fetch('/api/negative-keywords/google-ads/campaigns', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    customer_id: negativeKeywordState.selectedCustomerId,
+                    search: negativeKeywordState.campaignSearch,
+                })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.message || data.error || 'Unable to load campaigns.');
+            negativeKeywordState.campaigns = data.campaigns || [];
+            negativeKeywordState.selectedCampaignIds = new Set(
+                Array.from(negativeKeywordState.selectedCampaignIds).filter(function(campaignId) {
+                    return negativeKeywordState.campaigns.some(function(campaign) { return String(campaign.campaign_id) === String(campaignId); });
+                })
+            );
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = 'Campaigns refreshed.';
+            updateCustomPanel();
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to load campaigns.';
+            negativeKeywordState.notice = '';
+            updateCustomPanel();
+        }
+    }
+
+    function setNegativeKeywordCustomer(customerId) {
+        negativeKeywordState.selectedCustomerId = customerId;
+        negativeKeywordState.selectedCampaignIds = new Set();
+        loadNegativeKeywordCampaigns();
+    }
+
+    function setNegativeKeywordCampaignSearch(value) {
+        negativeKeywordState.campaignSearch = value;
+        updateCustomPanel();
+    }
+
+    function toggleNegativeKeywordCampaign(campaignId, checked) {
+        if (checked) negativeKeywordState.selectedCampaignIds.add(String(campaignId));
+        else negativeKeywordState.selectedCampaignIds.delete(String(campaignId));
+        updateCustomPanel();
+    }
+
+    function toggleAllNegativeKeywordCampaigns(checked) {
+        filteredNegativeKeywordCampaigns().forEach(function(campaign) {
+            if (checked) negativeKeywordState.selectedCampaignIds.add(String(campaign.campaign_id));
+            else negativeKeywordState.selectedCampaignIds.delete(String(campaign.campaign_id));
+        });
+        updateCustomPanel();
+    }
+
+    function clearNegativeKeywordCampaignSelection() {
+        negativeKeywordState.selectedCampaignIds = new Set();
+        updateCustomPanel();
+    }
+
+    function setNegativeKeywordTab(tab) {
+        negativeKeywordState.activeTab = tab;
+        updateCustomPanel();
+    }
+
+    async function disconnectNegativeKeywordGoogleAds() {
+        const response = await fetch('/api/negative-keywords/google-ads/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to disconnect Google Ads.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.accounts = [];
+            negativeKeywordState.campaigns = [];
+            negativeKeywordState.selectedCustomerId = '';
+            negativeKeywordState.selectedCampaignIds = new Set();
+            negativeKeywordState.status = { ...(negativeKeywordState.status || {}), connected: false, has_stored_token: false, reason: 'Disconnected' };
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = 'Google Ads disconnected.';
+        }
+        updateCustomPanel();
+    }
+
+    function openNegativeKeywordRuleEditor() {
+        negativeKeywordState.editingRuleId = null;
+        const editor = document.getElementById('negative-keyword-rule-editor');
+        if (editor) editor.classList.remove('hidden');
+        const defaults = {
+            name: '',
+            terms: '',
+            classification: 'NEGATIVE',
+            priority: 500,
+            confidence: 'HIGH',
+            risk: 'LOW',
+            match_type: 'PHRASE',
+            enabled: 'true',
+            reason: '',
+        };
+        Object.keys(defaults).forEach(function(key) {
+            const input = document.getElementById('nk-rule-' + key.replace('_', '-'));
+            if (input) input.value = defaults[key];
+        });
+    }
+
+    function closeNegativeKeywordRuleEditor() {
+        const editor = document.getElementById('negative-keyword-rule-editor');
+        if (editor) editor.classList.add('hidden');
+        negativeKeywordState.editingRuleId = null;
+    }
+
+    function editNegativeKeywordRule(ruleId) {
+        const rule = (negativeKeywordState.rules || []).find(function(item) { return String(item.id) === String(ruleId); });
+        if (!rule) return;
+        openNegativeKeywordRuleEditor();
+        negativeKeywordState.editingRuleId = rule.id;
+        document.getElementById('nk-rule-name').value = rule.name || '';
+        document.getElementById('nk-rule-terms').value = (rule.terms || []).join(', ');
+        document.getElementById('nk-rule-classification').value = rule.classification || 'NEGATIVE';
+        document.getElementById('nk-rule-priority').value = rule.priority || 500;
+        document.getElementById('nk-rule-confidence').value = rule.confidence || 'HIGH';
+        document.getElementById('nk-rule-risk').value = rule.risk || 'LOW';
+        document.getElementById('nk-rule-match-type').value = rule.match_type || 'PHRASE';
+        document.getElementById('nk-rule-enabled').value = rule.enabled ? 'true' : 'false';
+        document.getElementById('nk-rule-reason').value = rule.reason || '';
+    }
+
+    async function saveNegativeKeywordRule() {
+        const payload = {
+            name: document.getElementById('nk-rule-name').value,
+            terms: document.getElementById('nk-rule-terms').value,
+            classification: document.getElementById('nk-rule-classification').value,
+            priority: Number(document.getElementById('nk-rule-priority').value || 0),
+            confidence: document.getElementById('nk-rule-confidence').value,
+            risk: document.getElementById('nk-rule-risk').value,
+            match_type: document.getElementById('nk-rule-match-type').value,
+            enabled: document.getElementById('nk-rule-enabled').value === 'true',
+            reason: document.getElementById('nk-rule-reason').value,
+        };
+        const url = negativeKeywordState.editingRuleId
+            ? '/api/negative-keywords/rules/' + negativeKeywordState.editingRuleId
+            : '/api/negative-keywords/rules';
+        const method = negativeKeywordState.editingRuleId ? 'PUT' : 'POST';
+        const response = await fetch(url, {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to save rule.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.rules = data.rules || [];
+            negativeKeywordState.customInstructions = data.custom_instructions || negativeKeywordState.customInstructions;
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = negativeKeywordState.editingRuleId ? 'Rule updated.' : 'Rule created.';
+            closeNegativeKeywordRuleEditor();
+        }
+        updateCustomPanel();
+    }
+
+    async function deleteNegativeKeywordRule(ruleId) {
+        const response = await fetch('/api/negative-keywords/rules/' + ruleId, { method: 'DELETE' });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to delete rule.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.rules = data.rules || [];
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = 'Rule deleted.';
+        }
+        updateCustomPanel();
+    }
+
+    async function toggleNegativeKeywordRuleEnabled(ruleId, enabled) {
+        const response = await fetch('/api/negative-keywords/rules/' + ruleId, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: enabled })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to update rule.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.rules = data.rules || [];
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = enabled === 'true' ? 'Rule enabled.' : 'Rule disabled.';
+        }
+        updateCustomPanel();
+    }
+
+    async function moveNegativeKeywordRule(index, direction) {
+        const rules = Array.from(negativeKeywordState.rules || []);
+        const nextIndex = index + direction;
+        if (nextIndex < 0 || nextIndex >= rules.length) return;
+        const temp = rules[index];
+        rules[index] = rules[nextIndex];
+        rules[nextIndex] = temp;
+        const response = await fetch('/api/negative-keywords/rules/reorder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rule_ids: rules.map(function(rule) { return rule.id; }) })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to reorder rules.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.rules = data.rules || [];
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = 'Rule order updated.';
+        }
+        updateCustomPanel();
+    }
+
+    async function saveNegativeKeywordInstructions() {
+        const response = await fetch('/api/negative-keywords/instructions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                custom_instructions: document.getElementById('nk-custom-instructions').value
+            })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            negativeKeywordState.error = data.message || 'Unable to save instructions.';
+            negativeKeywordState.notice = '';
+        } else {
+            negativeKeywordState.customInstructions = data.custom_instructions || '';
+            negativeKeywordState.rules = data.rules || negativeKeywordState.rules;
+            negativeKeywordState.error = '';
+            negativeKeywordState.notice = 'Instructions saved.';
+        }
+        updateCustomPanel();
+    }
 
     function optionValue(option) {
         return typeof option === 'string' ? option : option.value;
@@ -1075,6 +2052,8 @@
             fieldValues[field.id] = control.checked;
         } else if (field.type === 'multi_select') {
             fieldValues[field.id] = Array.from(control.selectedOptions).map(function(option) { return option.value; });
+        } else if (field.type === 'file') {
+            fieldValues[field.id] = control.files && control.files.length ? control.files[0].name : '';
         } else {
             fieldValues[field.id] = control.value;
         }
@@ -1083,6 +2062,7 @@
     function renderField(field) {
         const wrap = document.createElement('div');
         wrap.className = MULTILINE_TYPES.includes(field.type) ? 'sm:col-span-2' : '';
+        wrap.dataset.fieldWrap = field.id;
 
         const label = document.createElement('label');
         label.className = 'block text-sm font-medium text-slate-700 mb-1';
@@ -1127,6 +2107,11 @@
             control.className = baseClass;
             control.rows = 4;
             control.value = Array.isArray(previousValue) ? previousValue.join('\n') : (previousValue || '');
+        } else if (field.type === 'file') {
+            control = document.createElement('input');
+            control.type = 'file';
+            control.className = baseClass + ' bg-white';
+            if (field.accept) control.accept = field.accept;
         } else {
             control = document.createElement('input');
             control.type = nativeInputType(field.type);
@@ -1172,6 +2157,7 @@
             seenIds.add(field.id);
             container.appendChild(renderField(field));
         });
+        updateCustomPanel();
     }
 
     function selectAgent(agentId) {
@@ -1182,14 +2168,25 @@
             card.classList.toggle('shadow-sm', isActive);
         });
         renderFieldsForAgent(agentId);
+        if (isNegativeKeywordAgent(agentId)) {
+            loadNegativeKeywordStatus();
+        }
     }
 
-    document.getElementById('agent').addEventListener('change', function() { renderFieldsForAgent(this.value); });
+    document.getElementById('agent').addEventListener('change', function() { selectAgent(this.value); });
     document.querySelectorAll('.agent-card').forEach(function(card) {
         card.addEventListener('click', function() { selectAgent(this.dataset.agentId); });
     });
 
-    renderFieldsForAgent(document.getElementById('agent').value);
+    const presetAgent = new URLSearchParams(window.location.search).get('agent');
+    if (presetAgent && AGENTS_BY_ID[presetAgent]) {
+        selectAgent(presetAgent);
+    } else {
+        renderFieldsForAgent(document.getElementById('agent').value);
+        if (isNegativeKeywordAgent(document.getElementById('agent').value)) {
+            loadNegativeKeywordStatus();
+        }
+    }
     if (window.__SEO_STUDIO_DEV__) {
         console.log('Schema-driven SEO form renderer loaded');
     }
@@ -1200,12 +2197,18 @@
         return String(raw || '').split(/\r?\n|,/).map(function(item) { return item.trim(); }).filter(Boolean);
     }
 
+    function agentUsesFileUpload(agentId) {
+        const agent = AGENTS_BY_ID[agentId] || {};
+        return ((agent.input_schema || []).some(function(field) { return field.type === 'file'; }));
+    }
+
     function collectPayload(agentId) {
         const container = document.getElementById('agent-fields-container');
         const payload = { agent: agentId, agent_id: agentId };
         container.querySelectorAll('[data-field-id]').forEach(function(control) {
             const id = control.dataset.fieldId;
             const type = control.dataset.fieldType;
+            if (type === 'file') return;
             if (type === 'checkbox') {
                 payload[id] = control.checked;
                 return;
@@ -1229,10 +2232,26 @@
         return payload;
     }
 
+    function collectFormData(agentId) {
+        const payload = collectPayload(agentId);
+        const formData = new FormData();
+        Object.keys(payload).forEach(function(key) {
+            const value = payload[key];
+            formData.append(key, Array.isArray(value) ? value.join('\n') : value);
+        });
+        document.getElementById('agent-fields-container').querySelectorAll('input[type="file"][data-field-id]').forEach(function(control) {
+            if (control.files && control.files.length) {
+                formData.append(control.dataset.fieldId, control.files[0]);
+            }
+        });
+        return formData;
+    }
+
     document.getElementById('agent-form').addEventListener('submit', async function(event) {
         event.preventDefault();
         const selectedAgent = document.getElementById('agent').value;
         const payload = collectPayload(selectedAgent);
+        const usesFileUpload = agentUsesFileUpload(selectedAgent);
 
         document.getElementById('result-status').textContent = 'Running...';
         document.getElementById('result-empty').classList.add('hidden');
@@ -1242,11 +2261,30 @@
         document.getElementById('result-output').textContent = '';
 
         try {
-            const response = await fetch('/run-agent', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
+            let response;
+            if (selectedAgent === 'negative_keyword' && negativeKeywordState.activeTab === 'google_ads') {
+                const startInput = document.getElementById('nk-start-date');
+                const endInput = document.getElementById('nk-end-date');
+                response = await fetch('/api/negative-keywords/analyse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ...payload,
+                        customer_id: negativeKeywordState.selectedCustomerId,
+                        campaign_ids: Array.from(negativeKeywordState.selectedCampaignIds),
+                        start_date: startInput ? startInput.value : '',
+                        end_date: endInput ? endInput.value : '',
+                    })
+                });
+            } else {
+                response = await fetch('/run-agent', usesFileUpload
+                    ? { method: 'POST', body: collectFormData(selectedAgent) }
+                    : {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            }
             const data = await response.json();
             document.getElementById('result-status').textContent = data.success ? 'Success' : 'Error';
             document.getElementById('result-output').textContent = JSON.stringify(data, null, 2);

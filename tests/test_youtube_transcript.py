@@ -2,7 +2,10 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
+from werkzeug.security import generate_password_hash
+
 from app import app
+from db.storage import create_user, get_user_by_email
 from services import youtube_transcript_service as service
 
 
@@ -73,6 +76,26 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
     def setUp(self):
         app.config["TESTING"] = True
         self.client = app.test_client()
+        user = get_user_by_email("youtube-tests@example.com")
+        if not user:
+            user_id = create_user("youtube-tests@example.com", generate_password_hash("Password123"))
+            user = {"id": user_id, "email": "youtube-tests@example.com"}
+        self.csrf_token = "youtube-csrf"
+        with self.client.session_transaction() as flask_session:
+            flask_session["auth_user_id"] = user["id"]
+            flask_session["csrf_token"] = self.csrf_token
+            flask_session["browser_session_id"] = "youtube-tests-session"
+        original_open = self.client.open
+
+        def open_with_auth(*args, **kwargs):
+            method = str(kwargs.get("method", "GET")).upper()
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
+                headers = kwargs.setdefault("headers", {})
+                headers.setdefault("X-CSRF-Token", self.csrf_token)
+                headers.setdefault("X-Requested-With", "XMLHttpRequest")
+            return original_open(*args, **kwargs)
+
+        self.client.open = open_with_auth
 
     def test_extract_video_id_accepts_supported_urls(self):
         expected = "abcDEF123_4"
@@ -132,8 +155,9 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         }, clear=True):
             proxy_config = service.build_proxy_config()
             diagnostics = service.get_proxy_diagnostics()
+            proxy_mode = service.get_proxy_mode()
         self.assertIsInstance(proxy_config, service.GenericProxyConfig)
-        self.assertEqual(service.get_proxy_mode(), "webshare_url")
+        self.assertEqual(proxy_mode, "webshare_url")
         self.assertEqual(diagnostics["webshare_proxy_url"], "Configured")
         self.assertNotIn("user:pass", str(diagnostics))
 

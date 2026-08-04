@@ -13,6 +13,7 @@ from agents.technical_audit      import TechnicalAuditAgent
 from agents.competitor_analysis  import CompetitorAnalysisAgent
 from agents.keyword_research     import KeywordResearchAgent
 from agents.keyword_clustering   import KeywordClusteringAgent
+from agents.negative_keyword     import NegativeKeywordAgent
 from agents.content_gap          import ContentGapAgent
 from agents.serp_analysis        import SerpAnalysisAgent
 from agents.rank_tracking        import RankTrackingAgent
@@ -52,6 +53,7 @@ _REGISTRY: dict = {
     "competitor_analysis":   (SEO_GROUP, CompetitorAnalysisAgent),
     "keyword_research":      (SEO_GROUP, KeywordResearchAgent),
     "keyword_clustering":    (SEO_GROUP, KeywordClusteringAgent),
+    "negative_keyword":      (SEO_GROUP, NegativeKeywordAgent),
     "content_gap":           (SEO_GROUP, ContentGapAgent),
     "serp_analysis":         (SEO_GROUP, SerpAnalysisAgent),
     "rank_tracking":         (SEO_GROUP, RankTrackingAgent),

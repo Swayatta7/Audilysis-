@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+
+{% block title %}Register{% endblock %}
+
+{% block content %}
+<div class="mx-auto max-w-md">
+    <div class="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+        <div class="mb-6">
+            <h2 class="text-2xl font-bold text-slate-900">Create your account</h2>
+            <p class="mt-1 text-sm text-slate-500">Register to get your own Audilysis workspace and Google Ads connections.</p>
+        </div>
+        {% if error %}
+        <div class="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{{ error }}</div>
+        {% endif %}
+        <form method="post" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div>
+                <label for="email" class="mb-1 block text-sm font-medium text-slate-700">Email</label>
+                <input id="email" name="email" type="email" required class="w-full rounded-lg border border-slate-300 px-4 py-2 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+                <label for="password" class="mb-1 block text-sm font-medium text-slate-700">Password</label>
+                <input id="password" name="password" type="password" required class="w-full rounded-lg border border-slate-300 px-4 py-2 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+                <label for="confirm_password" class="mb-1 block text-sm font-medium text-slate-700">Confirm Password</label>
+                <input id="confirm_password" name="confirm_password" type="password" required class="w-full rounded-lg border border-slate-300 px-4 py-2 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button type="submit" class="w-full rounded-lg bg-blue-600 px-4 py-2.5 font-semibold text-white hover:bg-blue-700">Create account</button>
+        </form>
+        <p class="mt-4 text-sm text-slate-500">
+            Already have an account?
+            <a href="{{ url_for('login') }}" class="font-medium text-blue-600 hover:text-blue-700">Log in</a>
+        </p>
+    </div>
+</div>
+{% endblock %}

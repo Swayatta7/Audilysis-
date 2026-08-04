@@ -14,7 +14,9 @@ from flask import Flask, request, jsonify, render_template, redirect, url_for, s
 # Imports from local packages
 from db.storage import (
     init_db, create_run, insert_mention_result, insert_competitor_metrics,
-    get_run, get_latest_run, get_mention_results, get_competitor_metrics, get_trend_data
+    get_negative_keyword_report,
+    get_run, get_latest_run, get_mention_results, get_competitor_metrics, get_trend_data,
+    list_negative_keyword_audit,
 )
 from api.dataforseo import query_platform
 from services.mailer import send_report_email
@@ -29,6 +31,39 @@ from services.youtube_transcript_service import (
     translate_existing_payload,
 )
 from services.diarization import get_speaker_detection_diagnostics, log_speaker_detection_diagnostics
+from services.google_ads_service import (
+    GoogleAdsIntegrationError,
+    apply_negative_keywords,
+    build_google_ads_connect_url,
+    disconnect_google_ads,
+    fetch_google_ads_campaigns,
+    fetch_google_ads_search_terms,
+    get_google_ads_status,
+    handle_google_ads_oauth_callback,
+    list_google_ads_accounts,
+)
+from services.auth import (
+    AuthError,
+    authenticate_user,
+    create_user_account,
+    csrf_protect,
+    current_user,
+    get_csrf_token,
+    login_required,
+    login_user,
+    logout_user,
+)
+from services.negative_keyword_service import (
+    NegativeKeywordError,
+    build_negative_keyword_csv,
+    create_rule as create_negative_keyword_rule,
+    delete_rule as delete_negative_keyword_rule,
+    get_negative_keyword_workspace_state,
+    reorder_rules as reorder_negative_keyword_rules,
+    save_custom_instructions,
+    update_rule as update_negative_keyword_rule,
+)
+from services.ownership import build_owner_context, extract_authenticated_user_id
 from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
@@ -38,6 +73,8 @@ from agents.agent_manager import (
     get_agents_by_group,
     run_agent,
 )
+from agents.negative_keyword import REPORT_DIR as NEGATIVE_KEYWORD_REPORT_DIR, is_safe_report_filename
+from agents.negative_keyword import NegativeKeywordAgent
 
 app = Flask(__name__)
 app.secret_key = get_env_value("FLASK_SECRET_KEY") or os.urandom(32)
@@ -148,6 +185,7 @@ def index():
     return redirect(url_for("setup"))
 
 @app.route("/setup")
+@login_required
 def setup():
     """Setup form screen."""
     return render_template("setup.html")
@@ -168,7 +206,116 @@ def youtube_transcript_error_response(error):
         "message": str(error),
     }), getattr(error, "status_code", 400)
 
+
+def google_ads_error_response(error):
+    return jsonify({
+        "success": False,
+        "status": "error",
+        "error": getattr(error, "error_code", "google_ads_error"),
+        "message": str(error),
+    }), getattr(error, "status_code", 400)
+
+
+def negative_keyword_error_response(error):
+    return jsonify({
+        "success": False,
+        "status": "error",
+        "error": "negative_keyword_error",
+        "message": str(error),
+    }), getattr(error, "status_code", 400)
+
+
+def get_browser_session_id():
+    browser_session_id = session.get("browser_session_id")
+    if not browser_session_id:
+        browser_session_id = uuid.uuid4().hex
+        session["browser_session_id"] = browser_session_id
+    return browser_session_id
+
+
+def allow_dev_session_ownership():
+    return is_development_mode() and get_env_value("AUDILYSIS_ALLOW_DEV_SESSION_OWNERSHIP").lower() in {"1", "true", "yes", "on"}
+
+
+def get_owner_context():
+    auth_user_id = extract_authenticated_user_id(session)
+    return build_owner_context(auth_user_id, get_browser_session_id(), allow_dev_session_ownership())
+
+
+def is_development_mode():
+    if app.debug or app.testing:
+        return True
+    return get_env_value("FLASK_DEBUG").lower() in {"1", "true", "yes", "on"}
+
+
+def build_ownership_payload(owner):
+    return {
+        "user_id": owner.user_id,
+        "owner_type": owner.owner_type,
+        "secure_auth": owner.secure_auth,
+        "development_mode": is_development_mode(),
+        "show_session_warning": allow_dev_session_ownership() and not owner.secure_auth,
+    }
+
+
+@app.context_processor
+def inject_template_auth_state():
+    return {
+        "current_user": current_user(),
+        "csrf_token": get_csrf_token(),
+    }
+
+
+@app.route("/register", methods=["GET", "POST"])
+@csrf_protect
+def register():
+    if current_user():
+        return redirect(url_for("dashboard"))
+    error = ""
+    if request.method == "POST":
+        email = request.form.get("email", "")
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        if password != confirm_password:
+            error = "Passwords do not match."
+        else:
+            try:
+                user = create_user_account(email, password)
+                login_user(user)
+                next_url = request.args.get("next") or url_for("dashboard")
+                return redirect(next_url)
+            except AuthError as exc:
+                error = str(exc)
+    return render_template("register.html", error=error)
+
+
+@app.route("/login", methods=["GET", "POST"])
+@csrf_protect
+def login():
+    if current_user():
+        return redirect(url_for("dashboard"))
+    error = ""
+    if request.method == "POST":
+        try:
+            user = authenticate_user(request.form.get("email", ""), request.form.get("password", ""))
+            login_user(user)
+            next_url = request.args.get("next") or url_for("dashboard")
+            return redirect(next_url)
+        except AuthError as exc:
+            error = str(exc)
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+@csrf_protect
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
 @app.route("/api/run", methods=["POST"])
+@login_required
+@csrf_protect
 def api_run():
     """Handles configuration submission and saves settings inside Flask session."""
     data = request.json
@@ -198,6 +345,7 @@ def api_run():
     return jsonify({"status": "success"})
 
 @app.route("/running")
+@login_required
 def running():
     """Progress screen rendering."""
     # Safety checks
@@ -206,6 +354,8 @@ def running():
     return render_template("running.html")
 
 @app.route("/api/cancel", methods=["POST"])
+@login_required
+@csrf_protect
 def api_cancel():
     """Sets current session identifier as cancelled."""
     run_sid = session.get("session_run_id")
@@ -214,6 +364,7 @@ def api_cancel():
     return jsonify({"status": "cancelled"})
 
 @app.route("/stream")
+@login_required
 def stream():
     """SSE streaming endpoint."""
     config = session.get("tracker_config")
@@ -421,30 +572,35 @@ def stream():
     return Response(generate(config, creds, email_cfg, run_id, session_run_id), mimetype='text/event-stream')
 
 @app.route("/agents")
+@login_required
 def agents_page():
     """SEO agent studio UI."""
     return render_template("agents.html", agents=get_agents_by_group(SEO_GROUP))
 
 
 @app.route("/content-agents")
+@login_required
 def content_agents_page():
     """Content marketing agent studio UI."""
     return render_template("content_agents.html", agents=get_agents_by_group(CONTENT_GROUP))
 
 
 @app.route("/social-agents")
+@login_required
 def social_agents_page():
     """Social media agent studio UI."""
     return render_template("social_agents.html", agents=get_agents_by_group(SOCIAL_GROUP))
 
 
 @app.route("/youtube-multilingual-transcripter")
+@login_required
 def youtube_multilingual_transcripter_page():
     """YouTube multilingual transcript tool UI."""
     return render_template("youtube_multilingual_transcripter.html")
 
 
 @app.route("/api/youtube-transcript/health")
+@login_required
 def youtube_transcript_health():
     """Health endpoint for the YouTube transcript feature."""
     return jsonify({
@@ -459,6 +615,7 @@ def youtube_transcript_health():
 
 
 @app.route("/api/youtube-transcript/languages")
+@login_required
 def youtube_transcript_languages():
     """Return backend-controlled supported translation languages."""
     return jsonify({
@@ -468,6 +625,8 @@ def youtube_transcript_languages():
 
 
 @app.route("/api/youtube-transcript/generate", methods=["POST"])
+@login_required
+@csrf_protect
 def youtube_transcript_generate():
     """Fetch a real YouTube transcript and optionally translate it."""
     payload = request.get_json(silent=True) or {}
@@ -483,6 +642,8 @@ def youtube_transcript_generate():
 
 
 @app.route("/api/youtube-transcript/translate", methods=["POST"])
+@login_required
+@csrf_protect
 def youtube_transcript_translate():
     """Translate existing normalized transcript segments with Google Translation."""
     payload = request.get_json(silent=True) or {}
@@ -494,6 +655,7 @@ def youtube_transcript_translate():
 
 
 @app.route("/api/youtube-transcript/download/<path:video_id>")
+@login_required
 def youtube_transcript_download(video_id):
     """Download a validated transcript as TXT, SRT, JSON, or VTT."""
     target_language = request.args.get("lang", "original")
@@ -509,22 +671,245 @@ def youtube_transcript_download(video_id):
     )
 
 
+@app.route("/integrations/google-ads/connect", methods=["GET"])
+@login_required
+def google_ads_connect():
+    state = uuid.uuid4().hex
+    session["google_ads_oauth_state"] = state
+    try:
+        auth_url = build_google_ads_connect_url(state)
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    return redirect(auth_url)
+
+
+@app.route("/integrations/google-ads/callback")
+@login_required
+def google_ads_callback():
+    expected_state = session.get("google_ads_oauth_state")
+    callback_state = request.args.get("state", "")
+    if not expected_state or callback_state != expected_state:
+        return google_ads_error_response(GoogleAdsIntegrationError(
+            "Google Ads OAuth state validation failed.",
+            status_code=400,
+            error_code="google_ads_invalid_state",
+        ))
+    try:
+        owner = get_owner_context()
+        handle_google_ads_oauth_callback(owner.user_id, owner.owner_key, expected_state, request.url)
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    finally:
+        session.pop("google_ads_oauth_state", None)
+    return redirect(url_for("agents_page", agent="negative_keyword", google_ads="connected"))
+
+
+@app.route("/api/negative-keywords/google-ads/status")
+@login_required
+def google_ads_status():
+    owner = get_owner_context()
+    return jsonify({
+        "success": True,
+        "ownership": build_ownership_payload(owner),
+        "google_ads": get_google_ads_status(owner.user_id, owner.owner_key),
+    })
+
+
+@app.route("/api/negative-keywords/google-ads/disconnect", methods=["POST"])
+@login_required
+@csrf_protect
+def google_ads_disconnect():
+    owner = get_owner_context()
+    return jsonify(disconnect_google_ads(owner.user_id, owner.owner_key))
+
+
+@app.route("/api/negative-keywords/google-ads/accounts")
+@login_required
+def google_ads_accounts():
+    try:
+        owner = get_owner_context()
+        accounts = list_google_ads_accounts(owner.user_id, owner.owner_key)
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    return jsonify({"success": True, "accounts": accounts})
+
+
+@app.route("/api/negative-keywords/google-ads/audit")
+@login_required
+def google_ads_audit():
+    owner = get_owner_context()
+    return jsonify({"success": True, "audit": list_negative_keyword_audit(owner.user_id, owner.owner_key)})
+
+
+@app.route("/api/negative-keywords/google-ads/campaigns", methods=["POST"])
+@login_required
+@csrf_protect
+def google_ads_campaigns():
+    payload = request.get_json(silent=True) or {}
+    try:
+        owner = get_owner_context()
+        campaigns = fetch_google_ads_campaigns(
+            owner.user_id,
+            owner.owner_key,
+            payload.get("customer_id", ""),
+            payload.get("search", ""),
+        )
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    return jsonify({"success": True, "campaigns": campaigns})
+
+
+@app.route("/api/negative-keywords/analyse", methods=["POST"])
+@login_required
+@csrf_protect
+def negative_keywords_analyse():
+    payload = request.get_json(silent=True) or {}
+    owner = get_owner_context()
+    try:
+        rows, source_metadata = fetch_google_ads_search_terms(
+            owner.user_id,
+            owner.owner_key,
+            payload.get("customer_id", ""),
+            payload.get("campaign_ids") or [],
+            payload.get("start_date", ""),
+            payload.get("end_date", ""),
+        )
+        agent = NegativeKeywordAgent()
+        result = agent.build_response_from_rows(
+            rows,
+            payload | {"_owner_key": owner.owner_key, "_user_id": owner.user_id},
+            source_metadata=source_metadata,
+            data_source_code="google_ads_api",
+            data_sources=[
+                {
+                    "name": "Google Ads API",
+                    "status": "Connected",
+                    "detail": (
+                        f"{source_metadata['parsed_rows']} search terms from customer "
+                        f"{source_metadata['customer_id']} between {source_metadata['date_start']} and {source_metadata['date_end']}"
+                    ),
+                }
+            ],
+            api_used=["Google Ads API", "Audilysis negative keyword rules"],
+        )
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    return jsonify(result)
+
+
+@app.route("/api/negative-keywords/google-ads/apply", methods=["POST"])
+@login_required
+@csrf_protect
+def negative_keywords_apply():
+    payload = request.get_json(silent=True) or {}
+    try:
+        owner = get_owner_context()
+        result = apply_negative_keywords(
+            owner.user_id,
+            owner.owner_key,
+            payload.get("customer_id", ""),
+            payload.get("recommendations") or [],
+            bool(payload.get("confirm")),
+        )
+    except GoogleAdsIntegrationError as error:
+        return google_ads_error_response(error)
+    return jsonify(result)
+
+
+@app.route("/api/negative-keywords/rules", methods=["GET", "POST"])
+@login_required
+@csrf_protect
+def negative_keyword_rules():
+    owner = get_owner_context()
+    try:
+        if request.method == "GET":
+            return jsonify({"success": True, "ownership": build_ownership_payload(owner), **get_negative_keyword_workspace_state(owner.owner_key, owner.user_id)})
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"success": True, **create_negative_keyword_rule(owner.owner_key, owner.user_id, payload)})
+    except NegativeKeywordError as error:
+        return negative_keyword_error_response(error)
+
+
+@app.route("/api/negative-keywords/rules/<int:rule_id>", methods=["PUT", "DELETE"])
+@login_required
+@csrf_protect
+def negative_keyword_rule_detail(rule_id):
+    owner = get_owner_context()
+    try:
+        if request.method == "DELETE":
+            return jsonify({"success": True, **delete_negative_keyword_rule(owner.owner_key, owner.user_id, rule_id)})
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"success": True, **update_negative_keyword_rule(owner.owner_key, owner.user_id, rule_id, payload)})
+    except NegativeKeywordError as error:
+        return negative_keyword_error_response(error)
+
+
+@app.route("/api/negative-keywords/rules/reorder", methods=["POST"])
+@login_required
+@csrf_protect
+def negative_keyword_rule_reorder():
+    payload = request.get_json(silent=True) or {}
+    try:
+        owner = get_owner_context()
+        return jsonify({"success": True, **reorder_negative_keyword_rules(owner.owner_key, owner.user_id, payload.get("rule_ids") or [])})
+    except NegativeKeywordError as error:
+        return negative_keyword_error_response(error)
+
+
+@app.route("/api/negative-keywords/instructions", methods=["GET", "POST"])
+@login_required
+@csrf_protect
+def negative_keyword_instructions():
+    owner = get_owner_context()
+    if request.method == "GET":
+        return jsonify({"success": True, "ownership": build_ownership_payload(owner), **get_negative_keyword_workspace_state(owner.owner_key, owner.user_id)})
+    payload = request.get_json(silent=True) or {}
+    return jsonify({"success": True, **save_custom_instructions(owner.owner_key, owner.user_id, payload.get("custom_instructions", ""))})
+
+
+@app.route("/api/negative-keywords/export/csv", methods=["POST"])
+@login_required
+@csrf_protect
+def negative_keyword_export_csv():
+    payload = request.get_json(silent=True) or {}
+    rows = payload.get("rows") or []
+    csv_content = build_negative_keyword_csv(rows)
+    return Response(
+        csv_content,
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="negative-keywords.csv"'},
+    )
+
+
 @app.route("/seo-reports")
+@login_required
 def seo_reports_page():
     """SEO reports page showing reporting agents."""
     return render_template("seo_reports.html")
 
 
 @app.route("/seo-strategy")
+@login_required
 def seo_strategy_page():
     """SEO strategy page showing the strategy agent."""
     return render_template("seo_strategy.html")
 
 
 @app.route("/run-agent", methods=["POST"])
+@login_required
+@csrf_protect
 def run_agent_route():
     """Execute a selected SEO, Content, or Social agent and return structured JSON."""
-    payload = request.get_json(silent=True) or {}
+    if request.mimetype == "multipart/form-data":
+        payload = request.form.to_dict(flat=True)
+        payload["_files"] = {key: request.files[key] for key in request.files}
+        for key, file_storage in payload["_files"].items():
+            payload[key] = file_storage
+    else:
+        payload = request.get_json(silent=True) or {}
+    owner = get_owner_context()
+    payload["_owner_key"] = owner.owner_key
+    payload["_user_id"] = owner.user_id
     agent_id = (payload.get("agent") or payload.get("agent_id") or "").strip()
     if not agent_id:
         return jsonify({"success": False, "message": "Agent is required.", "agent": None, "summary": "", "recommendations": [], "data": {}}), 400
@@ -535,7 +920,30 @@ def run_agent_route():
     return jsonify(result)
 
 
+@app.route("/download-negative-keyword-report/<path:filename>")
+@login_required
+def download_negative_keyword_report(filename):
+    """Download a previously generated negative keyword Excel report."""
+    if not is_safe_report_filename(filename):
+        return "Invalid report filename.", 400
+    owner = get_owner_context()
+    report_record = get_negative_keyword_report(owner.user_id, owner.owner_key, filename)
+    if not report_record:
+        return "Report not found.", 404
+    report_path = (NEGATIVE_KEYWORD_REPORT_DIR / filename).resolve()
+    if NEGATIVE_KEYWORD_REPORT_DIR.resolve() not in report_path.parents:
+        return "Invalid report path.", 400
+    if not report_path.exists():
+        return "Report not found.", 404
+    return Response(
+        report_path.read_bytes(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.route("/dashboard")
+@login_required
 def dashboard():
     """Analytics dashboard main interface view."""
     # Read last run ID
@@ -568,6 +976,7 @@ def dashboard():
     return render_template("dashboard.html", **report_data)
 
 @app.route("/download-report")
+@login_required
 def download_report():
     """Generates a downloadable offline PDF file."""
     run_id = request.args.get("run_id", type=int)
@@ -599,6 +1008,8 @@ def download_report():
     )
 
 @app.route("/api/email-report", methods=["POST"])
+@login_required
+@csrf_protect
 def api_email_report():
     """AJAX endpoint to email latest report on demand as PDF."""
     data = request.json or {}

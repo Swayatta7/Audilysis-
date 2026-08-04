@@ -42,6 +42,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- Custom CSS -->
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <style>
         body {
             font-family: 'Inter', sans-serif;
@@ -128,10 +129,21 @@
                 </h1>
             </div>
             <div class="flex items-center gap-4">
-                <span class="text-xs px-2.5 py-1 font-medium bg-emerald-50 text-emerald-700 rounded-full border border-emerald-200 flex items-center gap-1.5">
-                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    API Connected
+                {% if current_user %}
+                <span class="text-xs px-2.5 py-1 font-medium bg-slate-100 text-slate-700 rounded-full border border-slate-200">
+                    {{ current_user.email }}
                 </span>
+                <form method="post" action="{{ url_for('logout') }}" class="inline-flex">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                        <i class="fa-solid fa-arrow-right-from-bracket"></i>
+                        Logout
+                    </button>
+                </form>
+                {% else %}
+                <a href="{{ url_for('login') }}" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Login</a>
+                <a href="{{ url_for('register') }}" class="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700">Register</a>
+                {% endif %}
             </div>
         </header>
 
@@ -143,6 +155,23 @@
 
     <!-- Mobile Menu Toggle Script -->
     <script>
+        window.AUDILYSIS_CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+        const __audylisisOriginalFetch = window.fetch.bind(window);
+        window.fetch = function(resource, options = {}) {
+            const method = String(options.method || 'GET').toUpperCase();
+            const sameOrigin = typeof resource === 'string' ? resource.startsWith('/') || resource.startsWith(window.location.origin) : true;
+            if (sameOrigin && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+                options.headers = new Headers(options.headers || {});
+                if (!options.headers.has('X-CSRF-Token')) {
+                    options.headers.set('X-CSRF-Token', window.AUDILYSIS_CSRF_TOKEN);
+                }
+                if (!options.headers.has('X-Requested-With')) {
+                    options.headers.set('X-Requested-With', 'XMLHttpRequest');
+                }
+            }
+            return __audylisisOriginalFetch(resource, options);
+        };
+
         document.getElementById('mobile-menu-btn')?.addEventListener('click', function() {
             const nav = document.getElementById('sidebar-nav');
             nav.classList.toggle('hidden');

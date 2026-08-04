@@ -7,11 +7,12 @@ import unittest
 from unittest.mock import patch
 
 import requests
+from werkzeug.security import generate_password_hash
 
 from app import app
 from agents.agent_manager import CONTENT_GROUP, SEO_GROUP, SOCIAL_GROUP, get_all_agents
 from agents.base_agent import BaseAgent
-from db.storage import init_db, create_run
+from db.storage import create_run, create_user, get_user_by_email, init_db
 from services.pdf_generator import generate_pdf_report
 
 
@@ -19,6 +20,26 @@ class AgentRoutesTestCase(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
         app.config['TESTING'] = True
+        user = get_user_by_email("agent-tests@example.com")
+        if not user:
+            user_id = create_user("agent-tests@example.com", generate_password_hash("Password123"))
+            user = {"id": user_id, "email": "agent-tests@example.com"}
+        self.csrf_token = "test-csrf-token"
+        with self.client.session_transaction() as flask_session:
+            flask_session["auth_user_id"] = user["id"]
+            flask_session["csrf_token"] = self.csrf_token
+            flask_session["browser_session_id"] = "agent-tests-session"
+        original_open = self.client.open
+
+        def open_with_auth(*args, **kwargs):
+            method = str(kwargs.get("method", "GET")).upper()
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
+                headers = kwargs.setdefault("headers", {})
+                headers.setdefault("X-CSRF-Token", self.csrf_token)
+                headers.setdefault("X-Requested-With", "XMLHttpRequest")
+            return original_open(*args, **kwargs)
+
+        self.client.open = open_with_auth
 
     def test_agents_page_renders(self):
         response = self.client.get('/agents')
@@ -480,7 +501,7 @@ class AgentRoutesTestCase(unittest.TestCase):
 
     def test_all_seo_agents_have_nonempty_unique_input_schema(self):
         seo_agents = get_all_agents()[SEO_GROUP]
-        self.assertEqual(len(seo_agents), 16)
+        self.assertEqual(len(seo_agents), 17)
         for agent in seo_agents:
             schema = agent['input_schema']
             self.assertTrue(schema, f"{agent['id']} has an empty INPUT_SCHEMA")
@@ -506,6 +527,7 @@ class AgentRoutesTestCase(unittest.TestCase):
 
         expected_fields = {
             'technical_audit': {'website_url', 'crawl_depth', 'maximum_pages', 'device', 'sitemap_url', 'robots_txt_url', 'force_refresh'},
+            'negative_keyword': {'search_terms_file', 'company_name', 'account_name', 'target_locations', 'excluded_locations', 'competitor_terms', 'custom_negative_terms', 'high_cost_threshold', 'min_clicks_for_spend_rule', 'conversion_threshold'},
             'backlink_verification': {'backlink_url', 'target_url', 'expected_anchor_text', 'project_name', 'verification_frequency', 'force_javascript_rendering'},
             'strategy': {'website_url', 'business_goal', 'target_country', 'target_audience', 'target_keywords', 'competitor_urls', 'timeframe', 'budget_level', 'team_capacity', 'project_name', 'selected_agent_results'},
         }
