@@ -4,3 +4,11 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+# Generated reports
+data/negative_keyword_reports/
+
+# Reference materials
+reference_materials/
+
+# Local environment
+.env
