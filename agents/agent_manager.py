@@ -45,6 +45,7 @@ from agents.social_analytics     import SocialAnalyticsAgent
 # Metadata (name, description, icon, category) is pulled from the class itself.
 
 SEO_GROUP = "SEO AI Agents"
+PPC_GROUP = "PPC"
 CONTENT_GROUP = "Content"
 SOCIAL_GROUP = "Social"
 
@@ -53,7 +54,7 @@ _REGISTRY: dict = {
     "competitor_analysis":   (SEO_GROUP, CompetitorAnalysisAgent),
     "keyword_research":      (SEO_GROUP, KeywordResearchAgent),
     "keyword_clustering":    (SEO_GROUP, KeywordClusteringAgent),
-    "negative_keyword":      (SEO_GROUP, NegativeKeywordAgent),
+    "negative_keyword":      (PPC_GROUP, NegativeKeywordAgent),
     "content_gap":           (SEO_GROUP, ContentGapAgent),
     "serp_analysis":         (SEO_GROUP, SerpAnalysisAgent),
     "rank_tracking":         (SEO_GROUP, RankTrackingAgent),
@@ -106,7 +107,7 @@ def get_all_agents() -> dict:
     Returns registered agents grouped by SEO, Content, and Social category.
     Used by the studio templates to render group-specific cards.
     """
-    groups = {SEO_GROUP: [], CONTENT_GROUP: [], SOCIAL_GROUP: []}
+    groups = {SEO_GROUP: [], PPC_GROUP: [], CONTENT_GROUP: [], SOCIAL_GROUP: []}
     for agent_id, (group, cls) in _REGISTRY.items():
         groups[group].append(_agent_metadata(agent_id, group, cls))
     return groups

@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 from app import app
 from db.storage import DB_PATH, get_user_by_email
@@ -145,7 +146,19 @@ class AuthenticationTestCase(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 401)
         data = response.get_json()
-        self.assertEqual(data["error"], "authentication_required")
+        self.assertEqual(data["error"], "Authentication required")
+        self.assertEqual(data["error_code"], "authentication_required")
+        self.assertFalse(data["ok"])
+        self.assertEqual(response.mimetype, "application/json")
+
+    def test_run_agent_requires_authentication_and_returns_json(self):
+        response = self.client.post("/run-agent", json={"agent": "keyword_clustering", "keyword_list": "seo audit"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.mimetype, "application/json")
+        data = response.get_json()
+        self.assertEqual(data["error"], "Authentication required")
+        self.assertEqual(data["error_code"], "authentication_required")
+        self.assertFalse(data["ok"])
 
     def test_logout_requires_csrf(self):
         csrf_token = self._csrf_token("/register")
@@ -176,8 +189,37 @@ class AuthenticationTestCase(unittest.TestCase):
             "risk": "LOW",
             "match_type": "PHRASE",
         }, headers={"X-Requested-With": "XMLHttpRequest"})
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "csrf_failed")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["error"], "CSRF validation failed.")
+        self.assertEqual(response.get_json()["error_code"], "csrf_failed")
+
+    def test_missing_api_route_returns_json_not_html(self):
+        response = self.client.get("/api/does-not-exist", headers={"X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(response.get_json()["error_code"], "not_found")
+
+    def test_run_agent_server_failure_returns_json(self):
+        csrf_token = self._csrf_token("/register")
+        self.client.post("/register", data={
+            "email": self.email,
+            "password": self.password,
+            "confirm_password": self.password,
+            "csrf_token": csrf_token,
+        })
+        with self.client.session_transaction() as flask_session:
+            api_csrf_token = flask_session["csrf_token"]
+        with patch("app.run_agent", side_effect=RuntimeError("boom")):
+            response = self.client.post(
+                "/run-agent",
+                json={"agent": "keyword_clustering", "keyword_list": "seo audit"},
+                headers={"X-CSRF-Token": api_csrf_token, "X-Requested-With": "XMLHttpRequest"},
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.mimetype, "application/json")
+        data = response.get_json()
+        self.assertEqual(data["error"], "Server error")
+        self.assertEqual(data["error_code"], "server_error")
 
     def test_password_hash_authenticates_through_service(self):
         csrf_token = self._csrf_token("/register")

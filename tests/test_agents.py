@@ -10,7 +10,7 @@ import requests
 from werkzeug.security import generate_password_hash
 
 from app import app
-from agents.agent_manager import CONTENT_GROUP, SEO_GROUP, SOCIAL_GROUP, get_all_agents
+from agents.agent_manager import CONTENT_GROUP, PPC_GROUP, SEO_GROUP, SOCIAL_GROUP, get_all_agents
 from agents.base_agent import BaseAgent
 from db.storage import create_run, create_user, get_user_by_email, init_db
 from services.pdf_generator import generate_pdf_report
@@ -45,6 +45,15 @@ class AgentRoutesTestCase(unittest.TestCase):
         response = self.client.get('/agents')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'SEO Agent Studio', response.data)
+        self.assertIn(b'SEO AI Agents', response.data)
+        self.assertNotIn(b'data-agent-id="negative_keyword"', response.data)
+
+    def test_negative_keyword_agent_has_standalone_agents_route(self):
+        response = self.client.get('/agents?agent=negative_keyword')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'Negative Keyword Agent', response.data)
+        self.assertIn(b'PPC Agents', response.data)
+        self.assertIn(b'data-agent-id="negative_keyword"', response.data)
 
     def test_index_route_redirects(self):
         response = self.client.get('/', follow_redirects=False)
@@ -154,7 +163,7 @@ class AgentRoutesTestCase(unittest.TestCase):
         response = self.client.get('/content-agents')
         self.assertEqual(response.status_code, 200)
         hrefs = set(re.findall(rb'href="([^"#]+)"', response.data))
-        required = {b'/setup', b'/dashboard', b'/agents', b'/seo-reports', b'/seo-strategy', b'/content-agents', b'/social-agents', b'/'}
+        required = {b'/setup', b'/dashboard', b'/agents', b'/agents?agent=negative_keyword', b'/seo-reports', b'/seo-strategy', b'/content-agents', b'/social-agents', b'/'}
         self.assertTrue(required.issubset(hrefs))
         for href in required - {b'/'}:
             link_response = self.client.get(href.decode('utf-8'))
@@ -171,6 +180,7 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertIn(str(len(grouped[SEO_GROUP])).encode(), response.data)
         self.assertIn(str(len(grouped[CONTENT_GROUP])).encode(), response.data)
         self.assertIn(str(len(grouped[SOCIAL_GROUP])).encode(), response.data)
+        self.assertEqual(len(grouped[PPC_GROUP]), 1)
 
     def test_all_registered_agents_have_required_metadata_and_run(self):
         grouped = get_all_agents()
@@ -501,7 +511,8 @@ class AgentRoutesTestCase(unittest.TestCase):
 
     def test_all_seo_agents_have_nonempty_unique_input_schema(self):
         seo_agents = get_all_agents()[SEO_GROUP]
-        self.assertEqual(len(seo_agents), 17)
+        self.assertEqual(len(seo_agents), 16)
+        self.assertNotIn('negative_keyword', {agent['id'] for agent in seo_agents})
         for agent in seo_agents:
             schema = agent['input_schema']
             self.assertTrue(schema, f"{agent['id']} has an empty INPUT_SCHEMA")
@@ -527,7 +538,6 @@ class AgentRoutesTestCase(unittest.TestCase):
 
         expected_fields = {
             'technical_audit': {'website_url', 'crawl_depth', 'maximum_pages', 'device', 'sitemap_url', 'robots_txt_url', 'force_refresh'},
-            'negative_keyword': {'search_terms_file', 'company_name', 'account_name', 'target_locations', 'excluded_locations', 'competitor_terms', 'custom_negative_terms', 'high_cost_threshold', 'min_clicks_for_spend_rule', 'conversion_threshold'},
             'backlink_verification': {'backlink_url', 'target_url', 'expected_anchor_text', 'project_name', 'verification_frequency', 'force_javascript_rendering'},
             'strategy': {'website_url', 'business_goal', 'target_country', 'target_audience', 'target_keywords', 'competitor_urls', 'timeframe', 'budget_level', 'team_capacity', 'project_name', 'selected_agent_results'},
         }
@@ -538,6 +548,15 @@ class AgentRoutesTestCase(unittest.TestCase):
         for marker in ('id="brand_name"', 'id="industry"', 'id="content_type"', 'id="impressions"', 'setAgentFieldVisibility'):
             self.assertNotIn(marker, html)
         self.assertIn('id="agent-fields-container"', html)
+
+        standalone = self.client.get('/agents?agent=negative_keyword')
+        standalone_html = standalone.data.decode('utf-8')
+        standalone_match = re.search(r'<script id="agents-data" type="application/json">(.*?)</script>', standalone_html, re.S)
+        self.assertIsNotNone(standalone_match)
+        standalone_agents = {agent['id']: agent for agent in json.loads(standalone_match.group(1))}
+        negative_fields = {'search_terms_file', 'company_name', 'account_name', 'target_locations', 'excluded_locations', 'competitor_terms', 'custom_negative_terms', 'high_cost_threshold', 'min_clicks_for_spend_rule', 'conversion_threshold'}
+        self.assertEqual(set(standalone_agents.keys()), {'negative_keyword'})
+        self.assertEqual({field['id'] for field in standalone_agents['negative_keyword']['input_schema']}, negative_fields)
 
     @patch('agents.weekly_report.get_latest_run')
     @patch('agents.weekly_report.get_mention_results', return_value=[])

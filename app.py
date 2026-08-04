@@ -5,11 +5,13 @@ import time
 import uuid
 import threading
 import webbrowser
+from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
 
 from flask import Flask, request, jsonify, render_template, redirect, url_for, session, Response
+from werkzeug.exceptions import HTTPException
 
 # Imports from local packages
 from db.storage import (
@@ -41,6 +43,7 @@ from services.google_ads_service import (
     get_google_ads_status,
     handle_google_ads_oauth_callback,
     list_google_ads_accounts,
+    log_google_ads_redirect_uri,
 )
 from services.auth import (
     AuthError,
@@ -49,6 +52,7 @@ from services.auth import (
     csrf_protect,
     current_user,
     get_csrf_token,
+    is_api_request,
     login_required,
     login_user,
     logout_user,
@@ -67,10 +71,12 @@ from services.ownership import build_owner_context, extract_authenticated_user_i
 from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
+    PPC_GROUP,
     SEO_GROUP,
     SOCIAL_GROUP,
     get_all_agents,
     get_agents_by_group,
+    get_agent_metadata,
     run_agent,
 )
 from agents.negative_keyword import REPORT_DIR as NEGATIVE_KEYWORD_REPORT_DIR, is_safe_report_filename
@@ -80,6 +86,7 @@ app = Flask(__name__)
 app.secret_key = get_env_value("FLASK_SECRET_KEY") or os.urandom(32)
 init_db()
 log_speaker_detection_diagnostics()
+log_google_ads_redirect_uri("google_ads_startup")
 
 # Thread-safe tracker cancellation map
 cancelled_runs = set()
@@ -223,6 +230,49 @@ def negative_keyword_error_response(error):
         "error": "negative_keyword_error",
         "message": str(error),
     }), getattr(error, "status_code", 400)
+
+
+def json_error_response(message: str, status_code: int, error_code: str):
+    return jsonify({
+        "ok": False,
+        "success": False,
+        "error": message,
+        "error_code": error_code,
+        "message": message,
+    }), status_code
+
+
+def request_prefers_json_errors() -> bool:
+    return is_api_request()
+
+
+@app.errorhandler(404)
+def handle_not_found(error):
+    if request_prefers_json_errors():
+        return json_error_response("Endpoint not found", 404, "not_found")
+    return error
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(error):
+    if request_prefers_json_errors():
+        return json_error_response("Method not allowed", 405, "method_not_allowed")
+    return error
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(error):
+    if isinstance(error, HTTPException):
+        if not request_prefers_json_errors():
+            return error
+        status_code = error.code or 500
+        message = error.description or HTTPStatus(status_code).phrase
+        return json_error_response(message, status_code, error.name.lower().replace(" ", "_"))
+    if not request_prefers_json_errors():
+        app.logger.exception("Unhandled page exception on %s", request.path)
+        return "Internal Server Error", 500
+    app.logger.exception("Unhandled API exception on %s", request.path)
+    return json_error_response("Server error", 500, "server_error")
 
 
 def get_browser_session_id():
@@ -575,7 +625,13 @@ def stream():
 @login_required
 def agents_page():
     """SEO agent studio UI."""
-    return render_template("agents.html", agents=get_agents_by_group(SEO_GROUP))
+    selected_agent = (request.args.get("agent") or "").strip()
+    if selected_agent == "negative_keyword":
+        agent = get_agent_metadata("negative_keyword")
+        if not agent:
+            return redirect(url_for("agents_page"))
+        return render_template("agents.html", agents=[agent], standalone_agent=agent)
+    return render_template("agents.html", agents=get_agents_by_group(SEO_GROUP), standalone_agent=None)
 
 
 @app.route("/content-agents")
@@ -914,7 +970,11 @@ def run_agent_route():
     if not agent_id:
         return jsonify({"success": False, "message": "Agent is required.", "agent": None, "summary": "", "recommendations": [], "data": {}}), 400
 
-    result = run_agent(agent_id, payload)
+    try:
+        result = run_agent(agent_id, payload)
+    except Exception:
+        app.logger.exception("run_agent_route_failed agent=%s", agent_id)
+        return json_error_response("Server error", 500, "server_error")
     if result.get("status") == "error" and not result.get("success"):
         return jsonify(result), 400
     return jsonify(result)
@@ -970,6 +1030,7 @@ def dashboard():
     grouped_agents = get_all_agents()
     report_data["agent_counts"] = {
         "SEO": len(grouped_agents.get(SEO_GROUP, [])),
+        "PPC": len(grouped_agents.get(PPC_GROUP, [])),
         "Content": len(grouped_agents.get(CONTENT_GROUP, [])),
         "Social": len(grouped_agents.get(SOCIAL_GROUP, [])),
     }

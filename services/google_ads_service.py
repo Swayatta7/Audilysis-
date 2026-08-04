@@ -1,6 +1,8 @@
 import re
+import logging
 from dataclasses import dataclass
 from datetime import date
+from urllib.parse import urlparse
 
 from agents.runtime_config import get_env_value
 from db.storage import (
@@ -41,10 +43,10 @@ except ImportError as exc:
 
 SCOPES = [
     "https://www.googleapis.com/auth/adwords",
-    "https://www.googleapis.com/auth/userinfo.profile",
 ]
 GAQL_VERSION = "v24"
 CUSTOMER_ID_PATTERN = re.compile(r"^\d{10}$")
+logger = logging.getLogger(__name__)
 
 
 class GoogleAdsIntegrationError(Exception):
@@ -119,6 +121,7 @@ def disconnect_google_ads(user_id: int | None, owner_key: str) -> dict:
 def build_google_ads_connect_url(state: str) -> str:
     ensure_google_ads_dependencies()
     ensure_google_ads_configuration()
+    log_google_ads_redirect_uri("google_ads_oauth_connect")
     flow = build_oauth_flow(state)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
@@ -418,6 +421,31 @@ def ensure_google_ads_configuration():
             status_code=500,
             error_code="google_ads_config_missing",
         )
+
+
+def redact_google_ads_redirect_uri() -> dict:
+    redirect_uri = get_google_ads_config().redirect_uri.strip()
+    if not redirect_uri:
+        return {"configured": False, "scheme": "", "host": "", "path": ""}
+    parsed = urlparse(redirect_uri)
+    return {
+        "configured": True,
+        "scheme": parsed.scheme,
+        "host": parsed.netloc,
+        "path": parsed.path or "/",
+    }
+
+
+def log_google_ads_redirect_uri(event: str = "google_ads_redirect_uri") -> None:
+    details = redact_google_ads_redirect_uri()
+    logger.info(
+        "%s configured=%s scheme=%s host=%s path=%s",
+        event,
+        details["configured"],
+        details["scheme"] or "-",
+        details["host"] or "-",
+        details["path"] or "-",
+    )
 
 
 def build_oauth_flow(state: str):

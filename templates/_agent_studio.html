@@ -1735,7 +1735,7 @@
     async function loadNegativeKeywordStatus() {
         try {
             const response = await fetch('/api/negative-keywords/google-ads/status');
-            const data = await response.json();
+            const data = await parseFetchResponse(response, 'Unable to load Google Ads status.');
             negativeKeywordState.status = data.google_ads || {};
             negativeKeywordState.ownership = data.ownership || null;
             negativeKeywordState.error = '';
@@ -1754,8 +1754,7 @@
     async function loadNegativeKeywordWorkspace() {
         try {
             const response = await fetch('/api/negative-keywords/rules');
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.message || 'Unable to load rules.');
+            const data = await parseFetchResponse(response, 'Unable to load rules.');
             negativeKeywordState.rules = data.rules || [];
             negativeKeywordState.customInstructions = data.custom_instructions || '';
             negativeKeywordState.ownership = data.ownership || negativeKeywordState.ownership;
@@ -1770,8 +1769,7 @@
     async function loadNegativeKeywordAccounts() {
         try {
             const response = await fetch('/api/negative-keywords/google-ads/accounts');
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.message || data.error || 'Unable to load Google Ads accounts.');
+            const data = await parseFetchResponse(response, 'Unable to load Google Ads accounts.');
             negativeKeywordState.accounts = data.accounts || [];
             if (!negativeKeywordState.selectedCustomerId && negativeKeywordState.accounts.length) {
                 negativeKeywordState.selectedCustomerId = negativeKeywordState.accounts[0].customer_id;
@@ -1806,8 +1804,7 @@
                     search: negativeKeywordState.campaignSearch,
                 })
             });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.message || data.error || 'Unable to load campaigns.');
+            const data = await parseFetchResponse(response, 'Unable to load campaigns.');
             negativeKeywordState.campaigns = data.campaigns || [];
             negativeKeywordState.selectedCampaignIds = new Set(
                 Array.from(negativeKeywordState.selectedCampaignIds).filter(function(campaignId) {
@@ -1860,12 +1857,9 @@
     }
 
     async function disconnectNegativeKeywordGoogleAds() {
-        const response = await fetch('/api/negative-keywords/google-ads/disconnect', { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to disconnect Google Ads.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const response = await fetch('/api/negative-keywords/google-ads/disconnect', { method: 'POST' });
+            await parseFetchResponse(response, 'Unable to disconnect Google Ads.');
             negativeKeywordState.accounts = [];
             negativeKeywordState.campaigns = [];
             negativeKeywordState.selectedCustomerId = '';
@@ -1873,6 +1867,9 @@
             negativeKeywordState.status = { ...(negativeKeywordState.status || {}), connected: false, has_stored_token: false, reason: 'Disconnected' };
             negativeKeywordState.error = '';
             negativeKeywordState.notice = 'Google Ads disconnected.';
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to disconnect Google Ads.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
@@ -1941,30 +1938,30 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to save rule.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const data = await parseFetchResponse(response, 'Unable to save rule.');
             negativeKeywordState.rules = data.rules || [];
             negativeKeywordState.customInstructions = data.custom_instructions || negativeKeywordState.customInstructions;
             negativeKeywordState.error = '';
             negativeKeywordState.notice = negativeKeywordState.editingRuleId ? 'Rule updated.' : 'Rule created.';
             closeNegativeKeywordRuleEditor();
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to save rule.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
 
     async function deleteNegativeKeywordRule(ruleId) {
-        const response = await fetch('/api/negative-keywords/rules/' + ruleId, { method: 'DELETE' });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to delete rule.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const response = await fetch('/api/negative-keywords/rules/' + ruleId, { method: 'DELETE' });
+            const data = await parseFetchResponse(response, 'Unable to delete rule.');
             negativeKeywordState.rules = data.rules || [];
             negativeKeywordState.error = '';
             negativeKeywordState.notice = 'Rule deleted.';
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to delete rule.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
@@ -1975,14 +1972,14 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ enabled: enabled })
         });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to update rule.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const data = await parseFetchResponse(response, 'Unable to update rule.');
             negativeKeywordState.rules = data.rules || [];
             negativeKeywordState.error = '';
-            negativeKeywordState.notice = enabled === 'true' ? 'Rule enabled.' : 'Rule disabled.';
+            negativeKeywordState.notice = enabled ? 'Rule enabled.' : 'Rule disabled.';
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to update rule.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
@@ -1999,14 +1996,14 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ rule_ids: rules.map(function(rule) { return rule.id; }) })
         });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to reorder rules.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const data = await parseFetchResponse(response, 'Unable to reorder rules.');
             negativeKeywordState.rules = data.rules || [];
             negativeKeywordState.error = '';
             negativeKeywordState.notice = 'Rule order updated.';
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to reorder rules.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
@@ -2019,15 +2016,15 @@
                 custom_instructions: document.getElementById('nk-custom-instructions').value
             })
         });
-        const data = await response.json();
-        if (!response.ok) {
-            negativeKeywordState.error = data.message || 'Unable to save instructions.';
-            negativeKeywordState.notice = '';
-        } else {
+        try {
+            const data = await parseFetchResponse(response, 'Unable to save instructions.');
             negativeKeywordState.customInstructions = data.custom_instructions || '';
             negativeKeywordState.rules = data.rules || negativeKeywordState.rules;
             negativeKeywordState.error = '';
             negativeKeywordState.notice = 'Instructions saved.';
+        } catch (error) {
+            negativeKeywordState.error = error.message || 'Unable to save instructions.';
+            negativeKeywordState.notice = '';
         }
         updateCustomPanel();
     }
@@ -2247,6 +2244,24 @@
         return formData;
     }
 
+    async function parseFetchResponse(response, fallbackMessage) {
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.message || data.error || fallbackMessage || 'Request failed.');
+            }
+            return data;
+        }
+        const text = await response.text();
+        const trimmed = String(text || '').trim();
+        const statusDetail = 'HTTP ' + response.status;
+        if (trimmed.startsWith('<')) {
+            throw new Error((fallbackMessage || 'Request failed.') + ' ' + statusDetail + ': server returned HTML instead of JSON.');
+        }
+        throw new Error((fallbackMessage || 'Request failed.') + ' ' + statusDetail);
+    }
+
     document.getElementById('agent-form').addEventListener('submit', async function(event) {
         event.preventDefault();
         const selectedAgent = document.getElementById('agent').value;
@@ -2285,7 +2300,7 @@
                     body: JSON.stringify(payload)
                 });
             }
-            const data = await response.json();
+            const data = await parseFetchResponse(response, 'Agent request failed.');
             document.getElementById('result-status').textContent = data.success ? 'Success' : 'Error';
             document.getElementById('result-output').textContent = JSON.stringify(data, null, 2);
             document.getElementById('result-view').innerHTML = renderAgentSpecificView(selectedAgent, data);

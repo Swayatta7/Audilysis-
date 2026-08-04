@@ -86,7 +86,13 @@ def validate_csrf():
 
 
 def is_api_request() -> bool:
-    return request.path.startswith("/api/") or request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    return (
+        request.path.startswith("/api/")
+        or request.path in {"/run-agent", "/stream"}
+        or request.is_json
+        or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+        or "application/json" in (request.headers.get("Accept", "") or "").lower()
+    )
 
 
 def login_required(view):
@@ -95,7 +101,13 @@ def login_required(view):
         if is_authenticated():
             return view(*args, **kwargs)
         if is_api_request():
-            return jsonify({"success": False, "error": "authentication_required", "message": "Log in to continue."}), 401
+            return jsonify({
+                "ok": False,
+                "success": False,
+                "error": "Authentication required",
+                "error_code": "authentication_required",
+                "message": "Authentication required",
+            }), 401
         query = urlencode({"next": request.full_path if request.query_string else request.path})
         return redirect(f"{url_for('login')}?{query}")
     return wrapped
@@ -110,7 +122,13 @@ def csrf_protect(view):
             validate_csrf()
         except AuthError as error:
             if is_api_request():
-                return jsonify({"success": False, "error": "csrf_failed", "message": str(error)}), 400
+                return jsonify({
+                    "ok": False,
+                    "success": False,
+                    "error": str(error),
+                    "error_code": "csrf_failed",
+                    "message": str(error),
+                }), 403
             return str(error), 400
         return view(*args, **kwargs)
     return wrapped

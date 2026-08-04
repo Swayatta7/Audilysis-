@@ -12,6 +12,8 @@ from db.storage import DB_PATH, create_user, get_google_ads_connection, get_user
 from services.google_ads_service import (
     GoogleAdsIntegrationError,
     apply_negative_keywords,
+    build_google_ads_connect_url,
+    build_oauth_flow,
     disconnect_google_ads,
     get_google_ads_status,
     handle_google_ads_oauth_callback,
@@ -129,6 +131,38 @@ class GoogleAdsIntegrationTestCase(unittest.TestCase):
 
         self.assertNotEqual(first_state, second_state)
         self.assertIn(f"state={second_state}", second.location)
+
+    @patch("services.google_ads_service.Flow")
+    def test_oauth_flow_uses_configured_production_redirect_uri(self, flow_mock):
+        flow_instance = MagicMock()
+        flow_mock.from_client_config.return_value = flow_instance
+        redirect_uri = "http://187.127.185.74/integrations/google-ads/callback"
+        with patch.dict(os.environ, {
+            "GOOGLE_ADS_CLIENT_ID": "client-id.apps.googleusercontent.com",
+            "GOOGLE_ADS_CLIENT_SECRET": "client-secret",
+            "GOOGLE_ADS_REDIRECT_URI": redirect_uri,
+        }, clear=False):
+            build_oauth_flow("state-123")
+
+        client_config = flow_mock.from_client_config.call_args[0][0]
+        self.assertEqual(client_config["web"]["redirect_uris"], [redirect_uri])
+        self.assertEqual(flow_instance.redirect_uri, redirect_uri)
+        self.assertNotIn("127.0.0.1", redirect_uri)
+        self.assertNotIn("localhost", redirect_uri)
+
+    @patch("services.google_ads_service.build_oauth_flow")
+    @patch("services.google_ads_service.ensure_google_ads_configuration")
+    @patch("services.google_ads_service.ensure_google_ads_dependencies")
+    def test_auth_url_generation_uses_configured_redirect_uri_exactly(self, _deps_mock, _config_mock, flow_mock):
+        flow_instance = MagicMock()
+        flow_instance.authorization_url.return_value = ("https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fapp.audilysis.com%2Fintegrations%2Fgoogle-ads%2Fcallback", None)
+        flow_mock.return_value = flow_instance
+
+        auth_url = build_google_ads_connect_url("state-456")
+
+        self.assertIn("redirect_uri=https%3A%2F%2Fapp.audilysis.com%2Fintegrations%2Fgoogle-ads%2Fcallback", auth_url)
+        self.assertNotIn("localhost", auth_url)
+        self.assertNotIn("127.0.0.1", auth_url)
 
     def test_callback_clears_state_after_completion(self):
         with self.client.session_transaction() as flask_session:

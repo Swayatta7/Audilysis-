@@ -45,6 +45,18 @@
 </div>
 
 <script>
+    async function parseAgentResponse(response) {
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+            return response.json();
+        }
+        const text = await response.text();
+        const statusDetail = 'HTTP ' + response.status;
+        throw new Error(String(text || '').trim().startsWith('<')
+            ? 'Request failed. ' + statusDetail + ': server returned HTML instead of JSON.'
+            : 'Request failed. ' + statusDetail);
+    }
+
     document.getElementById('strategy-form').addEventListener('submit', async function(event) {
         event.preventDefault();
         const payload = {
@@ -54,13 +66,17 @@
             business_goal: document.getElementById('strategy_goal').value,
             location: document.getElementById('strategy_location').value
         };
-        const response = await fetch('/run-agent', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        document.getElementById('strategy-output').textContent = JSON.stringify(data, null, 2);
+        try {
+            const response = await fetch('/run-agent', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await parseAgentResponse(response);
+            document.getElementById('strategy-output').textContent = JSON.stringify(data, null, 2);
+        } catch (error) {
+            document.getElementById('strategy-output').textContent = JSON.stringify({ success: false, message: error.message }, null, 2);
+        }
     });
 </script>
 {% endblock %}

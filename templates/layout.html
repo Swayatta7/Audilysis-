@@ -65,47 +65,63 @@
         
         <!-- Navigation Links -->
         <nav class="flex-1 px-4 py-6 space-y-2 overflow-y-auto" id="sidebar-nav">
-            <a href="/setup" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                <i class="fa-solid fa-square-plus text-slate-400 group-hover:text-blue-400 text-base"></i>
+            {% set current_path = request.path %}
+            {% set current_agent = request.args.get('agent', '') %}
+            {% set nav_item_base = 'flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 group' %}
+            {% set nav_item_idle = 'hover:bg-slate-800 hover:text-white' %}
+            {% set nav_item_active = 'bg-slate-800 text-white shadow-sm' %}
+            {% set nav_icon_idle = 'text-slate-400 group-hover:text-blue-400 text-base' %}
+            {% set nav_icon_active = 'text-blue-400 text-base' %}
+
+            <a href="/setup" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/setup' else nav_item_idle }}">
+                <i class="fa-solid fa-square-plus {{ nav_icon_active if current_path == '/setup' else nav_icon_idle }}"></i>
                 Run New Tracker
             </a>
-            <a href="/dashboard" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                <i class="fa-solid fa-chart-line text-slate-400 group-hover:text-blue-400 text-base"></i>
+            <a href="/dashboard" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/dashboard' else nav_item_idle }}">
+                <i class="fa-solid fa-chart-line {{ nav_icon_active if current_path == '/dashboard' else nav_icon_idle }}"></i>
                 Dashboard View
             </a>
 
             <div class="pt-3 mt-2 border-t border-slate-800">
                 <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">SEO Agents</p>
-                <a href="/agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-solid fa-robot text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/agents" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/agents' and current_agent != 'negative_keyword' else nav_item_idle }}">
+                    <i class="fa-solid fa-robot {{ nav_icon_active if current_path == '/agents' and current_agent != 'negative_keyword' else nav_icon_idle }}"></i>
                     SEO Agent Studio
                 </a>
-                <a href="/seo-reports" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-solid fa-file-lines text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/seo-reports" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/seo-reports' else nav_item_idle }}">
+                    <i class="fa-solid fa-file-lines {{ nav_icon_active if current_path == '/seo-reports' else nav_icon_idle }}"></i>
                     SEO Reports
                 </a>
-                <a href="/seo-strategy" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-solid fa-bullseye text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/seo-strategy" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/seo-strategy' else nav_item_idle }}">
+                    <i class="fa-solid fa-bullseye {{ nav_icon_active if current_path == '/seo-strategy' else nav_icon_idle }}"></i>
                     SEO Strategy
                 </a>
             </div>
 
             <div class="pt-3 mt-2 border-t border-slate-800">
+                <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">PPC Agents</p>
+                <a href="/agents?agent=negative_keyword" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/agents' and current_agent == 'negative_keyword' else nav_item_idle }}">
+                    <i class="fa-solid fa-bullseye {{ nav_icon_active if current_path == '/agents' and current_agent == 'negative_keyword' else nav_icon_idle }}"></i>
+                    Negative Keyword Agent
+                </a>
+            </div>
+
+            <div class="pt-3 mt-2 border-t border-slate-800">
                 <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">Content Agents</p>
-                <a href="/content-agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-solid fa-pen-nib text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/content-agents" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/content-agents' else nav_item_idle }}">
+                    <i class="fa-solid fa-pen-nib {{ nav_icon_active if current_path == '/content-agents' else nav_icon_idle }}"></i>
                     Content Agent Studio
                 </a>
-                <a href="/youtube-multilingual-transcripter" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-brands fa-youtube text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/youtube-multilingual-transcripter" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/youtube-multilingual-transcripter' else nav_item_idle }}">
+                    <i class="fa-brands fa-youtube {{ nav_icon_active if current_path == '/youtube-multilingual-transcripter' else nav_icon_idle }}"></i>
                     YouTube Transcripter
                 </a>
             </div>
 
             <div class="pt-3 mt-2 border-t border-slate-800">
                 <p class="px-4 pb-2 text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">Social Agents</p>
-                <a href="/social-agents" class="flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all duration-150 hover:bg-slate-800 hover:text-white group">
-                    <i class="fa-solid fa-share-nodes text-slate-400 group-hover:text-blue-400 text-base"></i>
+                <a href="/social-agents" class="{{ nav_item_base }} {{ nav_item_active if current_path == '/social-agents' else nav_item_idle }}">
+                    <i class="fa-solid fa-share-nodes {{ nav_icon_active if current_path == '/social-agents' else nav_icon_idle }}"></i>
                     Social Agent Studio
                 </a>
             </div>

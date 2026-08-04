@@ -1,11 +1,18 @@
 {% extends 'layout.html' %}
 
-{% block title %}SEO Agent Studio{% endblock %}
+{% block title %}{% if standalone_agent %}{{ standalone_agent.name }}{% else %}SEO Agent Studio{% endif %}{% endblock %}
 
 {% block content %}
+{% if standalone_agent %}
+{% set studio_label = 'PPC Agents' %}
+{% set studio_heading = standalone_agent.name %}
+{% set studio_description = standalone_agent.description %}
+{% set form_agent_label = 'PPC Agent' %}
+{% else %}
 {% set studio_label = 'SEO AI Agents' %}
 {% set studio_heading = 'Run modular SEO workflows directly in Audilysis' %}
 {% set studio_description = 'Select an agent, provide campaign context, and receive a structured recommendation payload.' %}
 {% set form_agent_label = 'SEO Agent' %}
+{% endif %}
 {% include '_agent_studio.html' %}
 {% endblock %}

@@ -200,6 +200,24 @@
 </div>
 
 <script>
+async function parseJsonResponse(response, fallbackMessage) {
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.includes("application/json")) {
+        const text = await response.text();
+        const statusDetail = `HTTP ${response.status}`;
+        throw new Error(
+            String(text || "").trim().startsWith("<")
+                ? `${fallbackMessage} ${statusDetail}: server returned HTML instead of JSON.`
+                : `${fallbackMessage} ${statusDetail}`
+        );
+    }
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.message || data.error || fallbackMessage);
+    }
+    return data;
+}
+
 document.addEventListener("DOMContentLoaded", () => {
     const container = document.getElementById("competitors-container");
     const addBtn = document.getElementById("add-competitor-btn");
@@ -317,8 +335,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 body: JSON.stringify(payload)
             });
 
-            const data = await response.json();
-            if (response.ok && data.status === "success") {
+            const data = await parseJsonResponse(response, "Setup failed.");
+            if (data.status === "success") {
                 // Redirect to running progress screen
                 window.location.href = "/running";
             } else {
