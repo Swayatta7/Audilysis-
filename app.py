@@ -32,6 +32,7 @@ from services.youtube_transcript_service import (
     get_youtube_transcript_api_version,
     translate_existing_payload,
 )
+from services.audio_transcription import get_audio_transcription_diagnostics
 from services.diarization import get_speaker_detection_diagnostics, log_speaker_detection_diagnostics
 from services.google_ads_service import (
     GoogleAdsIntegrationError,
@@ -711,6 +712,7 @@ def youtube_transcript_health():
         "youtube_transcript_api_version": get_youtube_transcript_api_version(),
         "translation_provider": "google_cloud_translation",
         "speaker_detection": get_speaker_detection_diagnostics(),
+        "audio_transcription": get_audio_transcription_diagnostics(),
         "youtube_proxy": get_proxy_diagnostics(),
     })
 

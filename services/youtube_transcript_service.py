@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import xml.etree.ElementTree as ElementTree
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from agents.runtime_config import get_env_value
+from services.audio_transcription import AudioTranscriptionError, get_audio_transcription_diagnostics, transcribe_youtube_audio
 from services.subtitle_quality import (
     format_caption_text,
     process_transcript_segments,
@@ -101,10 +103,18 @@ YTDLP_SUBTITLE_BLOCKING_ERROR_CODES = {
     "youtube_timeout",
     "youtube_po_token_required",
 }
+CAPTION_FALLBACK_ERROR_CODES = YTDLP_SUBTITLE_BLOCKING_ERROR_CODES | {
+    "no_transcript",
+    "transcripts_disabled",
+    "youtube_transcript_not_found",
+    "youtube_bad_transcript_response",
+    "youtube_unavailable",
+    "youtube_request_failed",
+    "youtube_connection_failed",
+}
 YTDLP_FALLBACK_OVERRIDE_ERROR_CODES = {
     "youtube_auth_required",
     "youtube_cookies_invalid",
-    "youtube_transcript_not_found",
     "ytdlp_not_installed",
 }
 
@@ -325,6 +335,7 @@ def extract_video_id(value: str, allow_raw_id: bool = True) -> str:
 
 
 def fetch_transcript(url_or_id: str, target_language: str = "original", enable_speaker_detection: bool = False) -> dict:
+    started_at = time.perf_counter()
     video_id = extract_video_id(url_or_id)
     target_language = validate_language_code(target_language)
     transcript = _fetch_source_transcript(video_id, enable_speaker_detection=enable_speaker_detection)
@@ -352,7 +363,16 @@ def fetch_transcript(url_or_id: str, target_language: str = "original", enable_s
         segments=segments,
         thumbnail_url=get_thumbnail_url(video_id),
     )
-    return payload.to_dict()
+    result = payload.to_dict()
+    logger.info(
+        "youtube_transcript_request_completed video_id=%s segment_count=%s translated=%s speaker_status=%s total_elapsed_ms=%s",
+        video_id,
+        result["segment_count"],
+        translated,
+        result["speaker_detection"].get("status"),
+        int((time.perf_counter() - started_at) * 1000),
+    )
+    return result
 
 
 def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = False) -> dict:
@@ -374,7 +394,16 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
 
     transcript_source, raw_segments, transcript_status = _retrieve_transcript_with_fallback(video_id)
 
+    if enable_speaker_detection:
+        logger.info("youtube_transcript_speaker_detection_started video_id=%s", video_id)
     diarization = get_diarizer(enabled=enable_speaker_detection).apply(normalize_segments(raw_segments), video_id=video_id)
+    if enable_speaker_detection:
+        logger.info(
+            "youtube_transcript_speaker_detection_finished video_id=%s status=%s detected_speakers=%s",
+            video_id,
+            diarization.status,
+            diarization.detected_speakers,
+        )
     segments = diarization.segments
     if not segments:
         raise YouTubeTranscriptError("No transcript segments were found for this video.", 404, "empty_transcript")
@@ -497,9 +526,28 @@ def _retrieve_transcript_with_fallback(video_id: str):
         try:
             return _fetch_transcript_via_yt_dlp(video_id, deadline)
         except YouTubeTranscriptError as fallback_error:
+            if should_try_audio_transcription_fallback([*failures, build_virtual_fetch_failure(fallback_error, "yt_dlp_subtitles")]):
+                try:
+                    return _fetch_transcript_via_audio_transcription(video_id, fallback_error.error_code)
+                except YouTubeTranscriptError as audio_error:
+                    if audio_error.error_code == "audio_transcription_unavailable":
+                        raise original_error from audio_error
+                    raise
             if fallback_error.error_code in YTDLP_FALLBACK_OVERRIDE_ERROR_CODES:
                 raise
             raise original_error from fallback_error
+
+    if should_try_audio_transcription_fallback(failures):
+        mapped_error = map_transcript_exception(
+            last_exception or UpstreamError("Transcript retrieval failed. Please try another video or try again later."),
+            last_strategy or TranscriptFetchStrategy("direct", "direct", None, False),
+        )
+        try:
+            return _fetch_transcript_via_audio_transcription(video_id, getattr(mapped_error, "error_code", "caption_retrieval_failed"))
+        except YouTubeTranscriptError as audio_error:
+            if audio_error.error_code == "audio_transcription_unavailable":
+                raise mapped_error from audio_error
+            raise
 
     final_exception = last_exception or UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
     final_strategy = last_strategy or TranscriptFetchStrategy("direct", "direct", None, False)
@@ -844,7 +892,25 @@ def should_try_next_strategy(exc: Exception, strategy: TranscriptFetchStrategy, 
 def should_try_yt_dlp_subtitle_fallback(failures: list[TranscriptFetchFailure]) -> bool:
     if not failures:
         return False
-    return all(failure.error_code in YTDLP_SUBTITLE_BLOCKING_ERROR_CODES for failure in failures)
+    return all(failure.error_code in CAPTION_FALLBACK_ERROR_CODES for failure in failures)
+
+
+def should_try_audio_transcription_fallback(failures: list[TranscriptFetchFailure]) -> bool:
+    if not failures:
+        return False
+    return all(failure.error_code in CAPTION_FALLBACK_ERROR_CODES for failure in failures)
+
+
+def build_virtual_fetch_failure(error: YouTubeTranscriptError, strategy: str) -> TranscriptFetchFailure:
+    return TranscriptFetchFailure(
+        strategy=strategy,
+        proxy_mode="yt_dlp",
+        uses_proxy=False,
+        stage="subtitle_fallback",
+        exception_class=error.__class__.__name__,
+        error_code=getattr(error, "error_code", "upstream_error"),
+        diagnostic=str(error)[:240],
+    )
 
 
 def build_fetch_failure(exc: Exception, strategy: TranscriptFetchStrategy, stage: str) -> TranscriptFetchFailure:
@@ -1073,6 +1139,44 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
     )
 
 
+def _fetch_transcript_via_audio_transcription(video_id: str, caption_error_code: str):
+    started_at = time.perf_counter()
+    diagnostics = get_audio_transcription_diagnostics()
+    logger.info(
+        "youtube_transcript_audio_fallback_start video_id=%s caption_error_code=%s provider=%s available=%s",
+        video_id,
+        caption_error_code,
+        diagnostics.get("provider"),
+        diagnostics.get("available"),
+    )
+    try:
+        result = transcribe_youtube_audio(video_id)
+    except AudioTranscriptionError as exc:
+        logger.warning(
+            "youtube_transcript_audio_fallback_failed video_id=%s error_code=%s elapsed_ms=%s",
+            video_id,
+            exc.error_code,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        raise UpstreamError(str(exc), status_code=exc.status_code, error_code=exc.error_code) from exc
+    logger.info(
+        "youtube_transcript_audio_fallback_success video_id=%s segment_count=%s elapsed_ms=%s",
+        video_id,
+        len(result.segments),
+        int((time.perf_counter() - started_at) * 1000),
+    )
+    source = ResolvedTranscriptSource(
+        language_code=result.language_code,
+        language=LANGUAGE_NAMES.get(result.language_code, result.language_name or result.language_code),
+        is_generated=True,
+    )
+    transcript_status = {
+        **result.status,
+        "caption_error_code": caption_error_code,
+    }
+    return source, result.segments, transcript_status
+
+
 def build_ytdlp_fallback_deadline() -> float:
     return time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
 
@@ -1198,6 +1302,9 @@ def build_ytdlp_subtitle_options(strategy: dict, deadline: float, temp_dir: str)
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "proxy": strategy["proxy_url"] or "",
     }
+    deno_path = shutil.which("deno")
+    if deno_path:
+        options["js_runtimes"] = {"deno": {"path": deno_path}}
     if strategy["cookies_file"]:
         options["cookiefile"] = strategy["cookies_file"]
     return options

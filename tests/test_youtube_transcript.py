@@ -6,6 +6,8 @@ from werkzeug.security import generate_password_hash
 
 from app import app
 from db.storage import create_user, get_user_by_email
+from services.audio_transcription import AudioTranscriptionError, AudioTranscriptionResult
+from services.diarization import DiarizationResult
 from services import youtube_transcript_service as service
 
 
@@ -111,6 +113,14 @@ class FakeAllBlockedApi:
         if self.proxy_config is None:
             raise service.RequestBlocked(video_id)
         raise service.IpBlocked(video_id)
+
+
+class FakeNoTranscriptApi:
+    def __init__(self, proxy_config=None, http_client=None):
+        self.proxy_config = proxy_config
+
+    def list(self, video_id):
+        raise service.NoTranscriptFound(video_id, [], [])
 
 
 class FakeProxiesBlockedDirectTimeoutApi:
@@ -705,6 +715,130 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["transcript"]["video_id"], "abcDEF123_4")
         self.assertTrue(response.get_json()["transcript"]["is_generated"])
+
+    @patch.object(service, "YouTubeTranscriptApi")
+    def test_automatic_caption_video_marks_generated(self, transcript_api):
+        transcript_api.return_value.list.return_value = FakeTranscriptList([
+            FakeTranscript(language_code="en", language="English", is_generated=True),
+        ])
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["transcript"]["is_generated"])
+
+    @patch.object(service, "transcribe_youtube_audio")
+    @patch.object(service, "_fetch_transcript_via_yt_dlp")
+    @patch.object(service, "YouTubeTranscriptApi", FakeNoTranscriptApi)
+    def test_video_where_captions_fail_but_audio_transcription_succeeds(self, ytdlp_fetch, transcribe_audio):
+        ytdlp_fetch.side_effect = service.UpstreamError(
+            "No subtitles or automatic captions were found for this video.",
+            error_code="youtube_transcript_not_found",
+        )
+        transcribe_audio.return_value = AudioTranscriptionResult(
+            language_code="en",
+            language_name="English",
+            segments=[{"start": 0.0, "duration": 2.5, "text": "Audio fallback transcript"}],
+            status={
+                "status": "Completed",
+                "strategy": "audio_transcription",
+                "fallback_used": True,
+                "audio_fallback_used": True,
+                "provider": "openai",
+                "reason": "Transcript generated from accessible YouTube audio because captions were unavailable.",
+            },
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://youtu.be/abcDEF123_4",
+                "target_language": "original",
+            })
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["transcript"]["segments"][0]["text"], "Audio fallback transcript")
+        self.assertEqual(payload["transcript"]["transcript_status"]["strategy"], "audio_transcription")
+        self.assertTrue(payload["transcript"]["transcript_status"]["audio_fallback_used"])
+
+    @patch.object(service, "get_diarizer")
+    @patch.object(service, "transcribe_youtube_audio")
+    @patch.object(service, "_fetch_transcript_via_yt_dlp")
+    @patch.object(service, "YouTubeTranscriptApi", FakeNoTranscriptApi)
+    def test_speaker_detection_enabled_after_successful_audio_transcript(self, ytdlp_fetch, transcribe_audio, get_diarizer):
+        ytdlp_fetch.side_effect = service.UpstreamError("No subtitles.", error_code="youtube_transcript_not_found")
+        transcribe_audio.return_value = AudioTranscriptionResult(
+            language_code="en",
+            language_name="English",
+            segments=[{"start": 0.0, "duration": 2.0, "text": "Audio first"}],
+            status={"status": "Completed", "strategy": "audio_transcription", "audio_fallback_used": True},
+        )
+        diarizer = Mock()
+        diarizer.apply.return_value = DiarizationResult(
+            enabled=True,
+            speaker_labels_available=False,
+            segments=[{"start": 0.0, "end": 2.0, "duration": 2.0, "text": "Audio first"}],
+            status="Completed",
+            model="pyannote/speaker-diarization-3.1",
+            detected_speakers=1,
+            confidence=None,
+            reason="Only one speaker was detected.",
+        )
+        get_diarizer.return_value = diarizer
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+                "enable_speaker_detection": True,
+            })
+        self.assertEqual(response.status_code, 200)
+        get_diarizer.assert_called_once_with(enabled=True)
+        diarizer.apply.assert_called_once()
+
+    @patch.object(service, "transcribe_youtube_audio")
+    @patch.object(service, "_fetch_transcript_via_yt_dlp")
+    @patch.object(service, "YouTubeTranscriptApi", FakeNoTranscriptApi)
+    def test_audio_download_timeout_returns_structured_error(self, ytdlp_fetch, transcribe_audio):
+        ytdlp_fetch.side_effect = service.UpstreamError("No subtitles.", error_code="youtube_transcript_not_found")
+        transcribe_audio.side_effect = AudioTranscriptionError(
+            "The audio download timed out before transcription could run.",
+            status_code=504,
+            error_code="youtube_audio_download_timeout",
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.get_json()["error"], "youtube_audio_download_timeout")
+
+    @patch.object(service.requests, "post")
+    @patch.object(service, "transcribe_youtube_audio")
+    @patch.object(service, "_fetch_transcript_via_yt_dlp")
+    @patch.object(service, "YouTubeTranscriptApi", FakeNoTranscriptApi)
+    def test_translation_after_audio_transcription(self, ytdlp_fetch, transcribe_audio, post):
+        ytdlp_fetch.side_effect = service.UpstreamError("No subtitles.", error_code="youtube_transcript_not_found")
+        transcribe_audio.return_value = AudioTranscriptionResult(
+            language_code="en",
+            language_name="English",
+            segments=[{"start": 0.0, "duration": 2.0, "text": "Connect your own API Key."}],
+            status={"status": "Completed", "strategy": "audio_transcription", "audio_fallback_used": True},
+        )
+        post.return_value = Mock(status_code=200)
+        post.return_value.json.return_value = {
+            "data": {"translations": [{"translatedText": "Conecta tu propio API Key."}]}
+        }
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai", "GOOGLE_TRANSLATE_API_KEY": "test-google"}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/shorts/abcDEF123_4",
+                "target_language": "es",
+            })
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["transcript"]["translated"])
+        self.assertEqual(payload["transcript"]["segments"][0]["text"], "Conecta tu propio API Key.")
 
     def test_ytdlp_manual_subtitle_parsing(self):
         content = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world\n"
