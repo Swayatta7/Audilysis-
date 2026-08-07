@@ -103,6 +103,16 @@ class FakeTimeoutTranscript(FakeTranscript):
         raise service.requests.exceptions.Timeout("proxy tunnel timed out")
 
 
+class FakeAllBlockedApi:
+    def __init__(self, proxy_config=None, http_client=None):
+        self.proxy_config = proxy_config
+
+    def list(self, video_id):
+        if self.proxy_config is None:
+            raise service.RequestBlocked(video_id)
+        raise service.IpBlocked(video_id)
+
+
 class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
     def setUp(self):
         app.config["TESTING"] = True
@@ -563,6 +573,108 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["results"][0]["error_code"], "youtube_proxy_timeout")
         self.assertEqual(result["results"][1]["status"], "success")
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeAllBlockedApi)
+    def test_all_transcript_api_strategies_blocked_then_ytdlp_fallback_succeeds(self, ytdlp_fetch):
+        ytdlp_fetch.return_value = (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=False),
+            [{"start": 0.0, "duration": 2.0, "text": "Fallback subtitle"}],
+        )
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY_LIST": "http://user:pass@proxy1.test:1111,http://user:pass@proxy2.test:2222",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+            "YOUTUBE_COOKIES_FILE": "",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["transcript"]["transcript_status"]["strategy"], "yt_dlp_proxy_1")
+        self.assertEqual(payload["transcript"]["segments"][0]["text"], "Fallback subtitle")
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeAllBlockedApi)
+    def test_direct_blocked_then_ytdlp_fallback_succeeds(self, ytdlp_fetch):
+        ytdlp_fetch.return_value = (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+            [{"start": 0.0, "duration": 2.0, "text": "Direct fallback subtitle"}],
+        )
+        with patch.dict(os.environ, {
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+            "YOUTUBE_COOKIES_FILE": "",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/shorts/abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["transcript"]["video_id"], "abcDEF123_4")
+        self.assertTrue(response.get_json()["transcript"]["is_generated"])
+
+    def test_ytdlp_manual_subtitle_parsing(self):
+        content = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world\n"
+        segments = service.parse_ytdlp_subtitle_content(content, "vtt")
+        self.assertEqual(segments[0]["text"], "Hello world")
+        self.assertEqual(segments[0]["start"], 0.0)
+
+    def test_ytdlp_automatic_caption_json3_parsing(self):
+        content = '{"events":[{"tStartMs":0,"dDurationMs":2000,"segs":[{"utf8":"Hello "},{"utf8":"world"}]}]}'
+        segments = service.parse_ytdlp_subtitle_content(content, "json3")
+        self.assertEqual(segments[0]["text"], "Hello world")
+        self.assertEqual(segments[0]["duration"], 2.0)
+
+    def test_cookie_file_configured_diagnostics(self):
+        with patch("services.youtube_transcript_service.os.access", return_value=True), \
+                patch("services.youtube_transcript_service.Path.exists", return_value=True), \
+                patch.dict(os.environ, {"YOUTUBE_COOKIES_FILE": "/opt/Audilysis-/secrets/youtube_cookies.txt"}, clear=True):
+            diagnostics = service.get_ytdlp_subtitle_fallback_diagnostics()
+        self.assertTrue(diagnostics["configured"])
+        self.assertTrue(diagnostics["cookie_file_exists"])
+        self.assertTrue(diagnostics["cookie_file_readable"])
+
+    def test_cookie_file_missing_raises_configuration_error(self):
+        with patch("services.youtube_transcript_service.Path.exists", return_value=False), \
+                patch.dict(os.environ, {"YOUTUBE_COOKIES_FILE": "/opt/Audilysis-/secrets/youtube_cookies.txt"}, clear=True):
+            with self.assertRaises(service.ConfigurationError):
+                service.resolve_ytdlp_cookies_file()
+
+    def test_cookie_file_unreadable_raises_configuration_error(self):
+        with patch("services.youtube_transcript_service.Path.exists", return_value=True), \
+                patch("services.youtube_transcript_service.os.access", return_value=False), \
+                patch.dict(os.environ, {"YOUTUBE_COOKIES_FILE": "/opt/Audilysis-/secrets/youtube_cookies.txt"}, clear=True):
+            with self.assertRaises(service.ConfigurationError):
+                service.resolve_ytdlp_cookies_file()
+
+    def test_ytdlp_auth_required_classification(self):
+        error = service.classify_ytdlp_subtitle_exception(RuntimeError("Sign in to confirm you're not a bot"), {"name": "yt_dlp_direct"})
+        self.assertEqual(error.error_code, "youtube_auth_required")
+        self.assertIn("requires authentication", str(error))
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeAllBlockedApi)
+    @patch("services.diarization.shutil.which", return_value=None)
+    @patch("services.diarization.is_python_module_installed", return_value=False)
+    def test_transcript_succeeds_but_speaker_detection_fails(self, _modules, _which, ytdlp_fetch):
+        ytdlp_fetch.return_value = (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=False),
+            [{"start": 0.0, "duration": 2.0, "text": "Fallback subtitle"}],
+        )
+        with patch.dict(os.environ, {"YOUTUBE_DIRECT_FALLBACK_ENABLED": "1"}, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+                "enable_speaker_detection": True,
+            })
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["transcript"]["speaker_detection"]["status"], "Failed")
+        self.assertIsNone(payload["transcript"]["speaker_detection"]["detected_speakers"])
+        self.assertIsNone(payload["transcript"]["speaker_detection"]["confidence"])
 
     @patch.object(service, "YouTubeTranscriptApi")
     def test_blocked_request_logs_safe_diagnostics(self, transcript_api):

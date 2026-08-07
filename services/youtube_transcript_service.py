@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import re
 import time
 import xml.etree.ElementTree as ElementTree
@@ -86,6 +87,21 @@ DEFAULT_TRANSCRIPT_CONNECT_TIMEOUT_SECONDS = 4.0
 DEFAULT_TRANSCRIPT_READ_TIMEOUT_SECONDS = 8.0
 MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS = 1.0
 GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
+YTDLP_SUBTITLE_BLOCKING_ERROR_CODES = {
+    "youtube_proxy_ip_blocked",
+    "youtube_proxy_request_blocked",
+    "youtube_proxy_rate_limited",
+    "youtube_ip_blocked",
+    "youtube_request_blocked",
+    "youtube_rate_limited",
+    "youtube_po_token_required",
+}
+YTDLP_FALLBACK_OVERRIDE_ERROR_CODES = {
+    "youtube_auth_required",
+    "youtube_cookies_invalid",
+    "youtube_transcript_not_found",
+    "ytdlp_not_installed",
+}
 
 
 LANGUAGES = [
@@ -194,6 +210,13 @@ class TranscriptFetchFailure:
     exception_class: str
     error_code: str
     diagnostic: str
+
+
+@dataclass
+class ResolvedTranscriptSource:
+    language_code: str
+    language: str
+    is_generated: bool
 
 
 class TimeoutAwareSession(requests.Session):
@@ -344,18 +367,18 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
             error_code="missing_dependency",
         )
 
-    transcript, raw_segments, transcript_status = _retrieve_transcript_with_fallback(video_id)
+    transcript_source, raw_segments, transcript_status = _retrieve_transcript_with_fallback(video_id)
 
     diarization = get_diarizer(enabled=enable_speaker_detection).apply(normalize_segments(raw_segments), video_id=video_id)
     segments = diarization.segments
     if not segments:
         raise YouTubeTranscriptError("No transcript segments were found for this video.", 404, "empty_transcript")
 
-    source_language = getattr(transcript, "language_code", "") or "und"
+    source_language = getattr(transcript_source, "language_code", "") or "und"
     return {
         "source_language": source_language,
-        "source_language_name": getattr(transcript, "language", "") or LANGUAGE_NAMES.get(source_language, source_language),
-        "is_generated": bool(getattr(transcript, "is_generated", False)),
+        "source_language_name": getattr(transcript_source, "language", "") or LANGUAGE_NAMES.get(source_language, source_language),
+        "is_generated": bool(getattr(transcript_source, "is_generated", False)),
         "speaker_detection": {
             "enabled": diarization.enabled,
             "speaker_labels_available": diarization.speaker_labels_available,
@@ -377,6 +400,8 @@ def _retrieve_transcript_with_fallback(video_id: str):
     failures: list[TranscriptFetchFailure] = []
     strategies = build_transcript_fetch_strategies()
     deadline = time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
+    last_exception: Exception | None = None
+    last_strategy: TranscriptFetchStrategy | None = None
     logger.info("youtube_transcript_start video_id=%s strategies=%s", video_id, ",".join(strategy.name for strategy in strategies))
 
     for index, strategy in enumerate(strategies):
@@ -418,9 +443,16 @@ def _retrieve_transcript_with_fallback(video_id: str):
                     strategy.name,
                 )
             logger.info("youtube_transcript_success video_id=%s strategy=%s", video_id, strategy.name)
-            return transcript, raw_segments, transcript_status
+            source = ResolvedTranscriptSource(
+                language_code=getattr(transcript, "language_code", "") or "und",
+                language=getattr(transcript, "language", "") or "",
+                is_generated=bool(getattr(transcript, "is_generated", False)),
+            )
+            return source, raw_segments, transcript_status
         except Exception as exc:
             stage = "fetch"
+            last_exception = exc
+            last_strategy = strategy
             failure = build_fetch_failure(exc, strategy, stage)
             failures.append(failure)
             log_transcript_exception(exc, video_id, f"{stage}:{strategy.name}")
@@ -444,8 +476,24 @@ def _retrieve_transcript_with_fallback(video_id: str):
                     failure.error_code,
                 )
                 continue
-            raise map_transcript_exception(exc, strategy) from exc
-    raise UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
+            break
+
+    if should_try_yt_dlp_subtitle_fallback(failures):
+        logger.info("youtube_transcript_ytdlp_subtitle_fallback_start video_id=%s", video_id)
+        original_error = map_transcript_exception(
+            last_exception or UpstreamError("Transcript retrieval failed. Please try another video or try again later."),
+            last_strategy or TranscriptFetchStrategy("direct", "direct", None, False),
+        )
+        try:
+            return _fetch_transcript_via_yt_dlp(video_id, deadline)
+        except YouTubeTranscriptError as fallback_error:
+            if fallback_error.error_code in YTDLP_FALLBACK_OVERRIDE_ERROR_CODES:
+                raise
+            raise original_error from fallback_error
+
+    final_exception = last_exception or UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
+    final_strategy = last_strategy or TranscriptFetchStrategy("direct", "direct", None, False)
+    raise map_transcript_exception(final_exception, final_strategy) from final_exception
 
 
 def _fetch_raw_segments_with_retry(transcript, video_id: str, strategy: TranscriptFetchStrategy, deadline: float):
@@ -575,6 +623,7 @@ def get_proxy_diagnostics() -> dict:
     timeout_settings = get_transcript_timeout_settings()
     strategies = build_transcript_fetch_strategies()
     proxy_hosts = [strategy.proxy_host for strategy in strategies if strategy.uses_proxy and strategy.proxy_host]
+    ytdlp_diag = get_ytdlp_subtitle_fallback_diagnostics()
     return {
         "mode": mode,
         "webshare_proxy_url": "Configured" if webshare_url else "Missing",
@@ -590,6 +639,9 @@ def get_proxy_diagnostics() -> dict:
         "proxy_count": len([strategy for strategy in strategies if strategy.uses_proxy]),
         "proxy_hosts": proxy_hosts,
         "direct_fallback_enabled": direct_youtube_fallback_enabled(),
+        "yt_dlp_subtitle_fallback_available": ytdlp_diag["available"],
+        "cookie_file_configured": ytdlp_diag["configured"],
+        "cookie_file_readable": ytdlp_diag["cookie_file_readable"],
         "request_total_budget_seconds": timeout_settings["total_budget_seconds"],
         "connect_timeout_seconds": timeout_settings["connect_timeout_seconds"],
         "read_timeout_seconds": timeout_settings["read_timeout_seconds"],
@@ -779,6 +831,12 @@ def should_try_next_strategy(exc: Exception, strategy: TranscriptFetchStrategy, 
     )
 
 
+def should_try_yt_dlp_subtitle_fallback(failures: list[TranscriptFetchFailure]) -> bool:
+    if not failures:
+        return False
+    return all(failure.error_code in YTDLP_SUBTITLE_BLOCKING_ERROR_CODES for failure in failures)
+
+
 def build_fetch_failure(exc: Exception, strategy: TranscriptFetchStrategy, stage: str) -> TranscriptFetchFailure:
     mapped = map_transcript_exception(exc, strategy)
     return TranscriptFetchFailure(
@@ -904,6 +962,293 @@ def map_transcript_exception(exc: Exception, strategy: TranscriptFetchStrategy) 
     if isinstance(exc, YouTubeTranscriptError):
         return exc
     return UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
+
+
+def get_ytdlp_subtitle_fallback_diagnostics() -> dict:
+    cookie_path = get_env_value("YOUTUBE_COOKIES_FILE").strip()
+    cookie_file = Path(cookie_path) if cookie_path else None
+    configured = bool(cookie_path)
+    exists = bool(cookie_file and cookie_file.exists())
+    readable = bool(cookie_file and os.access(cookie_file, os.R_OK))
+    ytdlp_installed = is_ytdlp_available()
+    return {
+        "available": ytdlp_installed,
+        "configured": configured,
+        "cookie_file_exists": exists,
+        "cookie_file_readable": readable,
+    }
+
+
+def is_ytdlp_available() -> bool:
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
+    fallback_diag = get_ytdlp_subtitle_fallback_diagnostics()
+    if not fallback_diag["available"]:
+        raise ConfigurationError("yt-dlp is not installed, so subtitle fallback is unavailable.", error_code="ytdlp_not_installed")
+
+    last_exc: Exception | None = None
+    strategies = build_ytdlp_subtitle_strategies()
+    for index, strategy in enumerate(strategies, start=1):
+        try:
+            logger.info(
+                "youtube_transcript_ytdlp_subtitle_attempt video_id=%s strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s cookies=%s",
+                video_id,
+                strategy["name"],
+                index,
+                strategy["proxy_host"] or "-",
+                strategy["proxy_port"] or "-",
+                strategy["cookies_enabled"],
+            )
+            source, raw_segments = _fetch_ytdlp_subtitle_segments(video_id, strategy, deadline)
+            logger.info(
+                "youtube_transcript_ytdlp_subtitle_success video_id=%s strategy=%s proxy_index=%s",
+                video_id,
+                strategy["name"],
+                index,
+            )
+            transcript_status = {
+                "status": "Completed",
+                "strategy": strategy["name"],
+                "proxy_used": bool(strategy["proxy_url"]),
+                "proxy_index": index if strategy["proxy_url"] else None,
+                "proxy_host": strategy["proxy_host"] or None,
+                "proxy_port": strategy["proxy_port"],
+                "fallback_used": True,
+                "reason": "Transcript retrieved through yt-dlp subtitle fallback.",
+            }
+            return source, raw_segments, transcript_status
+        except Exception as exc:
+            last_exc = exc
+            mapped = classify_ytdlp_subtitle_exception(exc, strategy)
+            logger.warning(
+                "youtube_transcript_ytdlp_subtitle_failure video_id=%s strategy=%s proxy_index=%s error_code=%s",
+                video_id,
+                strategy["name"],
+                index,
+                mapped.error_code,
+            )
+            if index < len(strategies) and should_continue_ytdlp_subtitle_fallback(mapped):
+                continue
+            raise mapped from exc
+    raise classify_ytdlp_subtitle_exception(last_exc or RuntimeError("yt-dlp subtitle fallback failed."), {"name": "yt_dlp_subtitles", "proxy_url": None})
+
+
+def build_ytdlp_subtitle_strategies() -> list[dict]:
+    strategies = []
+    seen = set()
+    cookie_file = resolve_ytdlp_cookies_file()
+
+    def add_strategy(name: str, proxy_url: str | None):
+        key = (proxy_url or "", cookie_file or "")
+        if key in seen:
+            return
+        seen.add(key)
+        parsed = urlparse(proxy_url) if proxy_url else None
+        strategies.append({
+            "name": name,
+            "proxy_url": proxy_url,
+            "proxy_host": parsed.hostname if parsed else "",
+            "proxy_port": parsed.port if parsed else None,
+            "cookies_file": cookie_file,
+            "cookies_enabled": bool(cookie_file),
+        })
+
+    for index, proxy_url in enumerate(load_proxy_url_list(), start=1):
+        add_strategy(f"yt_dlp_proxy_{index}", proxy_url)
+    if direct_youtube_fallback_enabled() or not strategies:
+        add_strategy("yt_dlp_direct", None)
+    return strategies
+
+
+def resolve_ytdlp_cookies_file() -> str | None:
+    cookie_path = get_env_value("YOUTUBE_COOKIES_FILE").strip()
+    if not cookie_path:
+        return None
+    path = Path(cookie_path)
+    if not path.exists():
+        raise ConfigurationError("Configured YouTube cookies file was not found.", error_code="youtube_cookies_invalid")
+    if not os.access(path, os.R_OK):
+        raise ConfigurationError("Configured YouTube cookies file is not readable.", error_code="youtube_cookies_invalid")
+    return str(path)
+
+
+def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: float):
+    from yt_dlp import YoutubeDL
+
+    ensure_transcript_time_budget(deadline)
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": compute_transcript_request_timeout(deadline)[1],
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+    }
+    if strategy["proxy_url"]:
+        options["proxy"] = strategy["proxy_url"]
+    if strategy["cookies_file"]:
+        options["cookiefile"] = strategy["cookies_file"]
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with YoutubeDL(options) as downloader:
+        info = downloader.extract_info(url, download=False)
+
+    selected = select_ytdlp_subtitle(info)
+    response = requests.get(
+        selected["url"],
+        timeout=compute_transcript_request_timeout(deadline),
+        proxies={"http": strategy["proxy_url"], "https": strategy["proxy_url"]} if strategy["proxy_url"] else None,
+    )
+    response.raise_for_status()
+    raw_segments = parse_ytdlp_subtitle_content(response.text, selected["ext"])
+    source = ResolvedTranscriptSource(
+        language_code=selected["language_code"],
+        language=LANGUAGE_NAMES.get(selected["language_code"], selected["language_code"]),
+        is_generated=selected["is_generated"],
+    )
+    return source, raw_segments
+
+
+def select_ytdlp_subtitle(info: dict) -> dict:
+    for collection_name, is_generated in (("subtitles", False), ("automatic_captions", True)):
+        collection = info.get(collection_name) or {}
+        for preferred in ("en", "en-US", "en-GB"):
+            entries = collection.get(preferred) or []
+            selected = select_ytdlp_subtitle_entry(entries)
+            if selected:
+                return {
+                    "language_code": preferred,
+                    "is_generated": is_generated,
+                    **selected,
+                }
+        for language_code, entries in collection.items():
+            selected = select_ytdlp_subtitle_entry(entries or [])
+            if selected:
+                return {
+                    "language_code": language_code,
+                    "is_generated": is_generated,
+                    **selected,
+                }
+    raise UpstreamError("yt-dlp could not find subtitles or automatic captions for this video.", error_code="youtube_transcript_not_found")
+
+
+def select_ytdlp_subtitle_entry(entries: list[dict]) -> dict | None:
+    for ext in ("json3", "vtt", "srv3", "ttml"):
+        for entry in entries:
+            if entry.get("ext") == ext and entry.get("url"):
+                return {"url": entry["url"], "ext": ext}
+    for entry in entries:
+        if entry.get("url"):
+            return {"url": entry["url"], "ext": entry.get("ext", "")}
+    return None
+
+
+def parse_ytdlp_subtitle_content(content: str, ext: str) -> list[dict]:
+    ext = (ext or "").lower()
+    if ext == "json3":
+        return parse_json3_subtitles(content)
+    if ext in {"srv3", "ttml", "xml"}:
+        return parse_xml_subtitles(content)
+    return parse_vtt_subtitles(content)
+
+
+def parse_vtt_subtitles(content: str) -> list[dict]:
+    segments = []
+    blocks = re.split(r"\n\s*\n", content.replace("\r\n", "\n"))
+    for block in blocks:
+        lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
+        if not lines or "-->" not in " ".join(lines):
+            continue
+        timing_line_index = 0 if "-->" in lines[0] else 1
+        if timing_line_index >= len(lines):
+            continue
+        timing_line = lines[timing_line_index]
+        text_lines = lines[timing_line_index + 1 :]
+        if not text_lines:
+            continue
+        start_text, end_text = [part.strip().split(" ")[0] for part in timing_line.split("-->")]
+        start = parse_subtitle_timestamp_value(start_text)
+        end = parse_subtitle_timestamp_value(end_text)
+        text = " ".join(text_lines).strip()
+        if text:
+            segments.append({"start": start, "duration": max(0.1, round(end - start, 3)), "text": text})
+    return segments
+
+
+def parse_json3_subtitles(content: str) -> list[dict]:
+    payload = json.loads(content)
+    segments = []
+    for event in payload.get("events", []):
+        start = safe_float(event.get("tStartMs"), 0.0) / 1000.0
+        duration = safe_float(event.get("dDurationMs"), 0.0) / 1000.0
+        text = "".join(seg.get("utf8", "") for seg in event.get("segs", [])).strip()
+        if text:
+            segments.append({"start": start, "duration": max(0.1, round(duration or 1.0, 3)), "text": text})
+    return segments
+
+
+def parse_xml_subtitles(content: str) -> list[dict]:
+    root = ElementTree.fromstring(content)
+    segments = []
+    for node in root.findall(".//p"):
+        start = safe_float(node.attrib.get("t"), 0.0) / 1000.0
+        duration = safe_float(node.attrib.get("d"), 0.0) / 1000.0
+        text = "".join(node.itertext()).strip()
+        if text:
+            segments.append({"start": start, "duration": max(0.1, round(duration or 1.0, 3)), "text": text})
+    return segments
+
+
+def parse_subtitle_timestamp_value(value: str) -> float:
+    cleaned = value.strip().replace(",", ".")
+    parts = cleaned.split(":")
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return int(minutes) * 60 + float(seconds)
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return safe_float(cleaned, 0.0)
+
+
+def classify_ytdlp_subtitle_exception(exc: Exception, strategy: dict) -> YouTubeTranscriptError:
+    if isinstance(exc, YouTubeTranscriptError):
+        return exc
+    text = str(exc).strip()
+    lowered = text.lower()
+    if "sign in to confirm you're not a bot" in lowered or "not a bot" in lowered:
+        return UpstreamError(
+            "YouTube requires authentication before subtitles can be retrieved.",
+            status_code=403,
+            error_code="youtube_auth_required",
+        )
+    if "cookies file was not found" in lowered or "cookies file is not readable" in lowered:
+        return ConfigurationError(
+            "The configured YouTube cookies file is invalid.",
+            error_code="youtube_cookies_invalid",
+        )
+    if isinstance(exc, requests.exceptions.Timeout):
+        return UpstreamError("yt-dlp subtitle retrieval timed out.", status_code=504, error_code="youtube_timeout")
+    if "private video" in lowered:
+        return YouTubeTranscriptError("This video is private, removed, or unavailable.", 404, "video_unavailable")
+    return UpstreamError("yt-dlp subtitle retrieval failed.", error_code="youtube_request_failed")
+
+
+def should_continue_ytdlp_subtitle_fallback(error: YouTubeTranscriptError) -> bool:
+    return error.error_code in {
+        "youtube_auth_required",
+        "youtube_proxy_auth_failed",
+        "youtube_proxy_timeout",
+        "youtube_timeout",
+        "youtube_request_failed",
+    }
 
 
 def diagnose_transcript_fetch(video_id: str) -> dict:
