@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import tempfile
 import time
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
@@ -1138,6 +1139,26 @@ def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: floa
     from yt_dlp import YoutubeDL
 
     ensure_transcript_time_budget(deadline)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory(prefix="audilysis-ytdlp-subtitles-") as temp_dir:
+        options = build_ytdlp_subtitle_options(strategy, deadline, temp_dir)
+        with YoutubeDL(options) as downloader:
+            info = downloader.extract_info(url, download=True)
+
+        subtitle_file = find_ytdlp_subtitle_file(temp_dir)
+        if not subtitle_file:
+            raise UpstreamError("yt-dlp could not find subtitles or automatic captions for this video.", error_code="youtube_transcript_not_found")
+        raw_segments = parse_ytdlp_subtitle_content(subtitle_file.read_text(encoding="utf-8"), subtitle_file.suffix.lstrip("."))
+        language_code = infer_ytdlp_subtitle_language(subtitle_file)
+        source = ResolvedTranscriptSource(
+            language_code=language_code,
+            language=LANGUAGE_NAMES.get(language_code, language_code),
+            is_generated=is_ytdlp_subtitle_generated(info or {}, language_code),
+        )
+        return source, raw_segments
+
+
+def build_ytdlp_subtitle_options(strategy: dict, deadline: float, temp_dir: str) -> dict:
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -1146,32 +1167,21 @@ def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: floa
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": preferred_ytdlp_subtitle_languages(),
-        "subtitlesformat": "vtt/json3/best",
+        "subtitlesformat": "vtt",
         "socket_timeout": compute_ytdlp_socket_timeout(deadline),
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
+        "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
+        "proxy": strategy["proxy_url"] or "",
     }
-    options["proxy"] = strategy["proxy_url"] or ""
     if strategy["cookies_file"]:
         options["cookiefile"] = strategy["cookies_file"]
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with YoutubeDL(options) as downloader:
-        info = downloader.extract_info(url, download=False)
-
-    selected = select_ytdlp_subtitle(info)
-    raw_segments = fetch_ytdlp_subtitle_text(selected, strategy, deadline)
-    source = ResolvedTranscriptSource(
-        language_code=selected["language_code"],
-        language=LANGUAGE_NAMES.get(selected["language_code"], selected["language_code"]),
-        is_generated=selected["is_generated"],
-    )
-    return source, raw_segments
+    return options
 
 
 def preferred_ytdlp_subtitle_languages() -> list[str]:
-    return ["en", "en-US", "en-GB"]
+    return ["en"]
 
 
 def compute_ytdlp_socket_timeout(deadline: float) -> float:
@@ -1190,6 +1200,30 @@ def fetch_ytdlp_subtitle_text(selected: dict, strategy: dict, deadline: float) -
     )
     response.raise_for_status()
     return parse_ytdlp_subtitle_content(response.text, selected["ext"])
+
+
+def find_ytdlp_subtitle_file(temp_dir: str) -> Path | None:
+    candidates = []
+    for extension in ("*.vtt", "*.json3", "*.srv3", "*.ttml", "*.xml"):
+        candidates.extend(Path(temp_dir).glob(extension))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda path: (path.suffix != ".vtt", path.name))[0]
+
+
+def infer_ytdlp_subtitle_language(path: Path) -> str:
+    parts = path.name.split(".")
+    if len(parts) >= 3 and LANGUAGE_CODE_RE.match(parts[-2]):
+        return parts[-2]
+    return "en"
+
+
+def is_ytdlp_subtitle_generated(info: dict, language_code: str) -> bool:
+    subtitles = info.get("subtitles") or {}
+    automatic_captions = info.get("automatic_captions") or {}
+    if language_code in automatic_captions and language_code not in subtitles:
+        return True
+    return False
 
 
 def select_ytdlp_subtitle(info: dict) -> dict:

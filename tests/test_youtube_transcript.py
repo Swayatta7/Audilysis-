@@ -115,6 +115,13 @@ class FakeAllBlockedApi:
 
 class FakeSubtitleOnlyYoutubeDL:
     last_options = None
+    info_payload = {
+        "automatic_captions": {
+            "en": [
+                {"ext": "vtt", "url": "https://subtitle.example.test/captions.vtt"},
+            ]
+        }
+    }
 
     def __init__(self, options):
         FakeSubtitleOnlyYoutubeDL.last_options = options
@@ -126,13 +133,11 @@ class FakeSubtitleOnlyYoutubeDL:
         return False
 
     def extract_info(self, url, download=False):
-        return {
-            "automatic_captions": {
-                "en": [
-                    {"ext": "vtt", "url": "https://subtitle.example.test/captions.vtt"},
-                ]
-            }
-        }
+        outtmpl = self.last_options["outtmpl"]
+        subtitle_path = outtmpl.replace("%(id)s", "wuvaKDYK2RQ").replace("%(ext)s", "en.vtt")
+        with open(subtitle_path, "w", encoding="utf-8") as handle:
+            handle.write("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n")
+        return self.info_payload
 
 
 class FakeProxyThenDirectYtdlpFetch:
@@ -678,18 +683,7 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "Hello world")
         self.assertEqual(segments[0]["duration"], 2.0)
 
-    @patch("services.youtube_transcript_service.requests.Session")
-    def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self, session_cls):
-        class FakeResponse:
-            text = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n"
-
-            def raise_for_status(self):
-                return None
-
-        session = Mock()
-        session.proxies = {}
-        session.get.return_value = FakeResponse()
-        session_cls.return_value = session
+    def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self):
         strategy = {
             "name": "yt_dlp_direct",
             "proxy_url": None,
@@ -712,10 +706,33 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["ignore_no_formats_error"])
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writeautomaticsub"])
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writesubtitles"])
-        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitlesformat"], "vtt/json3/best")
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitlesformat"], "vtt")
         self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["cookiefile"], "/opt/Audilysis-/secrets/youtube_cookies.txt")
-        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitleslangs"], ["en", "en-US", "en-GB"])
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitleslangs"], ["en"])
         self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["proxy"], "")
+
+    def test_ytdlp_file_pipeline_succeeds_when_metadata_has_no_caption_urls(self):
+        original_info = FakeSubtitleOnlyYoutubeDL.info_payload
+        FakeSubtitleOnlyYoutubeDL.info_payload = {"subtitles": {}, "automatic_captions": {}}
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        try:
+            with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
+                source, segments = service._fetch_ytdlp_subtitle_segments(
+                    "wuvaKDYK2RQ",
+                    strategy,
+                    deadline=service.time.monotonic() + 10,
+                )
+        finally:
+            FakeSubtitleOnlyYoutubeDL.info_payload = original_info
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Subtitle only fallback")
 
     def test_ytdlp_uses_fresh_fallback_budget(self):
         with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=[{
