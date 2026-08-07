@@ -99,6 +99,32 @@
             </div>
         </div>
 
+        <div id="transcript-status-panel" class="hidden bg-white border border-slate-200 rounded-xl shadow-sm p-5">
+            <div class="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <i class="fa-solid fa-signal text-blue-600"></i>
+                Transcript Retrieval
+            </div>
+            <dl class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Status</dt>
+                    <dd id="transcript-status" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                </div>
+                <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Strategy</dt>
+                    <dd id="transcript-strategy" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                </div>
+                <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Fallback</dt>
+                    <dd id="transcript-fallback" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                </div>
+                <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs uppercase tracking-[0.14em] text-slate-500">Proxy</dt>
+                    <dd id="transcript-proxy" class="mt-1 text-sm font-semibold text-slate-900"></dd>
+                </div>
+            </dl>
+            <p id="transcript-reason" class="mt-3 text-sm text-slate-600"></p>
+        </div>
+
         <div id="speaker-panel" class="hidden bg-white border border-slate-200 rounded-xl shadow-sm p-5">
             <div class="flex items-center gap-2 text-sm font-semibold text-slate-900">
                 <i class="fa-solid fa-users text-blue-600"></i>
@@ -274,6 +300,7 @@
         setText('segment-count', transcript.segment_count);
         setText('word-count', transcript.word_count);
         setText('duration', formatTime(transcript.duration));
+        renderTranscriptStatus(transcript.transcript_status || {});
         renderSpeakerDetection(transcript.speaker_detection);
 
         segmentsView.textContent = '';
@@ -296,9 +323,19 @@
         switchView(state.view);
     }
 
+    function renderTranscriptStatus(details) {
+        const panel = document.getElementById('transcript-status-panel');
+        panel.classList.remove('hidden');
+        setText('transcript-status', details.status || 'Completed');
+        setText('transcript-strategy', details.strategy || 'Direct');
+        setText('transcript-fallback', details.fallback_used ? 'Used' : 'Not Used');
+        setText('transcript-proxy', details.proxy_used ? 'Yes' : 'No');
+        setText('transcript-reason', details.reason || '');
+    }
+
     function renderSpeakerDetection(details) {
         const panel = document.getElementById('speaker-panel');
-        if (!details || !details.enabled) {
+        if (!details) {
             panel.classList.add('hidden');
             return;
         }
@@ -306,9 +343,20 @@
         panel.classList.remove('hidden');
         setText('speaker-status', details.status || (details.message ? 'Completed' : 'Unknown'));
         setText('speaker-model', details.model || 'pyannote/speaker-diarization-3.1');
-        setText('speaker-count', details.detected_speakers == null ? '0' : details.detected_speakers);
-        setText('speaker-confidence', details.confidence == null ? '0%' : `${details.confidence}%`);
-        setText('speaker-total-time', timings.total == null ? '' : `${timings.total} ms`);
+        const notRun = (details.status || '').toLowerCase() === 'not run';
+        const failed = (details.status || '').toLowerCase() === 'failed';
+        const detectedLabel = notRun ? 'Not Run' : (failed ? 'Unavailable' : (details.detected_speakers == null ? 'Unavailable' : details.detected_speakers));
+        let confidenceLabel = 'Not Provided';
+        if (notRun) {
+            confidenceLabel = 'Not Run';
+        } else if (failed) {
+            confidenceLabel = 'Unavailable';
+        } else if (details.confidence_available && details.confidence != null) {
+            confidenceLabel = `${details.confidence}%`;
+        }
+        setText('speaker-count', detectedLabel);
+        setText('speaker-confidence', confidenceLabel);
+        setText('speaker-total-time', timings.total == null ? '' : `${(Number(timings.total) / 1000).toFixed(1)}s`);
         setText('speaker-reason', details.reason || details.message || '');
     }
 

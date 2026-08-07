@@ -118,7 +118,7 @@ class SubtitleQualityTestCase(unittest.TestCase):
             diarizer = get_diarizer(enabled=True)
             result = diarizer.apply([{"start": 0.0, "end": 1.0, "text": "Hello"}])
         self.assertIsInstance(diarizer, UnavailableDiarizer)
-        self.assertEqual(result.status, "Disabled")
+        self.assertEqual(result.status, "Failed")
         self.assertIn("Missing HUGGINGFACE_TOKEN", result.reason)
 
     @patch("services.diarization.shutil.which", return_value=None)
@@ -207,19 +207,20 @@ class SubtitleQualityTestCase(unittest.TestCase):
         self.assertEqual(calls, ["_download_audio", "_load_pyannote_model", "_run_pyannote"])
         self.assertEqual(result.status, "Completed")
         self.assertEqual(result.detected_speakers, 2)
-        self.assertEqual(result.confidence, 100)
+        self.assertIsNone(result.confidence)
+        self.assertFalse(result.confidence_available)
         self.assertTrue(result.speaker_labels_available)
         self.assertIn("audio_download", result.timings_ms)
         joined_logs = "\n".join(logs.output)
         for message in (
-            "[DIARIZATION] Enabled",
+            "[DIARIZATION] Speaker detection enabled",
             "[DIARIZATION] Downloading audio...",
             "[DIARIZATION] Audio downloaded",
             "[DIARIZATION] Loading pyannote model...",
             "[DIARIZATION] Running diarization...",
             "[DIARIZATION] Detected 2 speaker(s)",
             "[DIARIZATION] Assigning speaker labels...",
-            "[DIARIZATION] Speaker labels assigned",
+            "[DIARIZATION] Speaker labeling completed",
             "[DIARIZATION] Completed successfully",
         ):
             self.assertIn(message, joined_logs)
@@ -247,7 +248,9 @@ class SubtitleQualityTestCase(unittest.TestCase):
                 self.assertLogs("services.diarization", level="ERROR") as logs:
             result = diarizer.apply(segments, video_id="abcDEF123_4")
         self.assertEqual(result.status, "Failed")
-        self.assertIn("RuntimeError: download failed", result.reason)
+        self.assertEqual(result.detected_speakers, None)
+        self.assertEqual(result.confidence, None)
+        self.assertEqual(result.error_code, "youtube_audio_download_failed")
         self.assertIsNotNone(logs.records[0].exc_info)
 
     def test_entity_protection_restores_product_names_and_api_key(self):

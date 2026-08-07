@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
 from importlib import metadata
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -180,6 +181,8 @@ class TranscriptFetchStrategy:
     proxy_mode: str
     proxy_config: object | None
     uses_proxy: bool
+    proxy_host: str = ""
+    proxy_port: int | None = None
 
 
 @dataclass
@@ -213,6 +216,7 @@ class TranscriptPayload:
     translated: bool
     is_generated: bool
     speaker_detection: dict
+    transcript_status: dict
     segments: list[dict]
     thumbnail_url: str
 
@@ -229,6 +233,7 @@ class TranscriptPayload:
             "translated": self.translated,
             "is_generated": self.is_generated,
             "speaker_detection": self.speaker_detection,
+            "transcript_status": self.transcript_status,
             "segment_count": len(self.segments),
             "word_count": word_count(self.segments),
             "duration": duration,
@@ -315,6 +320,7 @@ def fetch_transcript(url_or_id: str, target_language: str = "original", enable_s
         translated=translated,
         is_generated=transcript["is_generated"],
         speaker_detection=transcript.get("speaker_detection") or {"enabled": False, "speaker_labels_available": False, "message": ""},
+        transcript_status=transcript.get("transcript_status") or {"status": "Completed", "reason": "Transcript retrieved successfully."},
         segments=segments,
         thumbnail_url=get_thumbnail_url(video_id),
     )
@@ -338,7 +344,7 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
             error_code="missing_dependency",
         )
 
-    transcript, raw_segments = _retrieve_transcript_with_fallback(video_id)
+    transcript, raw_segments, transcript_status = _retrieve_transcript_with_fallback(video_id)
 
     diarization = get_diarizer(enabled=enable_speaker_detection).apply(normalize_segments(raw_segments), video_id=video_id)
     segments = diarization.segments
@@ -358,9 +364,11 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
             "model": diarization.model,
             "detected_speakers": diarization.detected_speakers,
             "confidence": diarization.confidence,
+            "confidence_available": diarization.confidence is not None,
             "reason": diarization.reason,
             "timings_ms": diarization.timings_ms or {},
         },
+        "transcript_status": transcript_status,
         "segments": segments,
     }
 
@@ -369,27 +377,65 @@ def _retrieve_transcript_with_fallback(video_id: str):
     failures: list[TranscriptFetchFailure] = []
     strategies = build_transcript_fetch_strategies()
     deadline = time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
+    logger.info("youtube_transcript_start video_id=%s strategies=%s", video_id, ",".join(strategy.name for strategy in strategies))
 
     for index, strategy in enumerate(strategies):
         remaining_strategies = strategies[index + 1 :]
         try:
+            logger.info(
+                "youtube_transcript_proxy_attempt video_id=%s strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s uses_proxy=%s",
+                video_id,
+                strategy.name,
+                index + 1,
+                strategy.proxy_host or "-",
+                strategy.proxy_port or "-",
+                strategy.uses_proxy,
+            )
             transcript_list = _list_transcripts(video_id, strategy, deadline)
             transcript = _select_transcript(transcript_list)
             raw_segments = _fetch_raw_segments_with_retry(transcript, video_id, strategy, deadline)
+            transcript_status = {
+                "status": "Completed",
+                "strategy": strategy.name,
+                "proxy_used": strategy.uses_proxy,
+                "proxy_index": index + 1 if strategy.uses_proxy else None,
+                "proxy_host": strategy.proxy_host or None,
+                "proxy_port": strategy.proxy_port,
+                "fallback_used": index > 0,
+                "reason": "Transcript retrieved successfully.",
+            }
             if failures:
                 logger.info(
-                    "youtube_transcript_fallback_recovered video_id=%s strategy=%s previous_failures=%s",
+                    "youtube_transcript_proxy_success video_id=%s strategy=%s fallback_used=true previous_failures=%s",
                     video_id,
                     strategy.name,
                     ",".join(failure.error_code for failure in failures),
                 )
-            return transcript, raw_segments
+            else:
+                logger.info(
+                    "youtube_transcript_proxy_success video_id=%s strategy=%s fallback_used=false",
+                    video_id,
+                    strategy.name,
+                )
+            logger.info("youtube_transcript_success video_id=%s strategy=%s", video_id, strategy.name)
+            return transcript, raw_segments, transcript_status
         except Exception as exc:
             stage = "fetch"
             failure = build_fetch_failure(exc, strategy, stage)
             failures.append(failure)
             log_transcript_exception(exc, video_id, f"{stage}:{strategy.name}")
+            logger.warning(
+                "youtube_transcript_proxy_failed video_id=%s strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s error_code=%s",
+                video_id,
+                strategy.name,
+                index + 1,
+                strategy.proxy_host or "-",
+                strategy.proxy_port or "-",
+                failure.error_code,
+            )
             if should_try_next_strategy(exc, strategy, remaining_strategies):
+                if not remaining_strategies[0].uses_proxy:
+                    logger.warning("youtube_transcript_direct_fallback video_id=%s from_strategy=%s error_code=%s", video_id, strategy.name, failure.error_code)
                 logger.warning(
                     "youtube_transcript_strategy_fallback video_id=%s from_strategy=%s next_strategy=%s error_code=%s",
                     video_id,
@@ -423,6 +469,8 @@ def _fetch_raw_segments_with_retry(transcript, video_id: str, strategy: Transcri
                     "exception_class": exc.__class__.__name__,
                     "proxy_mode": strategy.proxy_mode,
                     "strategy": strategy.name,
+                    "proxy_host": strategy.proxy_host or "-",
+                    "proxy_port": strategy.proxy_port or "-",
                     "remaining_budget_seconds": round(remaining_transcript_budget(deadline), 2),
                 },
             )
@@ -495,7 +543,7 @@ def is_proxy_authentication_error(exc: Exception) -> bool:
 
 
 def get_proxy_mode() -> str:
-    if get_env_value("WEBSHARE_PROXY"):
+    if load_proxy_url_list():
         return "webshare_url"
     if get_env_value("WEBSHARE_PROXY_USERNAME") and get_env_value("WEBSHARE_PROXY_PASSWORD"):
         return "webshare"
@@ -505,7 +553,8 @@ def get_proxy_mode() -> str:
 
 
 def get_proxy_diagnostics() -> dict:
-    webshare_url = bool(get_env_value("WEBSHARE_PROXY"))
+    proxy_url_list = load_proxy_url_list()
+    webshare_url = bool(proxy_url_list)
     webshare_username = bool(get_env_value("WEBSHARE_PROXY_USERNAME"))
     webshare_password = bool(get_env_value("WEBSHARE_PROXY_PASSWORD"))
     webshare_host = bool(get_env_value("WEBSHARE_PROXY_HOST"))
@@ -525,6 +574,7 @@ def get_proxy_diagnostics() -> dict:
         reason = "No proxy configured; YouTube transcript requests use direct mode."
     timeout_settings = get_transcript_timeout_settings()
     strategies = build_transcript_fetch_strategies()
+    proxy_hosts = [strategy.proxy_host for strategy in strategies if strategy.uses_proxy and strategy.proxy_host]
     return {
         "mode": mode,
         "webshare_proxy_url": "Configured" if webshare_url else "Missing",
@@ -537,6 +587,8 @@ def get_proxy_diagnostics() -> dict:
         "available": mode != "direct",
         "reason": reason,
         "fetch_strategies": [strategy.name for strategy in strategies],
+        "proxy_count": len([strategy for strategy in strategies if strategy.uses_proxy]),
+        "proxy_hosts": proxy_hosts,
         "direct_fallback_enabled": direct_youtube_fallback_enabled(),
         "request_total_budget_seconds": timeout_settings["total_budget_seconds"],
         "connect_timeout_seconds": timeout_settings["connect_timeout_seconds"],
@@ -577,7 +629,7 @@ def build_transcript_fetch_strategies() -> list[TranscriptFetchStrategy]:
     strategies: list[TranscriptFetchStrategy] = []
     seen: set[tuple] = set()
 
-    def add_strategy(name: str, proxy_mode: str, proxy_config) -> None:
+    def add_strategy(name: str, proxy_mode: str, proxy_config, proxy_host: str = "", proxy_port: int | None = None) -> None:
         key = (proxy_mode, tuple(sorted((proxy_config.to_requests_dict() if proxy_config else {}).items())))
         if key in seen:
             return
@@ -587,14 +639,18 @@ def build_transcript_fetch_strategies() -> list[TranscriptFetchStrategy]:
             proxy_mode=proxy_mode,
             proxy_config=proxy_config,
             uses_proxy=proxy_config is not None,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
         ))
 
-    webshare_proxy_url = get_env_value("WEBSHARE_PROXY")
-    if webshare_proxy_url:
+    for index, proxy_url in enumerate(load_proxy_url_list(), start=1):
+        details = safe_proxy_url_details(proxy_url)
         add_strategy(
+            f"proxy_{index}",
             "webshare_url",
-            "webshare_url",
-            GenericProxyConfig(http_url=webshare_proxy_url, https_url=webshare_proxy_url),
+            GenericProxyConfig(http_url=proxy_url, https_url=proxy_url),
+            proxy_host=details["host"],
+            proxy_port=details["port"],
         )
 
     webshare_username = get_env_value("WEBSHARE_PROXY_USERNAME")
@@ -611,12 +667,25 @@ def build_transcript_fetch_strategies() -> list[TranscriptFetchStrategy]:
             kwargs["domain_name"] = webshare_host
         if webshare_port:
             kwargs["proxy_port"] = webshare_port
-        add_strategy("webshare", "webshare", WebshareProxyConfig(**kwargs))
+        add_strategy(
+            "webshare",
+            "webshare",
+            WebshareProxyConfig(**kwargs),
+            proxy_host=kwargs.get("domain_name", WebshareProxyConfig.DEFAULT_DOMAIN_NAME),
+            proxy_port=kwargs.get("proxy_port", WebshareProxyConfig.DEFAULT_PORT),
+        )
 
     http_url = get_env_value("YOUTUBE_PROXY_HTTP_URL")
     https_url = get_env_value("YOUTUBE_PROXY_HTTPS_URL")
     if http_url or https_url:
-        add_strategy("generic_proxy", "generic", GenericProxyConfig(http_url=http_url or None, https_url=https_url or None))
+        details = safe_proxy_url_details(https_url or http_url or "")
+        add_strategy(
+            "generic_proxy",
+            "generic",
+            GenericProxyConfig(http_url=http_url or None, https_url=https_url or None),
+            proxy_host=details["host"],
+            proxy_port=details["port"],
+        )
 
     if not strategies or direct_youtube_fallback_enabled():
         add_strategy("direct", "direct", None)
@@ -894,6 +963,46 @@ def parse_proxy_port(value: str) -> int | None:
         return port
     logger.warning("youtube_transcript_invalid_proxy_port")
     return None
+
+
+def load_proxy_url_list() -> list[str]:
+    urls = []
+    raw_list = get_env_value("WEBSHARE_PROXY_LIST")
+    if raw_list:
+        urls.extend(item.strip() for item in raw_list.split(",") if item.strip())
+
+    list_file = get_env_value("WEBSHARE_PROXY_LIST_FILE")
+    if list_file:
+        path = Path(list_file)
+        try:
+            if path.exists() and path.is_file():
+                urls.extend(
+                    line.strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                )
+        except OSError:
+            logger.warning("youtube_transcript_proxy_list_file_unreadable path=%s", path)
+
+    legacy = get_env_value("WEBSHARE_PROXY")
+    if legacy:
+        urls.append(legacy.strip())
+
+    deduped = []
+    seen = set()
+    for url in urls:
+        if url and url not in seen:
+            deduped.append(url)
+            seen.add(url)
+    return deduped
+
+
+def safe_proxy_url_details(proxy_url: str) -> dict:
+    parsed = urlparse(proxy_url)
+    return {
+        "host": parsed.hostname or "",
+        "port": parsed.port,
+    }
 
 
 def _select_transcript(transcript_list):

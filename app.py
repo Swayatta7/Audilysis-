@@ -739,7 +739,12 @@ def youtube_transcript_generate():
         )
     except YouTubeTranscriptError as error:
         return youtube_transcript_error_response(error)
-    return jsonify({"success": True, "transcript": result})
+    return jsonify({
+        "success": True,
+        "transcript": result,
+        "transcript_status": result.get("transcript_status", {"status": "Completed"}),
+        "speaker_detection": result.get("speaker_detection", {"status": "Not Run"}),
+    })
 
 
 @app.route("/api/youtube-transcript/translate", methods=["POST"])

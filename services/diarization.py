@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ import time
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
+from urllib.parse import urlparse
 
 from agents.runtime_config import get_env_value
 
@@ -36,10 +38,12 @@ class DiarizationResult:
     message: str = ""
     status: str = "Disabled"
     model: str = ""
-    detected_speakers: int = 0
-    confidence: int = 0
+    detected_speakers: int | None = None
+    confidence: int | None = None
     timings_ms: dict | None = None
     reason: str = ""
+    error_code: str | None = None
+    confidence_available: bool = False
 
 
 class BaseDiarizer:
@@ -53,7 +57,15 @@ class NoOpDiarizer(BaseDiarizer):
             enabled=False,
             speaker_labels_available=False,
             segments=segments,
-            message="Speaker detection disabled.",
+            message="Speaker detection was not requested.",
+            status="Not Run",
+            model=PyannoteDiarizer.model_name,
+            detected_speakers=None,
+            confidence=None,
+            timings_ms={"audio_download": 0, "model_loading": 0, "diarization": 0, "total": 0},
+            reason="Speaker detection was not requested.",
+            error_code=None,
+            confidence_available=False,
         )
 
 
@@ -69,12 +81,14 @@ class UnavailableDiarizer(BaseDiarizer):
             speaker_labels_available=False,
             segments=segments,
             message=self.reason,
-            status="Disabled",
+            status="Failed",
             model=PyannoteDiarizer.model_name,
-            detected_speakers=0,
-            confidence=0,
+            detected_speakers=None,
+            confidence=None,
             timings_ms={"audio_download": 0, "model_loading": 0, "diarization": 0, "total": 0},
             reason=self.reason,
+            error_code="speaker_detection_unavailable",
+            confidence_available=False,
         )
 
 
@@ -87,17 +101,17 @@ class PyannoteDiarizer(BaseDiarizer):
     def apply(self, segments: list[dict], video_id: str | None = None) -> DiarizationResult:
         total_start = time.perf_counter()
         timings = {"audio_download": 0, "model_loading": 0, "diarization": 0, "total": 0}
-        logger.info("[DIARIZATION] Enabled")
+        logger.info("[DIARIZATION] Speaker detection enabled")
         if not self.token:
             message = "HUGGINGFACE_TOKEN is not configured."
             logger.error("[DIARIZATION] %s", message)
             timings["total"] = elapsed_ms(total_start)
-            return DiarizationResult(True, False, segments, message, "Failed", self.model_name, 0, 0, timings, message)
+            return DiarizationResult(True, False, segments, message, "Failed", self.model_name, None, None, timings, message, "huggingface_token_missing", False)
         if not video_id:
             message = "A validated YouTube video ID is required for diarization."
             logger.error("[DIARIZATION] %s", message)
             timings["total"] = elapsed_ms(total_start)
-            return DiarizationResult(True, False, segments, message, "Failed", self.model_name, 0, 0, timings, message)
+            return DiarizationResult(True, False, segments, message, "Failed", self.model_name, None, None, timings, message, "missing_video_id", False)
 
         temp_dir = tempfile.mkdtemp(prefix="audilysis-diarization-")
         try:
@@ -118,7 +132,6 @@ class PyannoteDiarizer(BaseDiarizer):
             turns = self._run_pyannote(audio_path, pipeline)
             timings["diarization"] = elapsed_ms(step_start)
             speaker_count = len({turn["speaker"] for turn in turns})
-            confidence = estimate_confidence(turns, segments)
             logger.info("[DIARIZATION] Detected %s speaker(s)", speaker_count)
 
             logger.info("[DIARIZATION] Assigning speaker labels...")
@@ -126,7 +139,7 @@ class PyannoteDiarizer(BaseDiarizer):
             labels_available = speaker_count > 1 and any(item.get("speaker") for item in labeled)
             if speaker_count <= 1:
                 labeled = [strip_speaker_label(item) for item in labeled]
-            logger.info("[DIARIZATION] Speaker labels assigned")
+            logger.info("[DIARIZATION] Speaker labeling completed")
 
             timings["total"] = elapsed_ms(total_start)
             logger.info("[DIARIZATION] Completed successfully")
@@ -144,9 +157,11 @@ class PyannoteDiarizer(BaseDiarizer):
                 "Completed",
                 self.model_name,
                 speaker_count,
-                confidence,
+                None,
                 timings,
                 reason,
+                None,
+                False,
             )
         except Exception as exc:
             timings["total"] = elapsed_ms(total_start)
@@ -154,27 +169,53 @@ class PyannoteDiarizer(BaseDiarizer):
                 "[DIARIZATION] Speaker detection failed",
                 extra={"exception_class": exc.__class__.__name__, "video_id": video_id, "timings_ms": timings},
             )
+            error_code, safe_message = normalize_audio_download_error(exc)
             return DiarizationResult(
                 True,
                 False,
                 segments,
-                f"{exc.__class__.__name__}: {exc}",
+                safe_message,
                 "Failed",
                 self.model_name,
-                0,
-                0,
+                None,
+                None,
                 timings,
-                f"{exc.__class__.__name__}: {exc}",
+                safe_message,
+                error_code,
+                False,
             )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _download_audio(self, video_id: str, audio_path: Path) -> None:
         url = f"https://www.youtube.com/watch?v={video_id}"
+        last_error = None
+        for index, strategy in enumerate(build_audio_download_strategies(), start=1):
+            try:
+                logger.info("[DIARIZATION] Audio proxy attempt strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s", strategy["name"], index, strategy["proxy_host"] or "-", strategy["proxy_port"] or "-")
+                if strategy["cookies_enabled"]:
+                    logger.info("[DIARIZATION] Audio cookie auth enabled")
+                self._download_audio_with_strategy(url, audio_path, strategy)
+                logger.info("[DIARIZATION] Audio downloaded successfully")
+                return
+            except Exception as exc:
+                last_error = exc
+                error_code, safe_message = normalize_audio_download_error(exc)
+                logger.warning(
+                    "[DIARIZATION] Audio download failure strategy=%s proxy_index=%s error_code=%s",
+                    strategy["name"],
+                    index,
+                    error_code,
+                )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Audio download strategy list was empty.")
+
+    def _download_audio_with_strategy(self, url: str, audio_path: Path, strategy: dict) -> None:
         try:
             from yt_dlp import YoutubeDL
         except ImportError:
-            self._download_audio_with_binary(url, audio_path)
+            self._download_audio_with_binary(url, audio_path, strategy)
             return
 
         output_template = str(audio_path.with_suffix(".%(ext)s"))
@@ -183,14 +224,22 @@ class PyannoteDiarizer(BaseDiarizer):
             "outtmpl": output_template,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": get_audio_download_timeout_seconds(),
+            "retries": 1,
+            "fragment_retries": 1,
+            "extractor_retries": 1,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
         }
+        if strategy["proxy_url"]:
+            options["proxy"] = strategy["proxy_url"]
+        if strategy["cookies_file"]:
+            options["cookiefile"] = strategy["cookies_file"]
         with YoutubeDL(options) as downloader:
             downloader.download([url])
         if not audio_path.exists():
             raise RuntimeError("Audio download did not produce a WAV file.")
 
-    def _download_audio_with_binary(self, url: str, audio_path: Path) -> None:
+    def _download_audio_with_binary(self, url: str, audio_path: Path, strategy: dict) -> None:
         command = [
             "yt-dlp",
             "-f",
@@ -198,11 +247,25 @@ class PyannoteDiarizer(BaseDiarizer):
             "--extract-audio",
             "--audio-format",
             "wav",
+            "--socket-timeout",
+            str(int(get_audio_download_timeout_seconds())),
+            "--retries",
+            "1",
+            "--fragment-retries",
+            "1",
+            "--extractor-retries",
+            "1",
             "-o",
             str(audio_path.with_suffix(".%(ext)s")),
-            url,
         ]
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if strategy["proxy_url"]:
+            command.extend(["--proxy", strategy["proxy_url"]])
+        if strategy["cookies_file"]:
+            command.extend(["--cookies", strategy["cookies_file"]])
+        command.append(url)
+        result = subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "yt-dlp failed to download audio.")
         if not audio_path.exists():
             raise RuntimeError("yt-dlp did not produce a WAV file.")
 
@@ -300,14 +363,149 @@ def elapsed_ms(start: float) -> int:
     return int(round((time.perf_counter() - start) * 1000))
 
 
-def estimate_confidence(turns: list[dict], segments: list[dict]) -> int:
-    if not turns or not segments:
-        return 0
-    labeled = 0
-    for segment in segments:
-        if best_speaker_for_segment(segment, turns):
-            labeled += 1
-    return int(round((labeled / max(1, len(segments))) * 100))
+def get_audio_download_timeout_seconds() -> float:
+    raw = get_env_value("YOUTUBE_AUDIO_DOWNLOAD_TIMEOUT_SECONDS")
+    try:
+        value = float(raw) if raw else 15.0
+    except ValueError:
+        value = 15.0
+    return min(60.0, max(5.0, value))
+
+
+def get_youtube_cookies_file() -> str:
+    return get_env_value("YOUTUBE_COOKIES_FILE").strip()
+
+
+def get_cookie_file_diagnostics() -> dict:
+    cookie_path = get_youtube_cookies_file()
+    if not cookie_path:
+        return {"configured": False, "exists": False, "readable": False, "path": ""}
+    path = Path(cookie_path)
+    return {
+        "configured": True,
+        "exists": path.exists(),
+        "readable": os.access(path, os.R_OK),
+        "path": str(path),
+    }
+
+
+def build_audio_download_strategies() -> list[dict]:
+    cookie_file = resolve_cookie_file_for_runtime()
+    strategies = []
+    seen = set()
+
+    def add_strategy(name: str, proxy_url: str | None, cookies_file: str | None) -> None:
+        key = (proxy_url or "", cookies_file or "")
+        if key in seen:
+            return
+        seen.add(key)
+        parsed = urlparse(proxy_url) if proxy_url else None
+        strategies.append({
+            "name": name,
+            "proxy_url": proxy_url,
+            "proxy_host": parsed.hostname if parsed else "",
+            "proxy_port": parsed.port if parsed else None,
+            "cookies_file": cookies_file,
+            "cookies_enabled": bool(cookies_file),
+        })
+
+    for index, proxy_url in enumerate(load_audio_proxy_urls(), start=1):
+        add_strategy(f"proxy_{index}", proxy_url, cookie_file)
+    if not strategies or direct_audio_fallback_enabled():
+        add_strategy("direct", None, cookie_file)
+    return strategies
+
+
+def load_audio_proxy_urls() -> list[str]:
+    proxy_urls = []
+    raw_list = get_env_value("WEBSHARE_PROXY_LIST")
+    if raw_list:
+        proxy_urls.extend(item.strip() for item in raw_list.split(",") if item.strip())
+
+    list_file = get_env_value("WEBSHARE_PROXY_LIST_FILE")
+    if list_file:
+        path = Path(list_file)
+        try:
+            if path.exists() and path.is_file():
+                proxy_urls.extend(
+                    line.strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                )
+        except OSError:
+            logger.warning("[DIARIZATION] Proxy list file unreadable: %s", path)
+
+    single_proxy = get_env_value("WEBSHARE_PROXY").strip()
+    if single_proxy:
+        proxy_urls.append(single_proxy)
+
+    legacy_username = get_env_value("WEBSHARE_PROXY_USERNAME").strip()
+    legacy_password = get_env_value("WEBSHARE_PROXY_PASSWORD").strip()
+    if legacy_username and legacy_password:
+        legacy_host = get_env_value("WEBSHARE_PROXY_HOST").strip() or "p.webshare.io"
+        legacy_port = get_env_value("WEBSHARE_PROXY_PORT").strip() or "80"
+        proxy_urls.append(f"http://{legacy_username}:{legacy_password}@{legacy_host}:{legacy_port}")
+
+    generic_http = get_env_value("YOUTUBE_PROXY_HTTP_URL").strip()
+    generic_https = get_env_value("YOUTUBE_PROXY_HTTPS_URL").strip()
+    if generic_https:
+        proxy_urls.append(generic_https)
+    elif generic_http:
+        proxy_urls.append(generic_http)
+
+    deduped = []
+    seen = set()
+    for proxy_url in proxy_urls:
+        if proxy_url and proxy_url not in seen:
+            deduped.append(proxy_url)
+            seen.add(proxy_url)
+    return deduped
+
+
+def resolve_cookie_file_for_runtime() -> str | None:
+    details = get_cookie_file_diagnostics()
+    if not details["configured"]:
+        return None
+    if not details["exists"]:
+        raise RuntimeError("Configured YouTube cookies file was not found.")
+    if not details["readable"]:
+        raise RuntimeError("Configured YouTube cookies file is not readable.")
+    return details["path"]
+
+
+def direct_audio_fallback_enabled() -> bool:
+    raw = get_env_value("YOUTUBE_DIRECT_FALLBACK_ENABLED").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def normalize_audio_download_error(exc: Exception) -> tuple[str, str]:
+    text = str(exc or "").strip()
+    lowered = text.lower()
+    if "not a bot" in lowered or "sign in to confirm" in lowered:
+        return "youtube_auth_required", "YouTube requires authentication before the audio can be downloaded for speaker detection."
+    if "cookies file was not found" in lowered or "configured youtube cookies file was not found" in lowered:
+        return "youtube_cookies_invalid", "The configured YouTube cookies file could not be found."
+    if "cookies file is not readable" in lowered:
+        return "youtube_cookies_invalid", "The configured YouTube cookies file is not readable."
+    if "members-only" in lowered or "members only" in lowered:
+        return "youtube_members_only", "This video is members-only, so audio could not be downloaded for speaker detection."
+    if "age-restricted" in lowered or "age restricted" in lowered:
+        return "youtube_age_restricted", "This video is age-restricted, so audio could not be downloaded for speaker detection."
+    if "private video" in lowered or "private" in lowered:
+        return "youtube_private_video", "This private video could not be downloaded for speaker detection."
+    if "geo" in lowered and "blocked" in lowered:
+        return "youtube_geo_blocked", "This video is geo-blocked for audio download."
+    if "timed out" in lowered or "timeout" in lowered:
+        return "youtube_audio_download_timeout", "The audio download timed out before speaker detection could run."
+    if "proxy" in lowered and "407" in lowered:
+        return "youtube_proxy_auth_failed", "Proxy authentication failed while downloading audio for speaker detection."
+    if "proxy" in lowered:
+        return "youtube_proxy_connection_failed", "The configured proxy failed while downloading audio for speaker detection."
+    if "unavailable" in lowered:
+        return "youtube_unavailable", "The YouTube audio download is unavailable for this video."
+    return "youtube_audio_download_failed", "Speaker detection could not run because the YouTube audio download failed."
 
 
 def strip_speaker_label(segment: dict) -> dict:
@@ -321,6 +519,7 @@ def get_speaker_detection_diagnostics() -> dict:
     ytdlp_installed = is_python_module_installed("yt_dlp") or shutil.which("yt-dlp") is not None
     ffmpeg_installed = shutil.which("ffmpeg") is not None
     token_configured = bool(get_env_value("HUGGINGFACE_TOKEN"))
+    cookie_diagnostics = get_cookie_file_diagnostics()
     model_authentication, model_authentication_reason = check_model_authentication() if token_configured else ("Failed", "Missing HUGGINGFACE_TOKEN")
 
     missing = []
@@ -346,6 +545,11 @@ def get_speaker_detection_diagnostics() -> dict:
         "available": available,
         "status": "Enabled" if available else "Disabled",
         "reason": "Ready" if available else ", ".join(missing),
+        "youtube_cookies_file": "Configured" if cookie_diagnostics["configured"] else "Missing",
+        "youtube_cookies_exists": "Yes" if cookie_diagnostics["exists"] else "No",
+        "youtube_cookies_readable": "Yes" if cookie_diagnostics["readable"] else "No",
+        "proxy_count": len(load_audio_proxy_urls()),
+        "audio_timeout_seconds": get_audio_download_timeout_seconds(),
         "install_commands": [
             "pip install -r requirements-diarization.txt",
             "sudo apt install ffmpeg -y",
@@ -362,6 +566,7 @@ def log_speaker_detection_diagnostics() -> dict:
     logger.warning("yt-dlp: %s", diagnostics["yt_dlp"])
     logger.warning("ffmpeg: %s", diagnostics["ffmpeg"])
     logger.warning("HUGGINGFACE_TOKEN: %s", diagnostics["huggingface_token"])
+    logger.warning("YOUTUBE_COOKIES_FILE: %s", diagnostics["youtube_cookies_file"])
     logger.warning("Model Authentication: %s", diagnostics["model_authentication"])
     logger.warning("Speaker Detection Available: %s", "Yes" if diagnostics["available"] else "No")
     logger.warning("==================================================")

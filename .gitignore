@@ -13,3 +13,6 @@ reference_materials/
 
 # Local environment
 .env
+secrets/
+*.cookies.txt
+youtube_cookies.txt

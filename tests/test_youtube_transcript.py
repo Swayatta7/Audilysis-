@@ -324,6 +324,8 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
             "segments": [],
             "segment_count": 0,
             "translated": False,
+            "speaker_detection": {"status": "Not Run"},
+            "transcript_status": {"status": "Completed"},
         }
         response = self.client.post("/api/youtube-transcript/generate", json={
             "url": "https://www.youtube.com/watch?v=abcDEF123_4",
@@ -351,8 +353,10 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(response.status_code, 200)
         self.assertTrue(data["success"])
-        self.assertEqual(data["transcript"]["speaker_detection"]["status"], "Disabled")
+        self.assertEqual(data["transcript"]["speaker_detection"]["status"], "Failed")
         self.assertIn("Missing HUGGINGFACE_TOKEN", data["transcript"]["speaker_detection"]["reason"])
+        self.assertIsNone(data["transcript"]["speaker_detection"]["detected_speakers"])
+        self.assertIsNone(data["transcript"]["speaker_detection"]["confidence"])
 
     @patch("app.get_speaker_detection_diagnostics")
     def test_health_reports_speaker_detection_diagnostics(self, diagnostics):

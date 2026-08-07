@@ -15,6 +15,8 @@ from services.production_diagnostics import (
     get_runtime_path_diagnostics,
     package_diagnostics,
 )
+from services.diarization import get_speaker_detection_diagnostics
+from services.youtube_transcript_service import get_proxy_diagnostics
 
 
 def wsgi_import_status() -> dict:
@@ -42,6 +44,8 @@ def main() -> int:
         "packages": package_diagnostics(),
         "environment": get_environment_audit(),
         "paths": get_runtime_path_diagnostics(),
+        "youtube_proxy": get_proxy_diagnostics(),
+        "speaker_detection": get_speaker_detection_diagnostics(),
         "wsgi": wsgi_import_status(),
         "connectivity": connectivity_report(),
     }
