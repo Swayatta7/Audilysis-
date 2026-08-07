@@ -1,7 +1,6 @@
 import json
 import logging
 import math
-import os
 import re
 import time
 import xml.etree.ElementTree as ElementTree
@@ -80,7 +79,11 @@ LANGUAGE_CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$")
 MAX_URL_LENGTH = 512
 MAX_SEGMENTS = 2000
 MAX_TRANSLATION_CHARS = 90000
-MAX_TRANSCRIPT_FETCH_RETRIES = 2
+MAX_TRANSCRIPT_FETCH_RETRIES = 1
+DEFAULT_TRANSCRIPT_TOTAL_TIMEOUT_SECONDS = 20.0
+DEFAULT_TRANSCRIPT_CONNECT_TIMEOUT_SECONDS = 4.0
+DEFAULT_TRANSCRIPT_READ_TIMEOUT_SECONDS = 8.0
+MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS = 1.0
 GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 
 
@@ -169,6 +172,35 @@ class ConfigurationError(YouTubeTranscriptError):
 class UpstreamError(YouTubeTranscriptError):
     status_code = 502
     error_code = "upstream_error"
+
+
+@dataclass(frozen=True)
+class TranscriptFetchStrategy:
+    name: str
+    proxy_mode: str
+    proxy_config: object | None
+    uses_proxy: bool
+
+
+@dataclass
+class TranscriptFetchFailure:
+    strategy: str
+    proxy_mode: str
+    uses_proxy: bool
+    stage: str
+    exception_class: str
+    error_code: str
+    diagnostic: str
+
+
+class TimeoutAwareSession(requests.Session):
+    def __init__(self, timeout_provider):
+        super().__init__()
+        self._timeout_provider = timeout_provider
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self._timeout_provider())
+        return super().request(method, url, **kwargs)
 
 
 @dataclass
@@ -306,85 +338,7 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
             error_code="missing_dependency",
         )
 
-    try:
-        transcript_list = _list_transcripts(video_id)
-        transcript = _select_transcript(transcript_list)
-        raw_segments = _fetch_raw_segments_with_retry(transcript, video_id)
-    except TranscriptsDisabled as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError("Transcripts are disabled for this video.", 403, "transcripts_disabled") from exc
-    except NoTranscriptFound as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError("No transcript is available for this video.", 404, "no_transcript") from exc
-    except VideoUnavailable as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError("This video is private, removed, or unavailable.", 404, "video_unavailable") from exc
-    except IpBlocked as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError(
-            "YouTube blocked requests from this server IP. Configure a supported proxy or try again later.",
-            429,
-            "youtube_ip_blocked",
-        ) from exc
-    except RequestBlocked as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError(
-            "YouTube blocked the transcript request. Configure a supported proxy or try again later.",
-            429,
-            "youtube_request_blocked",
-        ) from exc
-    except TooManyRequests as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError(
-            "YouTube rate-limited transcript requests. Please try again later.",
-            429,
-            "youtube_rate_limited",
-        ) from exc
-    except PoTokenRequired as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise YouTubeTranscriptError(
-            "YouTube requires additional verification for this transcript request.",
-            403,
-            "youtube_po_token_required",
-        ) from exc
-    except requests.exceptions.ProxyError as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        if is_proxy_authentication_error(exc):
-            raise UpstreamError(
-                "Proxy authentication failed. Check the configured Webshare proxy credentials in the environment.",
-                error_code="youtube_proxy_auth_failed",
-            ) from exc
-        raise UpstreamError(
-            "Could not connect through the configured YouTube proxy.",
-            error_code="youtube_proxy_connection_failed",
-        ) from exc
-    except requests.exceptions.ConnectionError as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError(
-            "Could not connect to YouTube to retrieve the transcript. Check server network/DNS access and try again.",
-            error_code="youtube_connection_failed",
-        ) from exc
-    except CouldNotRetrieveTranscript as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError(
-            "YouTube could not return transcript data for this video.",
-            error_code="youtube_unavailable",
-        ) from exc
-    except requests.exceptions.Timeout as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError("The YouTube transcript request timed out.", error_code="youtube_timeout") from exc
-    except requests.exceptions.RequestException as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError("YouTube transcript request failed.", error_code="youtube_request_failed") from exc
-    except ElementTree.ParseError as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError(
-            "YouTube returned an empty or invalid transcript response. Please try again later.",
-            error_code="youtube_bad_transcript_response",
-        ) from exc
-    except Exception as exc:
-        log_transcript_exception(exc, video_id, "fetch")
-        raise UpstreamError("Transcript retrieval failed. Please try another video or try again later.") from exc
+    transcript, raw_segments = _retrieve_transcript_with_fallback(video_id)
 
     diarization = get_diarizer(enabled=enable_speaker_detection).apply(normalize_segments(raw_segments), video_id=video_id)
     segments = diarization.segments
@@ -411,16 +365,54 @@ def _fetch_source_transcript(video_id: str, enable_speaker_detection: bool = Fal
     }
 
 
-def _fetch_raw_segments_with_retry(transcript, video_id: str):
+def _retrieve_transcript_with_fallback(video_id: str):
+    failures: list[TranscriptFetchFailure] = []
+    strategies = build_transcript_fetch_strategies()
+    deadline = time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
+
+    for index, strategy in enumerate(strategies):
+        remaining_strategies = strategies[index + 1 :]
+        try:
+            transcript_list = _list_transcripts(video_id, strategy, deadline)
+            transcript = _select_transcript(transcript_list)
+            raw_segments = _fetch_raw_segments_with_retry(transcript, video_id, strategy, deadline)
+            if failures:
+                logger.info(
+                    "youtube_transcript_fallback_recovered video_id=%s strategy=%s previous_failures=%s",
+                    video_id,
+                    strategy.name,
+                    ",".join(failure.error_code for failure in failures),
+                )
+            return transcript, raw_segments
+        except Exception as exc:
+            stage = "fetch"
+            failure = build_fetch_failure(exc, strategy, stage)
+            failures.append(failure)
+            log_transcript_exception(exc, video_id, f"{stage}:{strategy.name}")
+            if should_try_next_strategy(exc, strategy, remaining_strategies):
+                logger.warning(
+                    "youtube_transcript_strategy_fallback video_id=%s from_strategy=%s next_strategy=%s error_code=%s",
+                    video_id,
+                    strategy.name,
+                    remaining_strategies[0].name,
+                    failure.error_code,
+                )
+                continue
+            raise map_transcript_exception(exc, strategy) from exc
+    raise UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
+
+
+def _fetch_raw_segments_with_retry(transcript, video_id: str, strategy: TranscriptFetchStrategy, deadline: float):
     last_exc = None
     for attempt in range(MAX_TRANSCRIPT_FETCH_RETRIES + 1):
         try:
+            ensure_transcript_time_budget(deadline)
             return transcript.fetch()
         except (IpBlocked, RequestBlocked, TooManyRequests, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, PoTokenRequired, CouldNotRetrieveTranscript):
             raise
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as exc:
             last_exc = exc
-            if attempt >= MAX_TRANSCRIPT_FETCH_RETRIES:
+            if attempt >= MAX_TRANSCRIPT_FETCH_RETRIES or remaining_transcript_budget(deadline) <= MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS:
                 raise
             logger.warning(
                 "youtube_transcript_fetch_retry",
@@ -429,26 +421,32 @@ def _fetch_raw_segments_with_retry(transcript, video_id: str):
                     "attempt": attempt + 1,
                     "max_retries": MAX_TRANSCRIPT_FETCH_RETRIES,
                     "exception_class": exc.__class__.__name__,
-                    "proxy_mode": get_proxy_mode(),
+                    "proxy_mode": strategy.proxy_mode,
+                    "strategy": strategy.name,
+                    "remaining_budget_seconds": round(remaining_transcript_budget(deadline), 2),
                 },
             )
             time.sleep(0.25 * (2 ** attempt))
     raise last_exc
 
 
-def _list_transcripts(video_id: str):
-    proxy_config = build_proxy_config()
+def _list_transcripts(video_id: str, strategy: TranscriptFetchStrategy, deadline: float):
+    http_client = build_youtube_http_client(deadline)
     try:
-        return YouTubeTranscriptApi(proxy_config=proxy_config).list(video_id)
+        return YouTubeTranscriptApi(proxy_config=strategy.proxy_config, http_client=http_client).list(video_id)
     except TypeError:
-        if proxy_config is not None:
+        if strategy.proxy_config is not None:
             raise ConfigurationError(
                 "The installed youtube-transcript-api version does not support proxy configuration.",
                 error_code="transcript_proxy_not_supported",
             )
+    try:
+        return YouTubeTranscriptApi(http_client=http_client).list(video_id)
+    except TypeError:
+        pass
     if hasattr(YouTubeTranscriptApi, "list_transcripts"):
         return YouTubeTranscriptApi.list_transcripts(video_id)
-    return YouTubeTranscriptApi().list(video_id)
+    return YouTubeTranscriptApi(http_client=http_client).list(video_id)
 
 
 def log_transcript_exception(exc: Exception, video_id: str, stage: str) -> None:
@@ -525,6 +523,8 @@ def get_proxy_diagnostics() -> dict:
         reason = "Incomplete Webshare proxy credentials."
     else:
         reason = "No proxy configured; YouTube transcript requests use direct mode."
+    timeout_settings = get_transcript_timeout_settings()
+    strategies = build_transcript_fetch_strategies()
     return {
         "mode": mode,
         "webshare_proxy_url": "Configured" if webshare_url else "Missing",
@@ -536,6 +536,11 @@ def get_proxy_diagnostics() -> dict:
         "generic_https_url": "Configured" if generic_https else "Missing",
         "available": mode != "direct",
         "reason": reason,
+        "fetch_strategies": [strategy.name for strategy in strategies],
+        "direct_fallback_enabled": direct_youtube_fallback_enabled(),
+        "request_total_budget_seconds": timeout_settings["total_budget_seconds"],
+        "connect_timeout_seconds": timeout_settings["connect_timeout_seconds"],
+        "read_timeout_seconds": timeout_settings["read_timeout_seconds"],
     }
 
 
@@ -550,6 +555,7 @@ def build_proxy_config():
         kwargs = {
             "proxy_username": webshare_username,
             "proxy_password": webshare_password,
+            "retries_when_blocked": 0,
         }
         webshare_host = get_env_value("WEBSHARE_PROXY_HOST")
         webshare_port = parse_proxy_port(get_env_value("WEBSHARE_PROXY_PORT"))
@@ -565,6 +571,315 @@ def build_proxy_config():
         return GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
 
     return None
+
+
+def build_transcript_fetch_strategies() -> list[TranscriptFetchStrategy]:
+    strategies: list[TranscriptFetchStrategy] = []
+    seen: set[tuple] = set()
+
+    def add_strategy(name: str, proxy_mode: str, proxy_config) -> None:
+        key = (proxy_mode, tuple(sorted((proxy_config.to_requests_dict() if proxy_config else {}).items())))
+        if key in seen:
+            return
+        seen.add(key)
+        strategies.append(TranscriptFetchStrategy(
+            name=name,
+            proxy_mode=proxy_mode,
+            proxy_config=proxy_config,
+            uses_proxy=proxy_config is not None,
+        ))
+
+    webshare_proxy_url = get_env_value("WEBSHARE_PROXY")
+    if webshare_proxy_url:
+        add_strategy(
+            "webshare_url",
+            "webshare_url",
+            GenericProxyConfig(http_url=webshare_proxy_url, https_url=webshare_proxy_url),
+        )
+
+    webshare_username = get_env_value("WEBSHARE_PROXY_USERNAME")
+    webshare_password = get_env_value("WEBSHARE_PROXY_PASSWORD")
+    if webshare_username and webshare_password:
+        kwargs = {
+            "proxy_username": webshare_username,
+            "proxy_password": webshare_password,
+            "retries_when_blocked": 0,
+        }
+        webshare_host = get_env_value("WEBSHARE_PROXY_HOST")
+        webshare_port = parse_proxy_port(get_env_value("WEBSHARE_PROXY_PORT"))
+        if webshare_host:
+            kwargs["domain_name"] = webshare_host
+        if webshare_port:
+            kwargs["proxy_port"] = webshare_port
+        add_strategy("webshare", "webshare", WebshareProxyConfig(**kwargs))
+
+    http_url = get_env_value("YOUTUBE_PROXY_HTTP_URL")
+    https_url = get_env_value("YOUTUBE_PROXY_HTTPS_URL")
+    if http_url or https_url:
+        add_strategy("generic_proxy", "generic", GenericProxyConfig(http_url=http_url or None, https_url=https_url or None))
+
+    if not strategies or direct_youtube_fallback_enabled():
+        add_strategy("direct", "direct", None)
+
+    return strategies
+
+
+def get_transcript_timeout_settings() -> dict:
+    return {
+        "total_budget_seconds": parse_timeout_setting(
+            "YOUTUBE_TRANSCRIPT_TOTAL_TIMEOUT_SECONDS",
+            DEFAULT_TRANSCRIPT_TOTAL_TIMEOUT_SECONDS,
+            minimum=5.0,
+            maximum=120.0,
+        ),
+        "connect_timeout_seconds": parse_timeout_setting(
+            "YOUTUBE_TRANSCRIPT_CONNECT_TIMEOUT_SECONDS",
+            DEFAULT_TRANSCRIPT_CONNECT_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=30.0,
+        ),
+        "read_timeout_seconds": parse_timeout_setting(
+            "YOUTUBE_TRANSCRIPT_READ_TIMEOUT_SECONDS",
+            DEFAULT_TRANSCRIPT_READ_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=60.0,
+        ),
+    }
+
+
+def parse_timeout_setting(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = get_env_value(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("youtube_transcript_invalid_timeout_setting %s", name)
+        return default
+    return min(maximum, max(minimum, value))
+
+
+def direct_youtube_fallback_enabled() -> bool:
+    raw = get_env_value("YOUTUBE_DIRECT_FALLBACK_ENABLED").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def remaining_transcript_budget(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def ensure_transcript_time_budget(deadline: float) -> None:
+    if remaining_transcript_budget(deadline) <= MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS:
+        raise requests.exceptions.Timeout("Transcript request budget exhausted")
+
+
+def build_youtube_http_client(deadline: float) -> TimeoutAwareSession:
+    return TimeoutAwareSession(lambda: compute_transcript_request_timeout(deadline))
+
+
+def compute_transcript_request_timeout(deadline: float) -> tuple[float, float]:
+    ensure_transcript_time_budget(deadline)
+    settings = get_transcript_timeout_settings()
+    remaining = remaining_transcript_budget(deadline)
+    connect_timeout = min(settings["connect_timeout_seconds"], max(1.0, remaining / 2))
+    read_ceiling = max(MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS, remaining - connect_timeout)
+    read_timeout = min(settings["read_timeout_seconds"], read_ceiling)
+    return (round(connect_timeout, 2), round(read_timeout, 2))
+
+
+def should_try_next_strategy(exc: Exception, strategy: TranscriptFetchStrategy, remaining_strategies: list[TranscriptFetchStrategy]) -> bool:
+    if not remaining_strategies or not strategy.uses_proxy:
+        return False
+    if isinstance(exc, (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, PoTokenRequired)):
+        return False
+    return isinstance(
+        exc,
+        (
+            IpBlocked,
+            RequestBlocked,
+            TooManyRequests,
+            CouldNotRetrieveTranscript,
+            ElementTree.ParseError,
+            requests.exceptions.ProxyError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+        ),
+    )
+
+
+def build_fetch_failure(exc: Exception, strategy: TranscriptFetchStrategy, stage: str) -> TranscriptFetchFailure:
+    mapped = map_transcript_exception(exc, strategy)
+    return TranscriptFetchFailure(
+        strategy=strategy.name,
+        proxy_mode=strategy.proxy_mode,
+        uses_proxy=strategy.uses_proxy,
+        stage=stage,
+        exception_class=exc.__class__.__name__,
+        error_code=getattr(mapped, "error_code", "upstream_error"),
+        diagnostic=safe_exception_diagnostic(exc),
+    )
+
+
+def map_transcript_exception(exc: Exception, strategy: TranscriptFetchStrategy) -> YouTubeTranscriptError:
+    uses_proxy = strategy.uses_proxy
+    if isinstance(exc, TranscriptsDisabled):
+        return YouTubeTranscriptError("Transcripts are disabled for this video.", 403, "transcripts_disabled")
+    if isinstance(exc, NoTranscriptFound):
+        return YouTubeTranscriptError("No transcript is available for this video.", 404, "no_transcript")
+    if isinstance(exc, VideoUnavailable):
+        return YouTubeTranscriptError("This video is private, removed, or unavailable.", 404, "video_unavailable")
+    if isinstance(exc, IpBlocked):
+        if uses_proxy:
+            return YouTubeTranscriptError(
+                "YouTube blocked requests from the configured proxy IP.",
+                429,
+                "youtube_proxy_ip_blocked",
+            )
+        return YouTubeTranscriptError(
+            "YouTube blocked requests from this server IP. Configure a supported proxy or try again later.",
+            429,
+            "youtube_ip_blocked",
+        )
+    if isinstance(exc, RequestBlocked):
+        if uses_proxy:
+            return YouTubeTranscriptError(
+                "YouTube blocked the transcript request through the configured proxy.",
+                429,
+                "youtube_proxy_request_blocked",
+            )
+        return YouTubeTranscriptError(
+            "YouTube blocked the transcript request. Configure a supported proxy or try again later.",
+            429,
+            "youtube_request_blocked",
+        )
+    if isinstance(exc, TooManyRequests):
+        if uses_proxy:
+            return YouTubeTranscriptError(
+                "YouTube rate-limited transcript requests through the configured proxy.",
+                429,
+                "youtube_proxy_rate_limited",
+            )
+        return YouTubeTranscriptError(
+            "YouTube rate-limited transcript requests. Please try again later.",
+            429,
+            "youtube_rate_limited",
+        )
+    if isinstance(exc, PoTokenRequired):
+        return YouTubeTranscriptError(
+            "YouTube requires additional verification for this transcript request.",
+            403,
+            "youtube_po_token_required",
+        )
+    if isinstance(exc, requests.exceptions.ProxyError):
+        if is_proxy_authentication_error(exc):
+            return UpstreamError(
+                "Proxy authentication failed. Check the configured Webshare proxy credentials in the environment.",
+                status_code=502,
+                error_code="youtube_proxy_auth_failed",
+            )
+        if uses_proxy:
+            return UpstreamError(
+                "Could not connect through the configured YouTube proxy.",
+                status_code=502,
+                error_code="youtube_proxy_connection_failed",
+            )
+        return UpstreamError(
+            "Could not connect to YouTube to retrieve the transcript. Check server network/DNS access and try again.",
+            status_code=502,
+            error_code="youtube_connection_failed",
+        )
+    if isinstance(exc, requests.exceptions.Timeout):
+        if uses_proxy:
+            return UpstreamError(
+                "The YouTube transcript request timed out through the configured proxy.",
+                status_code=504,
+                error_code="youtube_proxy_timeout",
+            )
+        return UpstreamError(
+            "The YouTube transcript request timed out.",
+            status_code=504,
+            error_code="youtube_timeout",
+        )
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        if uses_proxy:
+            return UpstreamError(
+                "Could not connect through the configured YouTube proxy.",
+                status_code=502,
+                error_code="youtube_proxy_connection_failed",
+            )
+        return UpstreamError(
+            "Could not connect to YouTube to retrieve the transcript. Check server network/DNS access and try again.",
+            status_code=502,
+            error_code="youtube_connection_failed",
+        )
+    if isinstance(exc, CouldNotRetrieveTranscript):
+        return UpstreamError(
+            "YouTube could not return transcript data for this video.",
+            error_code="youtube_unavailable",
+        )
+    if isinstance(exc, requests.exceptions.RequestException):
+        if uses_proxy:
+            return UpstreamError(
+                "The YouTube transcript request failed through the configured proxy.",
+                error_code="youtube_proxy_request_failed",
+            )
+        return UpstreamError("YouTube transcript request failed.", error_code="youtube_request_failed")
+    if isinstance(exc, ElementTree.ParseError):
+        return UpstreamError(
+            "YouTube returned an empty or invalid transcript response. Please try again later.",
+            error_code="youtube_bad_transcript_response",
+        )
+    if isinstance(exc, YouTubeTranscriptError):
+        return exc
+    return UpstreamError("Transcript retrieval failed. Please try another video or try again later.")
+
+
+def diagnose_transcript_fetch(video_id: str) -> dict:
+    extracted_video_id = extract_video_id(video_id)
+    deadline = time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
+    results = []
+    strategies = build_transcript_fetch_strategies()
+    for index, strategy in enumerate(strategies):
+        try:
+            transcript_list = _list_transcripts(extracted_video_id, strategy, deadline)
+            transcript = _select_transcript(transcript_list)
+            snippets = _fetch_raw_segments_with_retry(transcript, extracted_video_id, strategy, deadline)
+            results.append({
+                "strategy": strategy.name,
+                "proxy_mode": strategy.proxy_mode,
+                "uses_proxy": strategy.uses_proxy,
+                "status": "success",
+                "language_code": getattr(transcript, "language_code", ""),
+                "is_generated": bool(getattr(transcript, "is_generated", False)),
+                "segment_count": len(snippets),
+            })
+            return {
+                "success": True,
+                "video_id": extracted_video_id,
+                "results": results,
+            }
+        except Exception as exc:
+            mapped = map_transcript_exception(exc, strategy)
+            results.append({
+                "strategy": strategy.name,
+                "proxy_mode": strategy.proxy_mode,
+                "uses_proxy": strategy.uses_proxy,
+                "status": "error",
+                "exception_class": exc.__class__.__name__,
+                "error_code": getattr(mapped, "error_code", "upstream_error"),
+                "message": str(mapped),
+                "diagnostic": safe_exception_diagnostic(exc),
+            })
+            if not should_try_next_strategy(exc, strategy, strategies[index + 1 :]):
+                break
+    return {
+        "success": False,
+        "video_id": extracted_video_id,
+        "results": results,
+    }
 
 
 def parse_proxy_port(value: str) -> int | None:

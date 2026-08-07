@@ -35,6 +35,18 @@ class FakeFailingThenWorkingTranscript(FakeTranscript):
         return self._segments
 
 
+class FakeFailingOnceThenWorkingTranscript(FakeTranscript):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def fetch(self):
+        self.calls += 1
+        if self.calls < 2:
+            raise service.requests.exceptions.Timeout("temporary timeout")
+        return self._segments
+
+
 class FakeAlwaysIpBlockedTranscript(FakeTranscript):
     def __init__(self):
         super().__init__()
@@ -46,7 +58,7 @@ class FakeAlwaysIpBlockedTranscript(FakeTranscript):
 
 
 class FakeAlwaysProxyAuthFailingApi:
-    def __init__(self, proxy_config=None):
+    def __init__(self, proxy_config=None, http_client=None):
         self.proxy_config = proxy_config
 
     def list(self, video_id):
@@ -64,12 +76,31 @@ class FakeTranscriptList:
 class FakeNewYouTubeTranscriptApi:
     instances = []
 
-    def __init__(self, proxy_config=None):
+    def __init__(self, proxy_config=None, http_client=None):
         self.proxy_config = proxy_config
+        self.http_client = http_client
         FakeNewYouTubeTranscriptApi.instances.append(self)
 
     def list(self, video_id):
         return FakeTranscriptList([FakeTranscript()])
+
+
+class FakeProxyTimeoutThenDirectApi:
+    def __init__(self, proxy_config=None, http_client=None):
+        self.proxy_config = proxy_config
+        self.http_client = http_client
+
+    def list(self, video_id):
+        if self.proxy_config is None:
+            return FakeTranscriptList([FakeTranscript()])
+        return FakeTranscriptList([
+            FakeTimeoutTranscript(),
+        ])
+
+
+class FakeTimeoutTranscript(FakeTranscript):
+    def fetch(self):
+        raise service.requests.exceptions.Timeout("proxy tunnel timed out")
 
 
 class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
@@ -456,20 +487,27 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
 
     @patch.object(service.time, "sleep")
     @patch.object(service, "YouTubeTranscriptApi")
-    def test_transient_fetch_errors_retry_at_most_twice(self, transcript_api, sleep):
-        transcript = FakeFailingThenWorkingTranscript()
+    def test_transient_fetch_errors_retry_is_bounded(self, transcript_api, sleep):
+        transcript = FakeFailingOnceThenWorkingTranscript()
         transcript_api.return_value.list.return_value = FakeTranscriptList([transcript])
-        response = self.client.post("/api/youtube-transcript/generate", json={
-            "url": "https://youtube.com/watch?v=abcDEF123_4",
-            "target_language": "original",
-        })
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "",
+            "WEBSHARE_PROXY_USERNAME": "",
+            "WEBSHARE_PROXY_PASSWORD": "",
+            "YOUTUBE_PROXY_HTTP_URL": "",
+            "YOUTUBE_PROXY_HTTPS_URL": "",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(transcript.calls, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(transcript.calls, 2)
+        self.assertEqual(sleep.call_count, 1)
 
     @patch.object(service.time, "sleep")
     @patch.object(service, "YouTubeTranscriptApi")
-    def test_ip_blocked_is_not_retried(self, transcript_api, sleep):
+    def test_ip_blocked_can_fall_back_to_direct_without_same_strategy_retry(self, transcript_api, sleep):
         transcript = FakeAlwaysIpBlockedTranscript()
         transcript_api.return_value.list.return_value = FakeTranscriptList([transcript])
         response = self.client.post("/api/youtube-transcript/generate", json={
@@ -478,8 +516,49 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.get_json()["error"], "youtube_ip_blocked")
-        self.assertEqual(transcript.calls, 1)
+        self.assertEqual(transcript.calls, 2)
         sleep.assert_not_called()
+
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxyTimeoutThenDirectApi)
+    def test_proxy_timeout_falls_back_to_direct_and_succeeds(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "http://user:pass@proxy.example.test:1234",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertEqual(response.get_json()["transcript"]["video_id"], "abcDEF123_4")
+
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxyTimeoutThenDirectApi)
+    def test_proxy_timeout_returns_structured_json_when_direct_fallback_disabled(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "http://user:pass@proxy.example.test:1234",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "0",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://youtube.com/watch?v=abcDEF123_4",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 504)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], "youtube_proxy_timeout")
+        self.assertIn("timed out through the configured proxy", payload["message"])
+
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxyTimeoutThenDirectApi)
+    def test_diagnostics_capture_proxy_timeout_and_direct_success(self):
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY": "http://user:pass@proxy.example.test:1234",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+        }, clear=True):
+            result = service.diagnose_transcript_fetch("abcDEF123_4")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["results"][0]["error_code"], "youtube_proxy_timeout")
+        self.assertEqual(result["results"][1]["status"], "success")
 
     @patch.object(service, "YouTubeTranscriptApi")
     def test_blocked_request_logs_safe_diagnostics(self, transcript_api):

@@ -9,13 +9,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.youtube_transcript_service import (  # noqa: E402
-    build_proxy_config,
+    diagnose_transcript_fetch,
     extract_video_id,
-    get_proxy_mode,
+    get_proxy_diagnostics,
     get_youtube_transcript_api_version,
-    safe_exception_diagnostic,
 )
-from youtube_transcript_api import YouTubeTranscriptApi  # noqa: E402
 
 
 def main() -> int:
@@ -26,35 +24,37 @@ def main() -> int:
     video_id = extract_video_id(args.video)
     print(f"youtube_transcript_api_version={get_youtube_transcript_api_version()}")
     print(f"video_id={video_id}")
-    print(f"proxy_mode={get_proxy_mode()}")
+    diagnostics = get_proxy_diagnostics()
+    print(f"proxy_mode={diagnostics['mode']}")
+    print(f"fetch_strategies={','.join(diagnostics['fetch_strategies'])}")
+    print(f"direct_fallback_enabled={diagnostics['direct_fallback_enabled']}")
+    print(f"request_total_budget_seconds={diagnostics['request_total_budget_seconds']}")
+    print(f"connect_timeout_seconds={diagnostics['connect_timeout_seconds']}")
+    print(f"read_timeout_seconds={diagnostics['read_timeout_seconds']}")
 
-    try:
-        api = YouTubeTranscriptApi(proxy_config=build_proxy_config())
-        transcript_list = api.list(video_id)
-        transcripts = list(transcript_list)
-        print(f"available_transcripts={len(transcripts)}")
-        for index, transcript in enumerate(transcripts, start=1):
-            print(
-                "transcript="
-                f"{index},language_code={transcript.language_code},"
-                f"is_generated={transcript.is_generated}"
-            )
-        if not transcripts:
-            print("result=no_transcripts_listed")
-            return 2
-
-        selected = transcripts[0]
-        snippets = selected.fetch()
-        print(f"fetch_result=success")
-        print(f"selected_language_code={selected.language_code}")
-        print(f"selected_is_generated={selected.is_generated}")
-        print(f"segment_count={len(snippets)}")
-        return 0
-    except Exception as exc:
-        print("fetch_result=error")
-        print(f"exception_class={exc.__class__.__name__}")
-        print(f"diagnostic={safe_exception_diagnostic(exc)}")
-        return 1
+    result = diagnose_transcript_fetch(video_id)
+    for index, attempt in enumerate(result["results"], start=1):
+        parts = [
+            f"attempt={index}",
+            f"strategy={attempt['strategy']}",
+            f"proxy_mode={attempt['proxy_mode']}",
+            f"uses_proxy={attempt['uses_proxy']}",
+            f"status={attempt['status']}",
+        ]
+        if attempt["status"] == "success":
+            parts.extend([
+                f"language_code={attempt['language_code']}",
+                f"is_generated={attempt['is_generated']}",
+                f"segment_count={attempt['segment_count']}",
+            ])
+        else:
+            parts.extend([
+                f"exception_class={attempt['exception_class']}",
+                f"error_code={attempt['error_code']}",
+                f"diagnostic={attempt['diagnostic']}",
+            ])
+        print(",".join(str(part) for part in parts))
+    return 0 if result["success"] else 1
 
 
 if __name__ == "__main__":
