@@ -113,6 +113,28 @@ class FakeAllBlockedApi:
         raise service.IpBlocked(video_id)
 
 
+class FakeSubtitleOnlyYoutubeDL:
+    last_options = None
+
+    def __init__(self, options):
+        FakeSubtitleOnlyYoutubeDL.last_options = options
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def extract_info(self, url, download=False):
+        return {
+            "automatic_captions": {
+                "en": [
+                    {"ext": "vtt", "url": "https://subtitle.example.test/captions.vtt"},
+                ]
+            }
+        }
+
+
 class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
     def setUp(self):
         app.config["TESTING"] = True
@@ -626,6 +648,40 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         segments = service.parse_ytdlp_subtitle_content(content, "json3")
         self.assertEqual(segments[0]["text"], "Hello world")
         self.assertEqual(segments[0]["duration"], 2.0)
+
+    @patch("services.youtube_transcript_service.requests.get")
+    def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self, requests_get):
+        class FakeResponse:
+            text = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n"
+
+            def raise_for_status(self):
+                return None
+
+        requests_get.return_value = FakeResponse()
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
+            source, segments = service._fetch_ytdlp_subtitle_segments(
+                "wuvaKDYK2RQ",
+                strategy,
+                deadline=service.time.monotonic() + 10,
+            )
+
+        self.assertEqual(source.language_code, "en")
+        self.assertTrue(segments)
+        self.assertEqual(segments[0]["text"], "Subtitle only fallback")
+        self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["skip_download"])
+        self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["ignore_no_formats_error"])
+        self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writeautomaticsub"])
+        self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writesubtitles"])
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitlesformat"], "json3/vtt/best")
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["cookiefile"], "/opt/Audilysis-/secrets/youtube_cookies.txt")
 
     def test_cookie_file_configured_diagnostics(self):
         with patch("services.youtube_transcript_service.os.access", return_value=True), \
