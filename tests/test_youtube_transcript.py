@@ -125,6 +125,10 @@ class FakeProxiesBlockedDirectTimeoutApi:
 
 class FakeSubtitleOnlyYoutubeDL:
     last_options = None
+    subtitle_video_id = "wuvaKDYK2RQ"
+    subtitle_language = "en"
+    write_file = True
+    extra_files = []
     info_payload = {
         "automatic_captions": {
             "en": [
@@ -144,10 +148,31 @@ class FakeSubtitleOnlyYoutubeDL:
 
     def extract_info(self, url, download=False):
         outtmpl = self.last_options["outtmpl"]
-        subtitle_path = outtmpl.replace("%(id)s", "wuvaKDYK2RQ").replace("%(ext)s", "en.vtt")
-        with open(subtitle_path, "w", encoding="utf-8") as handle:
-            handle.write("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n")
+        if self.write_file:
+            subtitle_path = outtmpl.replace("%(id)s", self.subtitle_video_id).replace("%(ext)s", f"{self.subtitle_language}.vtt")
+            with open(subtitle_path, "w", encoding="utf-8") as handle:
+                handle.write("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n")
+        for relative_name, content in self.extra_files:
+            base_dir = os.path.dirname(outtmpl)
+            path = os.path.join(base_dir, relative_name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
         return self.info_payload
+
+    @classmethod
+    def reset(cls):
+        cls.subtitle_video_id = "wuvaKDYK2RQ"
+        cls.subtitle_language = "en"
+        cls.write_file = True
+        cls.extra_files = []
+        cls.info_payload = {
+            "automatic_captions": {
+                "en": [
+                    {"ext": "vtt", "url": "https://subtitle.example.test/captions.vtt"},
+                ]
+            }
+        }
 
 
 class FakeProxyThenDirectYtdlpFetch:
@@ -687,6 +712,19 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "Hello world")
         self.assertEqual(segments[0]["start"], 0.0)
 
+    def test_ytdlp_vtt_parser_handles_cue_settings_multiline_and_duplicates(self):
+        content = (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000 align:start position:0%\n"
+            "Hello\nworld\n\n"
+            "00:00:00.000 --> 00:00:02.000 align:start position:0%\n"
+            "Hello\nworld\n"
+        )
+        segments = service.parse_ytdlp_subtitle_content(content, "vtt")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["text"], "Hello world")
+        self.assertEqual(segments[0]["duration"], 2.0)
+
     def test_ytdlp_automatic_caption_json3_parsing(self):
         content = '{"events":[{"tStartMs":0,"dDurationMs":2000,"segs":[{"utf8":"Hello "},{"utf8":"world"}]}]}'
         segments = service.parse_ytdlp_subtitle_content(content, "json3")
@@ -694,6 +732,8 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(segments[0]["duration"], 2.0)
 
     def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self):
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.subtitle_video_id = "wuvaKDYK2RQ"
         strategy = {
             "name": "yt_dlp_direct",
             "proxy_url": None,
@@ -722,7 +762,8 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["proxy"], "")
 
     def test_ytdlp_file_pipeline_succeeds_when_metadata_has_no_caption_urls(self):
-        original_info = FakeSubtitleOnlyYoutubeDL.info_payload
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.subtitle_video_id = "ag75o8Qwpv8"
         FakeSubtitleOnlyYoutubeDL.info_payload = {"subtitles": {}, "automatic_captions": {}}
         strategy = {
             "name": "yt_dlp_direct",
@@ -735,14 +776,116 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         try:
             with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
                 source, segments = service._fetch_ytdlp_subtitle_segments(
-                    "wuvaKDYK2RQ",
+                    "ag75o8Qwpv8",
                     strategy,
                     deadline=service.time.monotonic() + 10,
                 )
         finally:
-            FakeSubtitleOnlyYoutubeDL.info_payload = original_info
+            FakeSubtitleOnlyYoutubeDL.reset()
         self.assertEqual(source.language_code, "en")
         self.assertEqual(segments[0]["text"], "Subtitle only fallback")
+
+    def test_ytdlp_discovers_en_us_language_suffix_file(self):
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.subtitle_video_id = "ag75o8Qwpv8"
+        FakeSubtitleOnlyYoutubeDL.subtitle_language = "en-US"
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        try:
+            with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
+                source, segments = service._fetch_ytdlp_subtitle_segments(
+                    "ag75o8Qwpv8",
+                    strategy,
+                    deadline=service.time.monotonic() + 10,
+                )
+        finally:
+            FakeSubtitleOnlyYoutubeDL.reset()
+        self.assertEqual(source.language_code, "en-US")
+        self.assertEqual(segments[0]["text"], "Subtitle only fallback")
+
+    def test_ytdlp_prefers_id_language_file_over_title_filename(self):
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.subtitle_video_id = "ag75o8Qwpv8"
+        FakeSubtitleOnlyYoutubeDL.extra_files = [
+            ("Some Video Title.en.vtt", "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nTitle filename\n"),
+        ]
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        try:
+            with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
+                source, segments = service._fetch_ytdlp_subtitle_segments(
+                    "ag75o8Qwpv8",
+                    strategy,
+                    deadline=service.time.monotonic() + 10,
+                )
+        finally:
+            FakeSubtitleOnlyYoutubeDL.reset()
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Subtitle only fallback")
+
+    def test_ytdlp_success_without_subtitle_file_returns_not_found(self):
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.write_file = False
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        try:
+            with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL):
+                with self.assertRaises(service.UpstreamError) as caught:
+                    service._fetch_ytdlp_subtitle_segments(
+                        "ag75o8Qwpv8",
+                        strategy,
+                        deadline=service.time.monotonic() + 10,
+                    )
+        finally:
+            FakeSubtitleOnlyYoutubeDL.reset()
+        self.assertEqual(caught.exception.error_code, "youtube_transcript_not_found")
+        self.assertEqual(str(caught.exception), "No subtitles or automatic captions were found for this video.")
+
+    def test_ytdlp_file_diagnostics_log_file_count_selected_file_and_segments(self):
+        FakeSubtitleOnlyYoutubeDL.reset()
+        FakeSubtitleOnlyYoutubeDL.subtitle_video_id = "ag75o8Qwpv8"
+        strategy = {
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+            "cookies_enabled": True,
+        }
+        try:
+            with patch("yt_dlp.YoutubeDL", FakeSubtitleOnlyYoutubeDL), \
+                    self.assertLogs("services.youtube_transcript_service", level="INFO") as logs:
+                service._fetch_ytdlp_subtitle_segments(
+                    "ag75o8Qwpv8",
+                    strategy,
+                    deadline=service.time.monotonic() + 10,
+                )
+        finally:
+            FakeSubtitleOnlyYoutubeDL.reset()
+        joined = "\n".join(logs.output)
+        self.assertIn("youtube_transcript_ytdlp_files", joined)
+        self.assertIn("file_count=1", joined)
+        self.assertIn("youtube_transcript_ytdlp_file_selected", joined)
+        self.assertIn("filename=ag75o8Qwpv8.en.vtt", joined)
+        self.assertIn("segment_count=1", joined)
 
     def test_ytdlp_uses_fresh_fallback_budget(self):
         with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=[{

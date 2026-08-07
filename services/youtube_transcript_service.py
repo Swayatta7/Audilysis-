@@ -1153,10 +1153,25 @@ def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: floa
         with YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=True)
 
-        subtitle_file = find_ytdlp_subtitle_file(temp_dir)
+        subtitle_files = collect_ytdlp_subtitle_files(temp_dir)
+        logger.info(
+            "youtube_transcript_ytdlp_files video_id=%s strategy=%s file_count=%s extensions=%s",
+            video_id,
+            strategy["name"],
+            len(subtitle_files),
+            sorted({path.suffix.lstrip(".") for path in subtitle_files}),
+        )
+        subtitle_file = select_ytdlp_subtitle_file(subtitle_files, video_id)
         if not subtitle_file:
-            raise UpstreamError("yt-dlp could not find subtitles or automatic captions for this video.", error_code="youtube_transcript_not_found")
+            raise UpstreamError("No subtitles or automatic captions were found for this video.", error_code="youtube_transcript_not_found")
         raw_segments = parse_ytdlp_subtitle_content(subtitle_file.read_text(encoding="utf-8"), subtitle_file.suffix.lstrip("."))
+        logger.info(
+            "youtube_transcript_ytdlp_file_selected video_id=%s strategy=%s filename=%s segment_count=%s",
+            video_id,
+            strategy["name"],
+            subtitle_file.name,
+            len(raw_segments),
+        )
         language_code = infer_ytdlp_subtitle_language(subtitle_file)
         source = ResolvedTranscriptSource(
             language_code=language_code,
@@ -1180,7 +1195,7 @@ def build_ytdlp_subtitle_options(strategy: dict, deadline: float, temp_dir: str)
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
-        "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
+        "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "proxy": strategy["proxy_url"] or "",
     }
     if strategy["cookies_file"]:
@@ -1210,13 +1225,33 @@ def fetch_ytdlp_subtitle_text(selected: dict, strategy: dict, deadline: float) -
     return parse_ytdlp_subtitle_content(response.text, selected["ext"])
 
 
-def find_ytdlp_subtitle_file(temp_dir: str) -> Path | None:
+def collect_ytdlp_subtitle_files(temp_dir: str) -> list[Path]:
     candidates = []
     for extension in ("*.vtt", "*.json3", "*.srv3", "*.ttml", "*.xml"):
-        candidates.extend(Path(temp_dir).glob(extension))
+        candidates.extend(Path(temp_dir).rglob(extension))
+    return sorted(candidates, key=lambda path: path.name)
+
+
+def select_ytdlp_subtitle_file(candidates: list[Path], video_id: str) -> Path | None:
     if not candidates:
         return None
-    return sorted(candidates, key=lambda path: (path.suffix != ".vtt", path.name))[0]
+
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name
+        suffix_rank = 0 if path.suffix == ".vtt" else 1
+        language_rank = 5
+        for rank, language in enumerate(("en", "en-US", "en-GB")):
+            if name == f"{video_id}.{language}.vtt":
+                language_rank = rank
+                break
+            if name.startswith(f"{video_id}.{language}."):
+                language_rank = rank + 1
+                break
+            if f".{language}." in name:
+                language_rank = min(language_rank, rank + 2)
+        return (suffix_rank, language_rank, name)
+
+    return sorted(candidates, key=score)[0]
 
 
 def infer_ytdlp_subtitle_language(path: Path) -> str:
@@ -1279,6 +1314,7 @@ def parse_ytdlp_subtitle_content(content: str, ext: str) -> list[dict]:
 
 def parse_vtt_subtitles(content: str) -> list[dict]:
     segments = []
+    seen = set()
     blocks = re.split(r"\n\s*\n", content.replace("\r\n", "\n"))
     for block in blocks:
         lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
@@ -1295,7 +1331,9 @@ def parse_vtt_subtitles(content: str) -> list[dict]:
         start = parse_subtitle_timestamp_value(start_text)
         end = parse_subtitle_timestamp_value(end_text)
         text = " ".join(text_lines).strip()
-        if text:
+        key = (round(start, 3), round(end, 3), text)
+        if text and key not in seen:
+            seen.add(key)
             segments.append({"start": start, "duration": max(0.1, round(end - start, 3)), "text": text})
     return segments
 
