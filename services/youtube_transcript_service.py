@@ -86,6 +86,7 @@ DEFAULT_TRANSCRIPT_TOTAL_TIMEOUT_SECONDS = 20.0
 DEFAULT_TRANSCRIPT_CONNECT_TIMEOUT_SECONDS = 4.0
 DEFAULT_TRANSCRIPT_READ_TIMEOUT_SECONDS = 8.0
 MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS = 1.0
+MINIMUM_YTDLP_DIRECT_BUDGET_SECONDS = 8.0
 GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 YTDLP_SUBTITLE_BLOCKING_ERROR_CODES = {
     "youtube_proxy_ip_blocked",
@@ -994,23 +995,32 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
 
     last_exc: Exception | None = None
     strategies = build_ytdlp_subtitle_strategies()
+    fallback_deadline = build_ytdlp_fallback_deadline()
     for index, strategy in enumerate(strategies, start=1):
+        attempt_started_at = time.monotonic()
+        attempt_deadline = build_ytdlp_attempt_deadline(fallback_deadline, strategy, strategies[index:])
+        remaining_budget_ms = max(0, int((attempt_deadline - attempt_started_at) * 1000))
         try:
             logger.info(
-                "youtube_transcript_ytdlp_subtitle_attempt video_id=%s strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s cookies=%s",
+                "youtube_transcript_ytdlp_subtitle_attempt video_id=%s strategy=%s proxy_index=%s proxy_host=%s proxy_port=%s cookies=%s cookie_readable=%s remaining_budget_ms=%s",
                 video_id,
                 strategy["name"],
                 index,
                 strategy["proxy_host"] or "-",
                 strategy["proxy_port"] or "-",
                 strategy["cookies_enabled"],
+                fallback_diag["cookie_file_readable"],
+                remaining_budget_ms,
             )
-            source, raw_segments = _fetch_ytdlp_subtitle_segments(video_id, strategy, deadline)
+            source, raw_segments = _fetch_ytdlp_subtitle_segments(video_id, strategy, attempt_deadline)
+            elapsed_ms = int((time.monotonic() - attempt_started_at) * 1000)
             logger.info(
-                "youtube_transcript_ytdlp_subtitle_success video_id=%s strategy=%s proxy_index=%s",
+                "youtube_transcript_ytdlp_subtitle_success video_id=%s strategy=%s proxy_index=%s elapsed_ms=%s remaining_budget_ms=%s",
                 video_id,
                 strategy["name"],
                 index,
+                elapsed_ms,
+                max(0, int((fallback_deadline - time.monotonic()) * 1000)),
             )
             transcript_status = {
                 "status": "Completed",
@@ -1026,17 +1036,51 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
         except Exception as exc:
             last_exc = exc
             mapped = classify_ytdlp_subtitle_exception(exc, strategy)
+            elapsed_ms = int((time.monotonic() - attempt_started_at) * 1000)
             logger.warning(
-                "youtube_transcript_ytdlp_subtitle_failure video_id=%s strategy=%s proxy_index=%s error_code=%s",
+                "youtube_transcript_ytdlp_subtitle_failure video_id=%s strategy=%s proxy_index=%s error_code=%s elapsed_ms=%s remaining_budget_ms=%s",
                 video_id,
                 strategy["name"],
                 index,
                 mapped.error_code,
+                elapsed_ms,
+                max(0, int((fallback_deadline - time.monotonic()) * 1000)),
             )
             if index < len(strategies) and should_continue_ytdlp_subtitle_fallback(mapped):
                 continue
             raise mapped from exc
     raise classify_ytdlp_subtitle_exception(last_exc or RuntimeError("yt-dlp subtitle fallback failed."), {"name": "yt_dlp_subtitles", "proxy_url": None})
+
+
+def build_ytdlp_fallback_deadline() -> float:
+    return time.monotonic() + get_transcript_timeout_settings()["total_budget_seconds"]
+
+
+def build_ytdlp_attempt_deadline(
+    fallback_deadline: float,
+    strategy: dict,
+    remaining_strategies: list[dict],
+) -> float:
+    now = time.monotonic()
+    remaining_global = max(0.0, fallback_deadline - now)
+    settings = get_transcript_timeout_settings()
+    per_attempt_cap = settings["connect_timeout_seconds"] + settings["read_timeout_seconds"]
+    direct_reserved_budget = min(
+        remaining_global,
+        max(
+            MINIMUM_YTDLP_DIRECT_BUDGET_SECONDS,
+            settings["connect_timeout_seconds"] + settings["read_timeout_seconds"],
+        ),
+    )
+    direct_remaining = any(not item["proxy_url"] for item in remaining_strategies)
+    if strategy["proxy_url"] and direct_remaining:
+        available_for_this_attempt = max(
+            MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS,
+            remaining_global - direct_reserved_budget,
+        )
+    else:
+        available_for_this_attempt = remaining_global
+    return now + min(per_attempt_cap, max(MINIMUM_TRANSCRIPT_TIMEOUT_SECONDS, available_for_this_attempt))
 
 
 def build_ytdlp_subtitle_strategies() -> list[dict]:
@@ -1089,15 +1133,14 @@ def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: floa
         "ignore_no_formats_error": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitleslangs": ["en", "en-US", "en-GB", "all"],
-        "subtitlesformat": "json3/vtt/best",
-        "socket_timeout": compute_transcript_request_timeout(deadline)[1],
+        "subtitleslangs": preferred_ytdlp_subtitle_languages(),
+        "subtitlesformat": "vtt/json3/best",
+        "socket_timeout": compute_ytdlp_socket_timeout(deadline),
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
     }
-    if strategy["proxy_url"]:
-        options["proxy"] = strategy["proxy_url"]
+    options["proxy"] = strategy["proxy_url"] or ""
     if strategy["cookies_file"]:
         options["cookiefile"] = strategy["cookies_file"]
 
@@ -1106,19 +1149,35 @@ def _fetch_ytdlp_subtitle_segments(video_id: str, strategy: dict, deadline: floa
         info = downloader.extract_info(url, download=False)
 
     selected = select_ytdlp_subtitle(info)
-    response = requests.get(
-        selected["url"],
-        timeout=compute_transcript_request_timeout(deadline),
-        proxies={"http": strategy["proxy_url"], "https": strategy["proxy_url"]} if strategy["proxy_url"] else None,
-    )
-    response.raise_for_status()
-    raw_segments = parse_ytdlp_subtitle_content(response.text, selected["ext"])
+    raw_segments = fetch_ytdlp_subtitle_text(selected, strategy, deadline)
     source = ResolvedTranscriptSource(
         language_code=selected["language_code"],
         language=LANGUAGE_NAMES.get(selected["language_code"], selected["language_code"]),
         is_generated=selected["is_generated"],
     )
     return source, raw_segments
+
+
+def preferred_ytdlp_subtitle_languages() -> list[str]:
+    return ["en", "en-US", "en-GB"]
+
+
+def compute_ytdlp_socket_timeout(deadline: float) -> float:
+    connect_timeout, read_timeout = compute_transcript_request_timeout(deadline)
+    return round(min(30.0, max(read_timeout, connect_timeout + read_timeout)), 2)
+
+
+def fetch_ytdlp_subtitle_text(selected: dict, strategy: dict, deadline: float) -> list[dict]:
+    session = requests.Session()
+    session.trust_env = False
+    if strategy["proxy_url"]:
+        session.proxies = {"http": strategy["proxy_url"], "https": strategy["proxy_url"]}
+    response = session.get(
+        selected["url"],
+        timeout=compute_transcript_request_timeout(deadline),
+    )
+    response.raise_for_status()
+    return parse_ytdlp_subtitle_content(response.text, selected["ext"])
 
 
 def select_ytdlp_subtitle(info: dict) -> dict:

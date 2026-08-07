@@ -135,6 +135,24 @@ class FakeSubtitleOnlyYoutubeDL:
         }
 
 
+class FakeProxyThenDirectYtdlpFetch:
+    calls = []
+
+    @classmethod
+    def reset(cls):
+        cls.calls = []
+
+    @classmethod
+    def side_effect(cls, video_id, strategy, deadline):
+        cls.calls.append((strategy["name"], deadline))
+        if strategy["proxy_url"]:
+            raise service.requests.exceptions.Timeout(f"{strategy['name']} timed out")
+        return (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+            [{"start": 0.0, "duration": 2.0, "text": "Recovered on direct"}],
+        )
+
+
 class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
     def setUp(self):
         app.config["TESTING"] = True
@@ -649,15 +667,18 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "Hello world")
         self.assertEqual(segments[0]["duration"], 2.0)
 
-    @patch("services.youtube_transcript_service.requests.get")
-    def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self, requests_get):
+    @patch("services.youtube_transcript_service.requests.Session")
+    def test_ytdlp_subtitle_fallback_succeeds_when_formats_are_unavailable(self, session_cls):
         class FakeResponse:
             text = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSubtitle only fallback\n"
 
             def raise_for_status(self):
                 return None
 
-        requests_get.return_value = FakeResponse()
+        session = Mock()
+        session.proxies = {}
+        session.get.return_value = FakeResponse()
+        session_cls.return_value = session
         strategy = {
             "name": "yt_dlp_direct",
             "proxy_url": None,
@@ -680,8 +701,76 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["ignore_no_formats_error"])
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writeautomaticsub"])
         self.assertTrue(FakeSubtitleOnlyYoutubeDL.last_options["writesubtitles"])
-        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitlesformat"], "json3/vtt/best")
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitlesformat"], "vtt/json3/best")
         self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["cookiefile"], "/opt/Audilysis-/secrets/youtube_cookies.txt")
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["subtitleslangs"], ["en", "en-US", "en-GB"])
+        self.assertEqual(FakeSubtitleOnlyYoutubeDL.last_options["proxy"], "")
+
+    def test_ytdlp_uses_fresh_fallback_budget(self):
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=[{
+            "name": "yt_dlp_direct",
+            "proxy_url": None,
+            "proxy_host": "",
+            "proxy_port": None,
+            "cookies_file": None,
+            "cookies_enabled": False,
+        }]), patch.object(service, "_fetch_ytdlp_subtitle_segments", return_value=(
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+            [{"start": 0.0, "duration": 1.0, "text": "fresh budget"}],
+        )) as fetch_mock:
+            service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 0.05)
+        called_deadline = fetch_mock.call_args.args[2]
+        self.assertGreater(called_deadline - service.time.monotonic(), 5.0)
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_direct_gets_execution_opportunity_after_proxy_failures(self, ytdlp_fetch):
+        FakeProxyThenDirectYtdlpFetch.reset()
+        ytdlp_fetch.side_effect = FakeProxyThenDirectYtdlpFetch.side_effect
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY_LIST": "http://user:pass@proxy1.test:1111,http://user:pass@proxy2.test:2222",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+        }, clear=True):
+            source, segments, status = service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 0.01)
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Recovered on direct")
+        self.assertEqual(status["strategy"], "yt_dlp_direct")
+        self.assertEqual(
+            [name for name, _deadline in FakeProxyThenDirectYtdlpFetch.calls],
+            ["yt_dlp_proxy_1", "yt_dlp_proxy_2", "yt_dlp_direct"],
+        )
+
+    def test_ytdlp_attempt_deadline_reserves_time_for_direct(self):
+        now = service.time.monotonic()
+        fallback_deadline = now + 20
+        attempt_deadline = service.build_ytdlp_attempt_deadline(
+            fallback_deadline,
+            {"proxy_url": "http://proxy.example.test:1234"},
+            [{"proxy_url": "http://proxy2.example.test:1234"}, {"proxy_url": None}],
+        )
+        self.assertGreaterEqual(fallback_deadline - attempt_deadline, 8.0)
+
+    @patch("services.youtube_transcript_service.requests.Session")
+    def test_ytdlp_direct_subtitle_fetch_disables_env_proxy(self, session_cls):
+        session = Mock()
+        session.proxies = {}
+        session.get.return_value.text = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nNo proxy leak\n"
+        session.get.return_value.raise_for_status.return_value = None
+        session_cls.return_value = session
+        segments = service.fetch_ytdlp_subtitle_text(
+            {"url": "https://subtitle.example.test/captions.vtt", "ext": "vtt"},
+            {
+                "name": "yt_dlp_direct",
+                "proxy_url": None,
+                "proxy_host": "",
+                "proxy_port": None,
+                "cookies_file": None,
+                "cookies_enabled": False,
+            },
+            service.time.monotonic() + 10,
+        )
+        self.assertFalse(session.trust_env)
+        self.assertFalse(hasattr(session, "proxies") and session.proxies)
+        self.assertEqual(segments[0]["text"], "No proxy leak")
 
     def test_cookie_file_configured_diagnostics(self):
         with patch("services.youtube_transcript_service.os.access", return_value=True), \
