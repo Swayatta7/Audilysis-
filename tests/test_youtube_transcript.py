@@ -113,6 +113,16 @@ class FakeAllBlockedApi:
         raise service.IpBlocked(video_id)
 
 
+class FakeProxiesBlockedDirectTimeoutApi:
+    def __init__(self, proxy_config=None, http_client=None):
+        self.proxy_config = proxy_config
+
+    def list(self, video_id):
+        if self.proxy_config is None:
+            return FakeTranscriptList([FakeTimeoutTranscript()])
+        raise service.IpBlocked(video_id)
+
+
 class FakeSubtitleOnlyYoutubeDL:
     last_options = None
     info_payload = {
@@ -766,6 +776,82 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
             [name for name, _deadline in FakeProxyThenDirectYtdlpFetch.calls],
             ["yt_dlp_proxy_1", "yt_dlp_proxy_2", "yt_dlp_direct"],
         )
+
+    @patch.object(service.time, "sleep")
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxiesBlockedDirectTimeoutApi)
+    def test_primary_direct_timeout_enters_ytdlp_direct_and_succeeds(self, ytdlp_fetch, _sleep):
+        def ytdlp_side_effect(video_id, strategy, deadline):
+            if strategy["proxy_url"]:
+                raise service.UpstreamError("Proxy did not return subtitles.", error_code="youtube_transcript_not_found")
+            return (
+                service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+                [{"start": 0.0, "duration": 2.0, "text": "Recovered after primary timeout"}],
+            )
+
+        ytdlp_fetch.side_effect = ytdlp_side_effect
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY_LIST": ",".join([
+                "http://user:pass@proxy1.test:1111",
+                "http://user:pass@proxy2.test:2222",
+                "http://user:pass@proxy3.test:3333",
+                "http://user:pass@proxy4.test:4444",
+            ]),
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/shorts/ag75o8Qwpv8",
+                "target_language": "original",
+            })
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["transcript"]["segments"][0]["text"], "Recovered after primary timeout")
+        self.assertEqual(payload["transcript"]["transcript_status"]["strategy"], "yt_dlp_direct")
+        self.assertEqual(ytdlp_fetch.call_count, 5)
+
+    @patch.object(service.time, "sleep")
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxiesBlockedDirectTimeoutApi)
+    def test_final_primary_youtube_timeout_logs_ytdlp_fallback_start(self, ytdlp_fetch, _sleep):
+        ytdlp_fetch.return_value = (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+            [{"start": 0.0, "duration": 2.0, "text": "Fallback transcript"}],
+        )
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY_LIST": "http://user:pass@proxy1.test:1111",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+        }, clear=True), self.assertLogs("services.youtube_transcript_service", level="INFO") as logs:
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/shorts/ag75o8Qwpv8",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        joined = "\n".join(logs.output)
+        self.assertIn("youtube_transcript_ytdlp_subtitle_fallback_start", joined)
+        self.assertIn("primary_error_code=youtube_timeout", joined)
+        self.assertIn("fallback_budget_ms=", joined)
+
+    @patch.object(service.time, "sleep")
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    @patch.object(service, "YouTubeTranscriptApi", FakeProxiesBlockedDirectTimeoutApi)
+    def test_exhausted_primary_deadline_does_not_preexpire_ytdlp_deadline(self, ytdlp_fetch, _sleep):
+        ytdlp_fetch.return_value = (
+            service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+            [{"start": 0.0, "duration": 2.0, "text": "Fresh ytdlp budget"}],
+        )
+        with patch.dict(os.environ, {
+            "WEBSHARE_PROXY_LIST": "http://user:pass@proxy1.test:1111",
+            "YOUTUBE_DIRECT_FALLBACK_ENABLED": "1",
+            "YOUTUBE_TRANSCRIPT_TOTAL_TIMEOUT_SECONDS": "5",
+        }, clear=True):
+            response = self.client.post("/api/youtube-transcript/generate", json={
+                "url": "https://www.youtube.com/shorts/ag75o8Qwpv8",
+                "target_language": "original",
+            })
+        self.assertEqual(response.status_code, 200)
+        called_deadline = ytdlp_fetch.call_args.args[2]
+        self.assertGreater(called_deadline - service.time.monotonic(), 0.5)
 
     @patch.object(service, "_fetch_ytdlp_subtitle_segments")
     def test_ytdlp_proxy_transcript_not_found_then_next_proxy_success(self, ytdlp_fetch):

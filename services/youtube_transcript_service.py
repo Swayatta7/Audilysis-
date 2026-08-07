@@ -93,9 +93,12 @@ YTDLP_SUBTITLE_BLOCKING_ERROR_CODES = {
     "youtube_proxy_ip_blocked",
     "youtube_proxy_request_blocked",
     "youtube_proxy_rate_limited",
+    "youtube_proxy_timeout",
+    "youtube_proxy_connection_failed",
     "youtube_ip_blocked",
     "youtube_request_blocked",
     "youtube_rate_limited",
+    "youtube_timeout",
     "youtube_po_token_required",
 }
 YTDLP_FALLBACK_OVERRIDE_ERROR_CODES = {
@@ -481,10 +484,15 @@ def _retrieve_transcript_with_fallback(video_id: str):
             break
 
     if should_try_yt_dlp_subtitle_fallback(failures):
-        logger.info("youtube_transcript_ytdlp_subtitle_fallback_start video_id=%s", video_id)
         original_error = map_transcript_exception(
             last_exception or UpstreamError("Transcript retrieval failed. Please try another video or try again later."),
             last_strategy or TranscriptFetchStrategy("direct", "direct", None, False),
+        )
+        logger.info(
+            "youtube_transcript_ytdlp_subtitle_fallback_start video_id=%s primary_error_code=%s fallback_budget_ms=%s",
+            video_id,
+            getattr(original_error, "error_code", "upstream_error"),
+            int(get_transcript_timeout_settings()["total_budget_seconds"] * 1000),
         )
         try:
             return _fetch_transcript_via_yt_dlp(video_id, deadline)
