@@ -1,5 +1,6 @@
 from agents.base_agent import BaseAgent
 from agents.crawl_utils import audit_single_page
+import requests
 
 
 class SchemaAgent(BaseAgent):
@@ -21,7 +22,25 @@ class SchemaAgent(BaseAgent):
         website_url = (input_data.get("website_url") or input_data.get("target_page_url") or "").strip()
         if not website_url:
             return self.missing_input_response("website_url", input_data)
-        page = audit_single_page(website_url)
+        try:
+            page = audit_single_page(website_url)
+        except requests.RequestException as exc:
+            return self.build_structured_response(
+                input_data,
+                "The target page could not be crawled for schema analysis.",
+                ["Verify the website URL is reachable from the server and try again."],
+                {
+                    "detected_schema": [],
+                    "recommended_schema_types": [],
+                    "priority": "unavailable",
+                    "warnings": [{"website": website_url, "status": "crawl_failed", "message": str(exc)}],
+                    "data_source": "real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                },
+                success=False,
+                message=f"Unable to crawl {website_url}.",
+            )
         return self.build_structured_response(
             input_data,
             f"Schema review completed from live structured-data parsing on {page['url']}.",

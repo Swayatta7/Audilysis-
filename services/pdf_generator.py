@@ -25,6 +25,12 @@ from reportlab.pdfgen import canvas
 
 # Import DB queries for report content
 from db.storage import get_run, get_mention_results, get_competitor_metrics, get_trend_data
+from services.report_health import (
+    PLATFORM_LABELS,
+    PLATFORM_ORDER,
+    evaluate_report_data_health,
+    is_valid_platform_result,
+)
 
 # ================= Matplotlib Chart Plotting Functions =================
 
@@ -73,11 +79,8 @@ def generate_platform_chart(platform_breakdown):
     
     total = sum(values)
     if total == 0:
-        # Use equal dummy slices if there are 0 mentions to prevent empty chart crashes
-        values = [1, 1, 1, 1, 1]
-        labels = [f"{p} (0)" for p in platforms]
-    else:
-        labels = [f"{p} ({val})" for p, val in zip(platforms, values)]
+        return None
+    labels = [f"{p} ({val})" for p, val in zip(platforms, values)]
         
     colors_list = ['#4285F4', '#10a37f', '#19c37d', '#1a73e8', '#d97706']
     
@@ -252,6 +255,115 @@ def escape_and_highlight(text, brand_name, brand_domain):
     escaped = escaped.replace("\n", "<br/>")
     return escaped
 
+
+def build_response_explanation(result: dict | None) -> str:
+    if not result:
+        return "No platform response was recorded for this keyword."
+    if result.get("ai_response_text"):
+        return result["ai_response_text"]
+    return result.get("error_message") or "No usable platform response was collected for this keyword."
+
+
+def select_visibility_result(results: list[dict], keyword: str) -> dict | None:
+    preferred_order = ["google", "chat_gpt", "perplexity", "gemini", "claude"]
+    valid_by_platform = {
+        row["platform"]: row
+        for row in results
+        if row.get("keyword") == keyword and row.get("has_valid_data")
+    }
+    for platform in preferred_order:
+        if platform in valid_by_platform:
+            return valid_by_platform[platform]
+    return None
+
+
+def create_simple_pdf(story):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        leftMargin=54,
+        rightMargin=54,
+        topMargin=72,
+        bottomMargin=72,
+    )
+    doc.build(story, canvasmaker=NumberedCanvas)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+def build_technical_failure_pdf(run: dict, report_health: dict, results: list[dict]):
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('FailureTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=24, leading=30, textColor=HexColor('#1e1a4f'))
+    h1_style = ParagraphStyle('FailureHeader', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=15, leading=20, textColor=HexColor('#1e1a4f'), spaceBefore=12, spaceAfter=10)
+    body_style = ParagraphStyle('FailureBody', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=13, textColor=HexColor('#334155'))
+
+    story = [
+        Spacer(1, 24),
+        Paragraph("Audilysis 2.0", ParagraphStyle('FailureBrand', parent=body_style, fontName='Helvetica-Bold', fontSize=14, textColor=HexColor('#4361ee'))),
+        Paragraph("AI Mention Tracking — Technical Failure Report", title_style),
+        Spacer(1, 10),
+        Paragraph("No valid AI platform responses were collected. Client-facing visibility analytics were not generated for this run.", body_style),
+        Spacer(1, 18),
+        Paragraph("Run Summary", h1_style),
+    ]
+    summary_rows = [
+        ["Audit ID", str(run["id"])],
+        ["Brand", f'{run["brand_name"]} ({run["brand_domain"]})'],
+        ["Target Country", str(run["country"])],
+        ["Language", str(run["language"])],
+        ["Run Timestamp", str(run["run_date"])],
+        ["API Response Health", "Data Unavailable"],
+        ["Share of Voice", "Data Unavailable"],
+        ["Visibility Metrics", "Data Unavailable"],
+    ]
+    summary_table = Table(summary_rows, colWidths=[150, 354])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), HexColor('#f8fafc')),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#e2e8f0')),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 16))
+    story.append(Paragraph("Platform Status", h1_style))
+
+    status_rows = [["Platform", "Status", "Error Category", "Safe Error Message", "Retry Recommendation"]]
+    for item in report_health["platform_summaries"]:
+        status_rows.append([
+            PLATFORM_LABELS.get(item["platform"], item["platform"]),
+            item["status"],
+            item["error_category"],
+            item["safe_error_message"],
+            item["retry_recommendation"],
+        ])
+    status_table = Table(status_rows, colWidths=[78, 72, 96, 150, 108])
+    status_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1e1a4f')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#e2e8f0')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(status_table)
+    story.append(Spacer(1, 16))
+    story.append(Paragraph("Recommended Actions", h1_style))
+    for action in [
+        "Verify API credentials.",
+        "Verify quota and rate limits.",
+        "Check network connectivity from the server.",
+        "Check provider availability.",
+        "Rerun the audit after resolving the failures.",
+    ]:
+        story.append(Paragraph(f"• {action}", body_style))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Safe Technical Diagnostics", h1_style))
+    diagnostics = ", ".join(sorted({row.get("error_category") or row.get("response_status") or "unknown_error" for row in results})) or "No diagnostics recorded."
+    story.append(Paragraph(f"Observed error categories: {diagnostics}", body_style))
+    return create_simple_pdf(story)
+
 def generate_pdf_report(run_id):
     """
     Retrieves database results for run_id and generates a polished, multi-page PDF.
@@ -262,14 +374,19 @@ def generate_pdf_report(run_id):
         return None
         
     results = get_mention_results(run_id)
+    report_health = evaluate_report_data_health(results)
+    if report_health["report_mode"] == "technical_failure":
+        return build_technical_failure_pdf(run, report_health, results)
+
+    valid_results = [row for row in results if is_valid_platform_result(row)]
     metrics = get_competitor_metrics(run_id)
     
     # Calculations
     total_checks = len(results)
-    brand_mentions = sum(1 for r in results if r.get("mentioned"))
-    successful_checks = sum(1 for r in results if r.get("mentioned") is not None)
-    
-    brand_sov = round((brand_mentions / total_checks * 100), 1) if total_checks > 0 else 0.0
+    brand_mentions = sum(1 for r in valid_results if r.get("mentioned"))
+    successful_checks = len(valid_results)
+
+    brand_sov = round((brand_mentions / successful_checks * 100), 1) if successful_checks > 0 else None
     api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else 0.0
 
     competitors = []
@@ -283,7 +400,7 @@ def generate_pdf_report(run_id):
 
     def format_visibility_label(mentioned, position=None):
         if mentioned is None:
-            return "Not Mentioned"
+            return "Data Unavailable"
         if mentioned and position is not None:
             if position <= 3:
                 return "Top Recommendation"
@@ -294,17 +411,17 @@ def generate_pdf_report(run_id):
             return "Low Visibility"
         if mentioned:
             return "Moderate Visibility"
-        return "Not Mentioned"
+        return "No Visibility"
 
     def build_visibility_summary(match):
         if not match:
             return {
-                "mention_status": "Not Mentioned",
-                "visibility_level": "Low Visibility",
-                "position": "Estimated Position",
-                "visibility_score": "0%",
-                "sentiment": "Neutral",
-                "confidence": "Low"
+                "mention_status": "Data Unavailable",
+                "visibility_level": "Data Unavailable",
+                "position": "Data Unavailable",
+                "visibility_score": "Data Unavailable",
+                "sentiment": "Data Unavailable",
+                "confidence": "Data Unavailable"
             }
 
         mentioned = bool(match.get("mentioned"))
@@ -315,38 +432,40 @@ def generate_pdf_report(run_id):
             confidence = "High" if position <= 6 else "Medium"
             sentiment = "Positive"
         elif mentioned:
-            position_text = "Estimated Position"
+            position_text = "Data Unavailable"
             visibility_score = 62
             confidence = "Medium"
             sentiment = "Positive"
         else:
-            position_text = "Estimated Position"
+            position_text = "Data Unavailable"
             visibility_score = 0
-            confidence = "Low"
-            sentiment = "Neutral"
+            confidence = "Data Unavailable"
+            sentiment = "Data Unavailable"
 
         return {
             "mention_status": "Mentioned" if mentioned else "Not Mentioned",
             "visibility_level": format_visibility_label(mentioned, position),
             "position": position_text,
-            "visibility_score": f"{visibility_score}%",
+            "visibility_score": f"{visibility_score}%" if isinstance(visibility_score, (int, float)) else visibility_score,
             "sentiment": sentiment,
             "confidence": confidence
         }
     
     keywords = sorted(list(set(r["keyword"] for r in results)))
     
-    heatmap_data = {kw: {plat: None for plat in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude']} for kw in keywords}
+    heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
     for r in results:
         kw = r["keyword"]
         plat = r["platform"]
         heatmap_data[kw][plat] = {
             "mentioned": r["mentioned"],
-            "position": r["mention_position"]
-        } if r["mentioned"] is not None else None
+            "position": r["mention_position"],
+            "status": r.get("response_status"),
+            "error_message": r.get("error_message"),
+        } if r.get("has_valid_data") else None
         
-    platform_breakdown = {plat: 0 for plat in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude']}
-    for r in results:
+    platform_breakdown = {plat: 0 for plat in PLATFORM_ORDER}
+    for r in valid_results:
         if r.get("mentioned") and r.get("platform") in platform_breakdown:
             platform_breakdown[r["platform"]] += 1
             
@@ -355,7 +474,7 @@ def generate_pdf_report(run_id):
     
     # Top Citations Domain Counter
     domain_counts = {}
-    for r in results:
+    for r in valid_results:
         for url in r.get("sources_cited", []):
             dom = extract_domain(url)
             if dom:
@@ -541,6 +660,13 @@ def generate_pdf_report(run_id):
         story.append(comp_table)
     else:
         story.append(Paragraph("No competitors provided.", body_style))
+
+    story.append(Spacer(1, 16))
+    story.append(Paragraph("Keyword Coverage", ParagraphStyle('KeywordHeading', parent=h2_style, fontSize=11, textColor=HexColor('#1e1a4f'), spaceBefore=0, spaceAfter=6)))
+    story.append(Paragraph("Final keyword list used for this audit:", body_style))
+    story.append(Spacer(1, 6))
+    for keyword in keywords:
+        story.append(Paragraph(f"• {keyword}", body_style))
     
     story.append(Spacer(1, 80))
     story.append(Paragraph("<font color='#94a3b8'>Generated automatically by Audilysis 2.0 Mention Tracker Engine.</font>", body_style))
@@ -548,12 +674,14 @@ def generate_pdf_report(run_id):
     
     # ------------------ PAGE 2: EXECUTIVE SUMMARY & HEATMAP ------------------
     story.append(Paragraph("Executive Summary", h1_style))
-    story.append(Paragraph(
+    summary_intro = (
         f"This report presents brand visibility analysis for <b>{run['brand_name']}</b> across major AI and search engines. "
         f"We audited the presence of the brand domain <b>{run['brand_domain']}</b> and brand name keywords across Google AI Overviews "
-        f"and conversational LLMs (ChatGPT, Perplexity, Gemini, Claude). Below is the high-level summary of your brand presence score:",
-        body_style
-    ))
+        f"and conversational LLMs (ChatGPT, Perplexity, Gemini, Claude)."
+    )
+    if report_health["report_mode"] == "partial":
+        summary_intro += " <b>Warning:</b> one or more platform requests failed, so the analytics below are based only on validated responses."
+    story.append(Paragraph(summary_intro, body_style))
     story.append(Spacer(1, 12))
     
     # Summary Grid (2x2 Box Cards)
@@ -571,7 +699,7 @@ def generate_pdf_report(run_id):
             Paragraph("<b>API RESPONSE HEALTH</b><br/>Successful connection responses", cell_lbl_style)
         ],
         [
-            Paragraph(f"<font size=18 color='#4361ee'><b>{brand_sov}%</b></font>", cell_val_style),
+            Paragraph(f"<font size=18 color='#4361ee'><b>{brand_sov if brand_sov is not None else 'Data Unavailable'}{'%' if brand_sov is not None else ''}</b></font>", cell_val_style),
             Paragraph(f"<font size=18 color='#f43f5e'><b>{api_health}%</b></font>", cell_val_style)
         ]
     ]
@@ -587,6 +715,25 @@ def generate_pdf_report(run_id):
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 24))
+
+    story.append(Paragraph("Platform Response Health", h1_style))
+    platform_rows = [["Platform", "Status", "Error Category", "Safe Message"]]
+    for item in report_health["platform_summaries"]:
+        platform_rows.append([
+            PLATFORM_LABELS.get(item["platform"], item["platform"]),
+            item["status"],
+            item["error_category"],
+            item["safe_error_message"],
+        ])
+    platform_table = Table(platform_rows, colWidths=[90, 72, 96, 246])
+    platform_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#f1f5f9')),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#e2e8f0')),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(platform_table)
+    story.append(Spacer(1, 18))
     
     # Heatmap Table
     story.append(Paragraph("Mention Heatmap (Keyword × Platform)", h1_style))
@@ -595,51 +742,49 @@ def generate_pdf_report(run_id):
         body_style
     ))
     story.append(Spacer(1, 8))
-    
-    heatmap_rows = [["Keyword", "Google AI", "ChatGPT", "Perplexity", "Gemini", "Claude"]]
-    for kw in keywords:
-        row = [Paragraph(f"<b>{kw}</b>", body_style)]
-        for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude']:
-            res = heatmap_data[kw][platform]
-            if res is None:
-                row.append(Paragraph("Error", center_bold_style))
-            elif res["mentioned"]:
-                pos_lbl = f" (#{int(round(res['position']))})" if res.get('position') else ""
-                row.append(Paragraph(f"Mentioned{pos_lbl}", center_bold_style))
-            else:
-                row.append(Paragraph("Not Mentioned", center_bold_style))
-        heatmap_rows.append(row)
-        
-    # Col widths matching exactly printable 504pt (154 + 5 * 70)
-    heatmap_table = Table(heatmap_rows, colWidths=[154, 70, 70, 70, 70, 70])
-    
-    heatmap_style = [
-        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1e1a4f')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('ALIGN', (0, 1), (0, -1), 'LEFT'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('GRID', (0, 0), (-1, -1), 0.75, HexColor('#cbd5e1')),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('LEFTPADDING', (0, 0), (-1, -1), 4),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-    ]
-    
-    # Dynamically inject background colors matching dashboard styling
-    for r_idx, kw in enumerate(keywords, start=1):
-        for c_idx, platform in enumerate(['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'], start=1):
-            res = heatmap_data[kw][platform]
-            if res is None:
-                bg = '#94a3b8'  # Grey
-            elif res["mentioned"]:
-                bg = '#10b981'  # Emerald Green
-            else:
-                bg = '#f43f5e'  # Rose Red
-            heatmap_style.append(('BACKGROUND', (c_idx, r_idx), (c_idx, r_idx), HexColor(bg)))
-            
-    heatmap_table.setStyle(TableStyle(heatmap_style))
-    story.append(heatmap_table)
+    heatmap_has_valid_cells = any(heatmap_data[kw][platform] is not None for kw in keywords for platform in PLATFORM_ORDER)
+    if heatmap_has_valid_cells:
+        heatmap_rows = [["Keyword", "Google AI", "ChatGPT", "Perplexity", "Gemini", "Claude"]]
+        for kw in keywords:
+            row = [Paragraph(f"<b>{kw}</b>", body_style)]
+            for platform in PLATFORM_ORDER:
+                res = heatmap_data[kw][platform]
+                if res is None:
+                    row.append(Paragraph("Data Unavailable", center_bold_style))
+                elif res["mentioned"]:
+                    pos_lbl = f" (#{int(round(res['position']))})" if res.get('position') else ""
+                    row.append(Paragraph(f"Mentioned{pos_lbl}", center_bold_style))
+                else:
+                    row.append(Paragraph("Not Mentioned", center_bold_style))
+            heatmap_rows.append(row)
+
+        heatmap_table = Table(heatmap_rows, colWidths=[154, 70, 70, 70, 70, 70])
+        heatmap_style = [
+            ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1e1a4f')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.75, HexColor('#cbd5e1')),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ]
+        for r_idx, kw in enumerate(keywords, start=1):
+            for c_idx, platform in enumerate(PLATFORM_ORDER, start=1):
+                res = heatmap_data[kw][platform]
+                if res is None:
+                    bg = '#94a3b8'
+                elif res["mentioned"]:
+                    bg = '#10b981'
+                else:
+                    bg = '#f43f5e'
+                heatmap_style.append(('BACKGROUND', (c_idx, r_idx), (c_idx, r_idx), HexColor(bg)))
+        heatmap_table.setStyle(TableStyle(heatmap_style))
+        story.append(heatmap_table)
+    else:
+        story.append(Paragraph("Data Unavailable", body_style))
     story.append(PageBreak())
     
     # ------------------ PAGE 3: CHARTS SECTION ------------------
@@ -670,6 +815,12 @@ def generate_pdf_report(run_id):
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ]))
         story.append(charts_table)
+        story.append(Spacer(1, 20))
+    elif len(chart_elements) == 1:
+        story.append(chart_elements[0])
+        story.append(Spacer(1, 20))
+    else:
+        story.append(Paragraph("Data Unavailable", body_style))
         story.append(Spacer(1, 20))
         
     chart_elements_bottom = []
@@ -704,6 +855,10 @@ def generate_pdf_report(run_id):
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ]))
         story.append(bottom_charts_table)
+    elif len(chart_elements_bottom) == 1:
+        story.append(chart_elements_bottom[0])
+    else:
+        story.append(Paragraph("Data Unavailable", body_style))
         
     story.append(PageBreak())
     
@@ -755,7 +910,7 @@ def generate_pdf_report(run_id):
     story.append(Spacer(1, 6))
     
     cited_rows = [["Keyword Target", "Platform", "Cited Resource URLs"]]
-    for res in results:
+    for res in valid_results:
         if res.get("sources_cited"):
             kw_para = Paragraph(f"<b>{res['keyword']}</b>", body_style)
             plat_para = Paragraph(res["platform"].upper().replace('_', ' '), body_bold_style)
@@ -783,7 +938,7 @@ def generate_pdf_report(run_id):
         ]))
         story.append(cited_table)
     else:
-        story.append(Paragraph("No cited resource URLs found in the run.", body_style))
+        story.append(Paragraph("Data Unavailable", body_style))
         
     story.append(PageBreak())
     
@@ -796,11 +951,7 @@ def generate_pdf_report(run_id):
     story.append(Spacer(1, 10))
 
     for kw in keywords:
-        match = None
-        for res in results:
-            if res["keyword"] == kw and res["platform"] == 'google':
-                match = res
-                break
+        match = select_visibility_result(valid_results, kw)
         summary = build_visibility_summary(match)
         summary_row = Table([
             [Paragraph("<b>Keyword</b>", body_bold_style), Paragraph(kw, body_style)],
@@ -852,7 +1003,7 @@ def generate_pdf_report(run_id):
                 if match.get("mentioned"):
                     status_text = f"<font color='#10b981'><b>{summary_info['mention_status']} · {summary_info['visibility_level']}</b></font>"
                 elif match.get("mentioned") is None:
-                    status_text = "<font color='#94a3b8'><b>No data / error</b></font>"
+                    status_text = f"<font color='#94a3b8'><b>{html.escape(match.get('response_status') or 'No data')}</b></font>"
                 else:
                     status_text = "<font color='#f43f5e'><b>Not mentioned</b></font>"
             else:
@@ -863,7 +1014,7 @@ def generate_pdf_report(run_id):
             card_content.append(Spacer(1, 4))
             
             # Response text
-            resp_raw = match.get("ai_response_text") if match else None
+            resp_raw = build_response_explanation(match)
             highlighted_html = escape_and_highlight(resp_raw, run["brand_name"], run["brand_domain"])
             body_para = Paragraph(highlighted_html, response_content_style)
             card_content.append(body_para)

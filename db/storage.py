@@ -60,6 +60,11 @@ def init_db():
             sources_cited TEXT, -- JSON array of URLs
             competitor_mentions TEXT, -- JSON object: {domain: boolean}
             ai_response_text TEXT,
+            response_status TEXT,
+            error_category TEXT,
+            error_message TEXT,
+            has_valid_data INTEGER DEFAULT 0,
+            retry_recommendation TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE
         )
@@ -162,6 +167,11 @@ def init_db():
     ensure_column(cursor, "google_ads_connections", "user_id", "INTEGER")
     ensure_column(cursor, "google_ads_connections", "owner_key", "TEXT")
     ensure_column(cursor, "google_ads_connections", "owner_type", "TEXT")
+    ensure_column(cursor, "mention_results", "response_status", "TEXT")
+    ensure_column(cursor, "mention_results", "error_category", "TEXT")
+    ensure_column(cursor, "mention_results", "error_message", "TEXT")
+    ensure_column(cursor, "mention_results", "has_valid_data", "INTEGER DEFAULT 0")
+    ensure_column(cursor, "mention_results", "retry_recommendation", "TEXT")
     ensure_column(cursor, "negative_keyword_rules", "user_id", "INTEGER")
     ensure_column(cursor, "negative_keyword_rules", "owner_key", "TEXT")
     ensure_column(cursor, "negative_keyword_settings_v2", "user_id", "INTEGER")
@@ -222,14 +232,32 @@ def create_run(brand_domain, brand_name, country, language, competitors=None):
     conn.close()
     return run_id
 
-def insert_mention_result(run_id, keyword, platform, mentioned, mention_position, sources_cited, competitor_mentions, ai_response_text):
+def insert_mention_result(
+    run_id,
+    keyword,
+    platform,
+    mentioned,
+    mention_position,
+    sources_cited,
+    competitor_mentions,
+    ai_response_text,
+    response_status=None,
+    error_category=None,
+    error_message=None,
+    has_valid_data=False,
+    retry_recommendation=None,
+):
     """Inserts a single API mention result."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO mention_results (run_id, keyword, platform, mentioned, mention_position, sources_cited, competitor_mentions, ai_response_text, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO mention_results (
+            run_id, keyword, platform, mentioned, mention_position, sources_cited,
+            competitor_mentions, ai_response_text, response_status, error_category,
+            error_message, has_valid_data, retry_recommendation, timestamp
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -240,6 +268,11 @@ def insert_mention_result(run_id, keyword, platform, mentioned, mention_position
             json.dumps(sources_cited) if sources_cited is not None else None,
             json.dumps(competitor_mentions) if competitor_mentions is not None else None,
             ai_response_text,
+            response_status,
+            error_category,
+            error_message,
+            1 if has_valid_data else 0,
+            retry_recommendation,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
     )
@@ -291,6 +324,7 @@ def get_mention_results(run_id):
         d = dict(r)
         d["sources_cited"] = json.loads(d["sources_cited"]) if d["sources_cited"] else []
         d["competitor_mentions"] = json.loads(d["competitor_mentions"]) if d["competitor_mentions"] else {}
+        d["has_valid_data"] = bool(d.get("has_valid_data"))
         results.append(d)
     return results
 

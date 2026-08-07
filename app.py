@@ -68,6 +68,18 @@ from services.negative_keyword_service import (
     update_rule as update_negative_keyword_rule,
 )
 from services.ownership import build_owner_context, extract_authenticated_user_id
+from services.production_diagnostics import (
+    DEV_FALLBACK_SECRET_KEY,
+    apply_runtime_settings,
+    is_debug_environment,
+    log_startup_configuration_summary,
+)
+from services.report_health import (
+    PLATFORM_ORDER,
+    SUPPORTED_TARGET_COUNTRIES,
+    evaluate_report_data_health,
+    is_valid_platform_result,
+)
 from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
@@ -83,8 +95,19 @@ from agents.negative_keyword import REPORT_DIR as NEGATIVE_KEYWORD_REPORT_DIR, i
 from agents.negative_keyword import NegativeKeywordAgent
 
 app = Flask(__name__)
-app.secret_key = get_env_value("FLASK_SECRET_KEY") or os.urandom(32)
+configured_secret = get_env_value("FLASK_SECRET_KEY")
+if configured_secret:
+    app.secret_key = configured_secret
+else:
+    app.secret_key = DEV_FALLBACK_SECRET_KEY
+    logging_message = "FLASK_SECRET_KEY is missing; using development fallback secret key."
+    if is_debug_environment():
+        app.logger.warning(logging_message)
+    else:
+        app.logger.error(logging_message)
+apply_runtime_settings(app)
 init_db()
+log_startup_configuration_summary()
 log_speaker_detection_diagnostics()
 log_google_ads_redirect_uri("google_ads_startup")
 
@@ -112,49 +135,43 @@ def generate_report_content(run_id):
         
     results = get_mention_results(run_id)
     metrics = get_competitor_metrics(run_id)
-    
-    # Calculate stats
+
+    report_health = evaluate_report_data_health(results)
+    valid_results = [row for row in results if is_valid_platform_result(row)]
     total_checks = len(results)
-    brand_mentions = sum(1 for r in results if r.get("mentioned"))
-    successful_checks = sum(1 for r in results if r.get("mentioned") is not None)
-    
-    brand_sov = round((brand_mentions / total_checks * 100), 1) if total_checks > 0 else 0.0
+    brand_mentions = sum(1 for r in valid_results if r.get("mentioned"))
+    successful_checks = len(valid_results)
+    brand_sov = round((brand_mentions / successful_checks * 100), 1) if successful_checks > 0 else None
     api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else 0.0
-    
-    # Heatmap keywords
+
     keywords = sorted(list(set(r["keyword"] for r in results)))
-    
-    # Heatmap dictionary mapping keyword -> platform -> result
-    heatmap_data = {kw: {plat: None for plat in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude']} for kw in keywords}
+    heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
     for r in results:
         kw = r["keyword"]
         plat = r["platform"]
         heatmap_data[kw][plat] = {
             "mentioned": r["mentioned"],
-            "position": r["mention_position"]
-        } if r["mentioned"] is not None else None
-        
-    # Platform breakdown count for brand
-    platform_breakdown = {plat: 0 for plat in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude']}
-    for r in results:
+            "position": r["mention_position"],
+            "status": r.get("response_status"),
+            "error_message": r.get("error_message"),
+            "has_valid_data": r.get("has_valid_data"),
+        } if r.get("has_valid_data") else None
+
+    platform_breakdown = {plat: 0 for plat in PLATFORM_ORDER}
+    for r in valid_results:
         if r.get("mentioned") and r.get("platform") in platform_breakdown:
             platform_breakdown[r["platform"]] += 1
-            
-    # Trend Over Time
+
     competitor_domains = [m["domain"] for m in metrics if m["domain"].lower() != run["brand_domain"].lower()]
     trend_data = get_trend_data(run["brand_domain"], competitor_domains)
-    
-    # Top Mentioned Domains (Citation counts)
     domain_counts = {}
-    for r in results:
+    for r in valid_results:
         for url in r.get("sources_cited", []):
             dom = extract_domain(url)
             if dom:
                 domain_counts[dom] = domain_counts.get(dom, 0) + 1
-    
     top_domains = [{"domain": dom, "count": count} for dom, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)]
-    
-    # Top competitor details
+
     top_competitor_name = "None"
     top_competitor_mentions = 0
     competitor_metrics = [m for m in metrics if m["domain"].lower() != run["brand_domain"].lower()]
@@ -174,9 +191,12 @@ def generate_report_content(run_id):
         "trend_data": trend_data,
         "top_domains": top_domains,
         "stat_total_checks": total_checks,
-        "stat_brand_mentions": brand_mentions,
+        "stat_brand_mentions": brand_mentions if report_health["report_mode"] != "technical_failure" else None,
         "stat_brand_sov": brand_sov,
         "stat_api_health": api_health,
+        "report_health": report_health,
+        "report_mode": report_health["report_mode"],
+        "valid_results": valid_results,
         "top_competitor_name": top_competitor_name,
         "top_competitor_mentions": top_competitor_mentions
     }
@@ -383,6 +403,10 @@ def api_run():
         return jsonify({"status": "error", "message": "Brand domain and brand name are required."}), 400
     if not config.get("keywords") or len(config.get("keywords")) == 0:
         return jsonify({"status": "error", "message": "At least one keyword is required."}), 400
+    if len(config.get("keywords") or []) < 3:
+        return jsonify({"status": "error", "message": "Provide at least 3 keywords for adequate report coverage."}), 400
+    if config.get("country") not in SUPPORTED_TARGET_COUNTRIES:
+        return jsonify({"status": "error", "message": "Select a supported target country."}), 400
         
     # Store settings in flask session
     session["credentials"] = credentials
@@ -472,39 +496,55 @@ def stream():
                 yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_message, 'status': 'running'})}\n\n"
                 
                 # Run the API query
-                response_text, sources, error = query_platform(
+                platform_result = query_platform(
                     platform, keyword, creds, brand_domain, brand_name, competitor_domains, country, language
                 )
-                
-                # Parse brand mention
+                response_text = platform_result.get("text", "")
+                sources = platform_result.get("sources_cited", [])
                 mentioned = None
                 mention_position = None
                 competitor_mentions = {}
-                
-                if error:
-                    # Log error details and write NULL to DB
-                    log_line = f'[{current_step}/{total_steps}] "{keyword}" → {p_name}... ❌ API error: {error}'
-                else:
+
+                if platform_result.get("has_valid_data"):
                     mentioned = (brand_domain.lower() in response_text.lower()) or (brand_name.lower() in response_text.lower())
-                    
                     if mentioned:
-                        # Compute average mention position
                         lines = response_text.split('\n')
                         positions = [idx + 1 for idx, l in enumerate(lines) if brand_domain.lower() in l.lower() or brand_name.lower() in l.lower()]
                         if positions:
                             mention_position = int(round(sum(positions) / len(positions)))
-                            
-                    # Competitors
                     for comp in competitor_domains:
                         competitor_mentions[comp] = (comp.lower() in response_text.lower())
-                        
                     status_lbl = "✓ Mentioned" if mentioned else "✗ Not Mentioned"
                     pos_lbl = f" (position {mention_position})" if (mentioned and mention_position) else ""
                     log_line = f'[{current_step}/{total_steps}] "{keyword}" → {p_name}... {status_lbl}{pos_lbl}'
-                    
-                    # Save result to DB 
+                    app.logger.info(
+                        "platform_response_validated platform=%s keyword=%s status=success valid=true",
+                        platform,
+                        keyword,
+                    )
+                else:
+                    log_line = f'[{current_step}/{total_steps}] "{keyword}" → {p_name}... ❌ {platform_result.get("error_message")}'
+                    app.logger.warning(
+                        "platform_response_validated platform=%s keyword=%s status=%s valid=false",
+                        platform,
+                        keyword,
+                        platform_result.get("response_status"),
+                    )
+
                 insert_mention_result(
-                        run_id, keyword, platform, mentioned, mention_position, sources, competitor_mentions, response_text
+                    run_id,
+                    keyword,
+                    platform,
+                    mentioned,
+                    mention_position,
+                    sources,
+                    competitor_mentions,
+                    response_text,
+                    response_status=platform_result.get("response_status"),
+                    error_category=platform_result.get("error_category"),
+                    error_message=platform_result.get("error_message"),
+                    has_valid_data=platform_result.get("has_valid_data"),
+                    retry_recommendation=platform_result.get("retry_recommendation"),
                 )
                 
                 yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_line, 'status': 'running'})}\n\n"
@@ -512,29 +552,34 @@ def stream():
         # --- Run Complete Post-Processing ---
         # Calculate competitor SOV metrics locally
         results = get_mention_results(run_id)
-        total_checks = len(results)
-        
+        valid_results = [row for row in results if row.get("has_valid_data")]
+        report_health = evaluate_report_data_health(results)
+        app.logger.info(
+            "report_mode_selected run_id=%s mode=%s success_rate=%s successful=%s failed=%s",
+            run_id,
+            report_health["report_mode"],
+            report_health["success_rate"],
+            report_health["successful_platforms"],
+            report_health["failed_platforms"],
+        )
+
         domains_to_track = [brand_domain.lower()] + [c.lower() for c in competitor_domains]
         domain_mentions = {d: 0 for d in domains_to_track}
         domain_positions = {d: [] for d in domains_to_track}
-        
-        for res in results:
+        valid_total_checks = len(valid_results)
+
+        for res in valid_results:
             text = res.get("ai_response_text")
             if not text:
                 continue
-                
-            # Brand
             if brand_domain.lower() in text.lower() or brand_name.lower() in text.lower():
                 domain_mentions[brand_domain.lower()] += 1
                 pos = res.get("mention_position")
                 if pos is not None:
                     domain_positions[brand_domain.lower()].append(pos)
-                    
-            # Competitors
             for comp in competitor_domains:
                 if comp.lower() in text.lower():
                     domain_mentions[comp.lower()] += 1
-                    # Find mention position for competitor in this text
                     lines = text.split('\n')
                     comp_positions = [idx + 1 for idx, l in enumerate(lines) if comp.lower() in l.lower()]
                     if comp_positions:
@@ -545,7 +590,7 @@ def stream():
         for dom in domains_to_track:
             mentions_count = domain_mentions[dom]
             avg_pos = sum(domain_positions[dom]) / len(domain_positions[dom]) if domain_positions[dom] else 0.0
-            sov = round((mentions_count / total_checks * 100), 1) if total_checks > 0 else 0.0
+            sov = round((mentions_count / valid_total_checks * 100), 1) if valid_total_checks > 0 else 0.0
             insert_competitor_metrics(run_id, dom, mentions_count, avg_pos, sov)
 
         # Handle automatic emailing if configured
@@ -579,7 +624,7 @@ def stream():
                             </tr>
                             <tr>
                                 <td style="padding: 8px 0; font-weight: bold; color: #475569;">Mention Rate (SOV):</td>
-                                <td style="padding: 8px 0; text-align: right; color: #10b981; font-weight: bold;">{report_data['stat_brand_sov']}%</td>
+                                <td style="padding: 8px 0; text-align: right; color: #10b981; font-weight: bold;">{"Data Unavailable" if report_data['stat_brand_sov'] is None else str(report_data['stat_brand_sov']) + "%"}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 8px 0; font-weight: bold; color: #475569;">Total Checks:</td>

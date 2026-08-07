@@ -45,7 +45,11 @@
     async function parseAgentResponse(response) {
         const contentType = String(response.headers.get('content-type') || '').toLowerCase();
         if (contentType.includes('application/json')) {
-            return response.json();
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.message || data.error || ('Request failed. HTTP ' + response.status));
+            }
+            return data;
         }
         const text = await response.text();
         const statusDetail = 'HTTP ' + response.status;

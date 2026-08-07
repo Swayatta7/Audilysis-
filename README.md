@@ -5,8 +5,8 @@ Audilysis is a Flask application with AI mention tracking agents and a YouTube m
 ## Run Locally
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```
@@ -14,7 +14,7 @@ python app.py
 Gunicorn entry point:
 
 ```bash
-gunicorn --bind 127.0.0.1:8000 wsgi:app
+./.venv/bin/gunicorn --bind 127.0.0.1:8000 wsgi:app
 ```
 
 ## Environment Variables
@@ -71,6 +71,18 @@ Google Ads OAuth callback for local development should point to:
 
 ```env
 GOOGLE_ADS_REDIRECT_URI=http://127.0.0.1:5000/integrations/google-ads/callback
+```
+
+For VPS/production, set the exact deployed callback URI:
+
+```env
+GOOGLE_ADS_REDIRECT_URI=https://app.audilysis.com/integrations/google-ads/callback
+```
+
+Run a safe production diagnostics audit from the repo root:
+
+```bash
+./.venv/bin/python scripts/production_check.py
 ```
 
 ## Speaker Detection

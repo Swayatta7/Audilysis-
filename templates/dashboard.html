@@ -38,6 +38,19 @@
         </div>
     </div>
 
+    {% if report_mode == 'technical_failure' %}
+    <div class="bg-rose-50 border border-rose-200 rounded-xl p-5 shadow-sm">
+        <h3 class="font-bold text-rose-900">AI Mention Tracking — Technical Failure Report</h3>
+        <p class="mt-2 text-sm text-rose-800">No valid AI platform responses were collected. Client-facing analytics were not generated for this run.</p>
+        <p class="mt-2 text-sm text-rose-700">Recommended actions: verify API credentials, check quota/rate limits, check network connectivity, confirm provider availability, and rerun the audit.</p>
+    </div>
+    {% elif report_mode == 'partial' %}
+    <div class="bg-amber-50 border border-amber-200 rounded-xl p-5 shadow-sm">
+        <h3 class="font-bold text-amber-900">Partial Data Report</h3>
+        <p class="mt-2 text-sm text-amber-800">Some platform requests succeeded and others failed. Metrics below are calculated only from valid responses.</p>
+    </div>
+    {% endif %}
+
     <!-- Live Toast Notification Container -->
     <div id="toast-container" class="fixed bottom-5 right-5 z-50 pointer-events-none space-y-2"></div>
 
@@ -57,7 +70,7 @@
                 <span class="text-xs font-semibold uppercase tracking-wider">Brand Mentions</span>
                 <i class="fa-solid fa-quote-left text-xl text-emerald-500"></i>
             </div>
-            <div class="text-2xl font-bold text-slate-900">{{ stat_brand_mentions }}</div>
+            <div class="text-2xl font-bold text-slate-900">{{ stat_brand_mentions if stat_brand_mentions is not none else 'Data Unavailable' }}</div>
             <p class="text-xs text-slate-500 mt-1">Mentions across all queries</p>
         </div>
 
@@ -66,7 +79,7 @@
                 <span class="text-xs font-semibold uppercase tracking-wider">Share of Voice</span>
                 <i class="fa-solid fa-chart-pie text-xl text-blue-500"></i>
             </div>
-            <div class="text-2xl font-bold text-slate-900">{{ stat_brand_sov }}%</div>
+            <div class="text-2xl font-bold text-slate-900">{{ (stat_brand_sov ~ '%') if stat_brand_sov is not none else 'Data Unavailable' }}</div>
             <p class="text-xs text-slate-500 mt-1">Brand relative presence rate</p>
         </div>
 
@@ -80,11 +93,16 @@
         </div>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
         <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
             <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">SEO Agents</p>
             <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.SEO }}</div>
             <p class="text-sm text-slate-500 mt-1">Current SEO workflows</p>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">PPC Agents</p>
+            <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.PPC }}</div>
+            <p class="text-sm text-slate-500 mt-1">Current PPC workflows</p>
         </div>
         <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
             <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Content Agents</p>
@@ -98,7 +116,41 @@
         </div>
     </div>
 
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-circle-info text-blue-500"></i>
+                Platform Response Health
+            </h3>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-sm">
+                <thead class="bg-slate-100 border-b border-slate-200 text-slate-600 font-semibold">
+                    <tr>
+                        <th class="px-6 py-3">Platform</th>
+                        <th class="px-6 py-3">Status</th>
+                        <th class="px-6 py-3">Error Category</th>
+                        <th class="px-6 py-3">Safe Message</th>
+                        <th class="px-6 py-3">Retry Recommendation</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                    {% for item in report_health.platform_summaries %}
+                    <tr class="hover:bg-slate-50 transition-colors">
+                        <td class="px-6 py-4 font-medium text-slate-800">{{ item.platform_label }}</td>
+                        <td class="px-6 py-4 text-slate-700">{{ item.status }}</td>
+                        <td class="px-6 py-4 text-slate-700">{{ item.error_category }}</td>
+                        <td class="px-6 py-4 text-slate-700">{{ item.safe_error_message }}</td>
+                        <td class="px-6 py-4 text-slate-700">{{ item.retry_recommendation }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
     <!-- Chart 1: Mention Heatmap Grid (Keyword x Platform) -->
+    {% if report_mode != 'technical_failure' %}
     <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
         <div class="p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50">
             <h3 class="font-bold text-slate-900 flex items-center gap-2">
@@ -154,8 +206,10 @@
             </table>
         </div>
     </div>
+    {% endif %}
 
     <!-- Charts Row 2 & 3 -->
+    {% if report_mode != 'technical_failure' %}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <!-- Competitor Share of Voice -->
         <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
@@ -216,8 +270,10 @@
             </div>
         </div>
     </div>
+    {% endif %}
 
     <!-- Table: Sources Being Cited -->
+    {% if report_mode != 'technical_failure' %}
     <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
         <div class="p-5 border-b border-slate-100 bg-slate-50">
             <h3 class="font-bold text-slate-900 flex items-center gap-2">
@@ -262,6 +318,7 @@
             </table>
         </div>
     </div>
+    {% endif %}
 
     <!-- Table: Full AI Responses Accordion -->
     <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
@@ -283,7 +340,8 @@
                 <div class="hidden px-6 pb-6 border-t border-slate-100 pt-4 space-y-4 bg-slate-50">
                     <div class="grid grid-cols-1 gap-6">
                         {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
-                            {% set match = results | selectattr('keyword', 'equalto', kw) | selectattr('platform', 'equalto', platform) | first %}
+                            {% set platform_matches = results | selectattr('keyword', 'equalto', kw) | selectattr('platform', 'equalto', platform) | list %}
+                            {% set match = platform_matches[0] if platform_matches else none %}
                             <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-4">
                                 <div class="flex items-center justify-between border-b border-slate-100 pb-2 mb-3">
                                     <span class="font-bold text-xs uppercase tracking-wider text-slate-500 font-mono">{{ platform|upper }}</span>
@@ -292,9 +350,9 @@
                                         <span class="px-2 py-0.5 text-[10px] font-bold bg-emerald-100 text-emerald-700 rounded border border-emerald-200">
                                             Mentioned (L{{ match.mention_position|round|int }})
                                         </span>
-                                        {% elif match.mentioned is none %}
-                                        <span class="px-2 py-0.5 text-[10px] font-bold bg-slate-100 text-slate-400 rounded border border-slate-200">
-                                            No Data
+                                    {% elif match.mentioned is none %}
+                                    <span class="px-2 py-0.5 text-[10px] font-bold bg-slate-100 text-slate-400 rounded border border-slate-200">
+                                            {{ match.response_status or 'No Data' }}
                                         </span>
                                         {% else %}
                                         <span class="px-2 py-0.5 text-[10px] font-bold bg-rose-100 text-rose-700 rounded border border-rose-200">
@@ -310,6 +368,8 @@
                                 <div class="text-sm font-sans text-slate-700 leading-relaxed whitespace-pre-wrap ai-response-body">
                                     {%- if match and match.ai_response_text -%}
                                         {{- match.ai_response_text -}}
+                                    {%- elif match and match.error_message -%}
+                                        <em class="text-slate-400">{{ match.error_message }}</em>
                                     {%- else -%}
                                         <em class="text-slate-400">No response data or API call failed.</em>
                                     {%- endif -%}

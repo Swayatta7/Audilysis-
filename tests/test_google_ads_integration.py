@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -425,8 +425,9 @@ class GoogleAdsIntegrationTestCase(unittest.TestCase):
         self.assertEqual(audit[-1]["action_status"], "disconnected")
 
     def test_future_dates_are_rejected(self):
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
         with self.assertRaises(GoogleAdsIntegrationError) as ctx:
-            validate_date_range("2026-08-04", "2026-08-05")
+            validate_date_range("2026-08-04", tomorrow)
         self.assertEqual(ctx.exception.error_code, "google_ads_invalid_date_range")
 
     @patch("app.apply_negative_keywords", return_value={"success": True, "applied_count": 1, "failed_count": 0, "applied": [], "failed": []})

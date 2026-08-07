@@ -1,5 +1,6 @@
 from agents.base_agent import BaseAgent
 from agents.crawl_utils import audit_single_page
+import requests
 
 
 class BacklinkVerificationAgent(BaseAgent):
@@ -20,7 +21,28 @@ class BacklinkVerificationAgent(BaseAgent):
         backlink_url = (input_data.get("backlink_url") or input_data.get("website_url") or "").strip()
         if not backlink_url:
             return self.missing_input_response("backlink_url", input_data)
-        page = audit_single_page(backlink_url)
+        try:
+            page = audit_single_page(backlink_url)
+        except requests.RequestException as exc:
+            return self.build_structured_response(
+                input_data,
+                "The backlink URL could not be crawled for verification.",
+                ["Verify the backlink URL is reachable from the server and try again."],
+                {
+                    "status": "unreachable",
+                    "http_status": None,
+                    "https": None,
+                    "title": "",
+                    "meta_description": "",
+                    "external_links_count": 0,
+                    "warnings": [{"website": backlink_url, "status": "crawl_failed", "message": str(exc)}],
+                    "data_source": "real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                },
+                success=False,
+                message=f"Unable to crawl {backlink_url}.",
+            )
         return self.build_structured_response(
             input_data,
             f"Backlink verification checked the live page at {page['url']}.",

@@ -1,6 +1,7 @@
 from agents.base_agent import BaseAgent
 from agents.crawl_utils import audit_single_page, ensure_url
 from urllib.parse import urljoin
+import requests
 
 
 class ContentGapAgent(BaseAgent):
@@ -30,8 +31,60 @@ class ContentGapAgent(BaseAgent):
         if not competitors:
             return self.missing_input_response("competitor_urls", input_data, "Provide at least one valid competitor URL.")
 
-        site_page = audit_single_page(website_url)
-        competitor_pages = [audit_single_page(url) for url in competitors]
+        try:
+            site_page = audit_single_page(website_url)
+        except requests.RequestException as exc:
+            return self.build_structured_response(
+                input_data,
+                "The primary site could not be crawled for content-gap analysis.",
+                ["Verify the website URL is reachable from the server and try again."],
+                {
+                    "missing_topics": [],
+                    "missing_pages": [],
+                    "missing_faqs": [],
+                    "competitor_topics": [],
+                    "recommended_articles": [],
+                    "recommended_landing_pages": [],
+                    "warnings": [{"website": website_url, "status": "crawl_failed", "message": str(exc)}],
+                    "unavailable_metrics": ["keyword_gap"],
+                    "data_source": "real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                },
+                success=False,
+                message=f"Unable to crawl {website_url}.",
+            )
+
+        competitor_pages = []
+        warnings = []
+        for url in competitors:
+            try:
+                competitor_pages.append(audit_single_page(url))
+            except requests.RequestException as exc:
+                warnings.append({"website": url, "status": "crawl_failed", "message": str(exc)})
+
+        if not competitor_pages:
+            return self.build_structured_response(
+                input_data,
+                "No competitor pages could be crawled for content-gap analysis.",
+                ["Verify the competitor URLs are reachable from the server and try again."],
+                {
+                    "missing_topics": [],
+                    "missing_pages": [],
+                    "missing_faqs": [],
+                    "competitor_topics": [],
+                    "recommended_articles": [],
+                    "recommended_landing_pages": [],
+                    "warnings": warnings,
+                    "unavailable_metrics": ["keyword_gap"],
+                    "data_source": "real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                },
+                success=False,
+                message="Competitor crawl failed.",
+            )
+
         site_topics = set(filter(None, [site_page["title"], *site_page["h1"], *site_page["h2"]]))
         competitor_topics = []
         for page in competitor_pages:
@@ -49,6 +102,7 @@ class ContentGapAgent(BaseAgent):
                 "competitor_topics": competitor_topics[:30],
                 "recommended_articles": missing_topics[:10],
                 "recommended_landing_pages": [topic for topic in missing_topics if any(word in topic.lower() for word in ["service", "solution", "pricing"])][:10],
+                "warnings": warnings,
                 "unavailable_metrics": ["keyword_gap"] ,
                 "data_source": "real_crawl",
                 "api_used": [],

@@ -1,4 +1,5 @@
 import secrets
+import sqlite3
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -29,7 +30,10 @@ def create_user_account(email: str, password: str):
     if get_user_by_email(normalized_email):
         raise AuthError("An account with this email already exists.")
     password_hash = generate_password_hash(password)
-    user_id = create_user(normalized_email, password_hash)
+    try:
+        user_id = create_user(normalized_email, password_hash)
+    except sqlite3.IntegrityError as exc:
+        raise AuthError("An account with this email already exists.") from exc
     return get_user_by_id(user_id)
 
 

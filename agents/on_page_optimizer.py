@@ -1,5 +1,6 @@
 from agents.base_agent import BaseAgent
 from agents.crawl_utils import audit_single_page
+import requests
 
 
 class OnPageOptimizerAgent(BaseAgent):
@@ -24,7 +25,24 @@ class OnPageOptimizerAgent(BaseAgent):
         website_url = (input_data.get("target_page_url") or input_data.get("website_url") or "").strip()
         if not website_url:
             return self.missing_input_response("target_page_url", input_data)
-        page = audit_single_page(website_url)
+        try:
+            page = audit_single_page(website_url)
+        except requests.RequestException as exc:
+            return self.build_structured_response(
+                input_data,
+                "The target page could not be crawled for on-page analysis.",
+                ["Verify the target URL is reachable from the server and try again."],
+                {
+                    "priorities": [],
+                    "page_snapshot": {},
+                    "warnings": [{"website": website_url, "status": "crawl_failed", "message": str(exc)}],
+                    "data_source": "real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                },
+                success=False,
+                message=f"Unable to crawl {website_url}.",
+            )
         priorities = []
         if not page["title"]:
             priorities.append("title_tag")

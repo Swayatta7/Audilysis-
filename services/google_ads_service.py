@@ -12,6 +12,7 @@ from db.storage import (
     upsert_google_ads_connection,
 )
 from services.negative_keyword_service import SearchTermRow
+from services.production_diagnostics import classify_env_value
 
 GOOGLE_ADS_IMPORT_ERROR = None
 GOOGLE_OAUTH_IMPORT_ERROR = None
@@ -77,24 +78,31 @@ def get_google_ads_config() -> GoogleAdsConfig:
 
 def get_google_ads_status(user_id: int | None, owner_key: str) -> dict:
     config = get_google_ads_config()
-    missing = [
-        name for name, value in (
-            ("GOOGLE_ADS_DEVELOPER_TOKEN", config.developer_token),
-            ("GOOGLE_ADS_CLIENT_ID", config.client_id),
-            ("GOOGLE_ADS_CLIENT_SECRET", config.client_secret),
-            ("GOOGLE_ADS_REDIRECT_URI", config.redirect_uri),
-            ("GOOGLE_ADS_TOKEN_ENCRYPTION_KEY", config.encryption_key),
-        ) if not value
-    ]
+    config_values = (
+        ("GOOGLE_ADS_DEVELOPER_TOKEN", config.developer_token),
+        ("GOOGLE_ADS_CLIENT_ID", config.client_id),
+        ("GOOGLE_ADS_CLIENT_SECRET", config.client_secret),
+        ("GOOGLE_ADS_REDIRECT_URI", config.redirect_uri),
+        ("GOOGLE_ADS_TOKEN_ENCRYPTION_KEY", config.encryption_key),
+    )
+    missing = []
+    malformed = []
+    for name, value in config_values:
+        status, _detail = classify_env_value(name, value)
+        if status == "missing":
+            missing.append(name)
+        elif status == "malformed":
+            malformed.append(name)
     connection = get_google_ads_connection(user_id, owner_key)
     return {
-        "configured": not missing and dependencies_available(),
+        "configured": not missing and not malformed and dependencies_available(),
         "connected": bool(connection),
         "missing_configuration": missing,
+        "malformed_configuration": malformed,
         "dependency_ready": dependencies_available(),
         "redirect_uri": config.redirect_uri,
         "has_stored_token": bool(connection and connection.get("refresh_token_encrypted")),
-        "reason": "Ready" if not missing and dependencies_available() else build_status_reason(missing),
+        "reason": "Ready" if not missing and not malformed and dependencies_available() else build_status_reason(missing, malformed),
     }
 
 
@@ -414,10 +422,16 @@ def ensure_google_ads_dependencies():
 
 def ensure_google_ads_configuration():
     status = get_google_ads_status(None, "configuration-check")
-    if status["missing_configuration"]:
+    if status["missing_configuration"] or status.get("malformed_configuration"):
         missing = ", ".join(status["missing_configuration"])
+        malformed = ", ".join(status.get("malformed_configuration") or [])
+        detail_parts = []
+        if missing:
+            detail_parts.append(f"Missing: {missing}")
+        if malformed:
+            detail_parts.append(f"Malformed: {malformed}")
         raise GoogleAdsIntegrationError(
-            f"Google Ads is not configured. Missing: {missing}.",
+            f"Google Ads is not configured. {'; '.join(detail_parts)}.",
             status_code=500,
             error_code="google_ads_config_missing",
         )
@@ -633,7 +647,7 @@ def translate_google_ads_exception(exc: Exception) -> GoogleAdsIntegrationError:
     return GoogleAdsIntegrationError(message, 502, "google_ads_request_failed")
 
 
-def build_status_reason(missing: list[str]) -> str:
+def build_status_reason(missing: list[str], malformed: list[str] | None = None) -> str:
     dependency_messages = []
     if GOOGLE_ADS_IMPORT_ERROR:
         dependency_messages.append("Missing google-ads")
@@ -643,6 +657,8 @@ def build_status_reason(missing: list[str]) -> str:
         dependency_messages.append("Missing cryptography")
     if missing:
         dependency_messages.append("Missing configuration: " + ", ".join(missing))
+    if malformed:
+        dependency_messages.append("Malformed configuration: " + ", ".join(malformed))
     return "; ".join(dependency_messages) if dependency_messages else "Ready"
 
 

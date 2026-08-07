@@ -12,7 +12,7 @@ from werkzeug.security import generate_password_hash
 from app import app
 from agents.agent_manager import CONTENT_GROUP, PPC_GROUP, SEO_GROUP, SOCIAL_GROUP, get_all_agents
 from agents.base_agent import BaseAgent
-from db.storage import create_run, create_user, get_user_by_email, init_db
+from db.storage import create_run, create_user, get_user_by_email, init_db, insert_mention_result
 from services.pdf_generator import generate_pdf_report
 
 
@@ -170,9 +170,13 @@ class AgentRoutesTestCase(unittest.TestCase):
             self.assertNotIn(link_response.status_code, (404, 500), href)
 
     def test_dashboard_shows_agent_counts(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'])
+        with self.client.session_transaction() as flask_session:
+            flask_session["last_run_id"] = run_id
         response = self.client.get('/dashboard')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'SEO Agents', response.data)
+        self.assertIn(b'PPC Agents', response.data)
         self.assertIn(b'Content Agents', response.data)
         self.assertIn(b'Social Agents', response.data)
 
@@ -358,6 +362,33 @@ class AgentRoutesTestCase(unittest.TestCase):
             self.assertEqual(response.status_code, 200, agent_id)
             self.assertTrue(response.get_json()['success'], agent_id)
 
+    @patch('agents.on_page_optimizer.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    @patch('agents.schema_agent.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    @patch('agents.content_gap.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    @patch('agents.backlink_prospecting.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    @patch('agents.backlink_verification.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    def test_crawl_based_agents_return_structured_failure_when_network_unavailable(
+        self,
+        _backlink_verify_page,
+        _backlink_prospect_page,
+        _content_gap_page,
+        _schema_page,
+        _onpage_page,
+    ):
+        for agent_id, payload in [
+            ('content_gap', {'website_url': 'https://example.com', 'competitors': ['https://competitor.com']}),
+            ('on_page_optimizer', {'website_url': 'https://example.com'}),
+            ('schema_agent', {'website_url': 'https://example.com'}),
+            ('backlink_prospecting', {'website_url': 'https://example.com', 'competitors': ['https://competitor.com']}),
+            ('backlink_verification', {'backlink_url': 'https://example.com/link-page'}),
+        ]:
+            response = self.client.post('/run-agent', json={'agent': agent_id, **payload})
+            self.assertEqual(response.status_code, 200, agent_id)
+            data = response.get_json()
+            self.assertFalse(data['success'], agent_id)
+            self.assertNotIn("raised an unexpected error", data.get('message', ''), agent_id)
+            self.assertEqual(data['data']['data_source'], 'real_crawl' if agent_id != 'backlink_prospecting' else 'real_user_input_and_real_crawl')
+
     @patch('agents.competitor_analysis.CompetitorAnalysisAgent._crawl_site_or_warning')
     def test_competitor_analysis_timeout_returns_warning_not_500(self, crawl_site_or_warning):
         primary_page = {
@@ -489,6 +520,21 @@ class AgentRoutesTestCase(unittest.TestCase):
     def test_pdf_report_includes_competitors_and_visibility_summary(self):
         init_db()
         run_id = create_run('example.com', 'Example', 'United States', 'en', ['https://competitor1.com', 'https://competitor2.com'])
+        insert_mention_result(
+            run_id=run_id,
+            keyword='example brand',
+            platform='google',
+            mentioned=True,
+            mention_position=1,
+            sources_cited=['https://example.com'],
+            competitor_mentions={'https://competitor1.com': False},
+            ai_response_text='Example brand is recommended here.',
+            response_status='success',
+            error_category='success',
+            error_message='',
+            has_valid_data=True,
+            retry_recommendation='No retry needed.',
+        )
         pdf_bytes = generate_pdf_report(run_id)
         self.assertTrue(pdf_bytes and len(pdf_bytes) > 1000)
 
@@ -497,7 +543,7 @@ class AgentRoutesTestCase(unittest.TestCase):
             temp_path = temp_pdf.name
 
         try:
-            text_output = subprocess.check_output(['pdftotext', temp_path, '-'], text=True)
+            text_output = re.sub(r'\s+', ' ', subprocess.check_output(['pdftotext', temp_path, '-'], text=True)).strip()
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)

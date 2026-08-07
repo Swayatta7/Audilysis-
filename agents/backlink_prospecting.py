@@ -1,5 +1,6 @@
 from agents.base_agent import BaseAgent
 from agents.crawl_utils import audit_single_page
+import requests
 
 
 class BacklinkProspectingAgent(BaseAgent):
@@ -31,20 +32,43 @@ class BacklinkProspectingAgent(BaseAgent):
         maximum_prospects = 5 if raw_maximum_prospects in (None, "") else max(1, min(int(raw_maximum_prospects), 20))
 
         prospects = []
+        warnings = []
         for competitor in competitors[:maximum_prospects]:
-            page = audit_single_page(competitor)
+            try:
+                page = audit_single_page(competitor)
+            except requests.RequestException as exc:
+                warnings.append({"website": competitor, "status": "crawl_failed", "message": str(exc)})
+                continue
             prospects.append({
                 "site": page["url"],
                 "https": page["https"],
                 "external_links_count": len(page["external_links"]),
                 "has_contact_or_about_signals": any(token in page["url"].lower() for token in ["about", "contact"]),
             })
+
+        if not prospects:
+            return self.build_structured_response(
+                input_data,
+                "No competitor pages could be crawled for backlink prospecting.",
+                ["Verify the competitor URLs are reachable from the server and try again."],
+                {
+                    "prospects": [],
+                    "warnings": warnings,
+                    "data_source": "real_user_input_and_real_crawl",
+                    "api_used": [],
+                    "missing_api_keys": [],
+                    "unavailable_metrics": ["backlink_authority", "referring_domains"],
+                },
+                success=False,
+                message="Competitor crawl failed.",
+            )
         return self.build_structured_response(
             input_data,
             "Backlink prospecting used real competitor URLs as source domains for outreach review.",
             ["Prioritize competitor domains with clear editorial pages and HTTPS.", "Add a backlink API if you want genuine referring-domain metrics."],
             {
                 "prospects": prospects,
+                "warnings": warnings,
                 "data_source": "real_user_input_and_real_crawl",
                 "api_used": [],
                 "missing_api_keys": [],
