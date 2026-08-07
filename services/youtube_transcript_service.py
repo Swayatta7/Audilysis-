@@ -994,11 +994,13 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
         raise ConfigurationError("yt-dlp is not installed, so subtitle fallback is unavailable.", error_code="ytdlp_not_installed")
 
     last_exc: Exception | None = None
+    failures: list[YouTubeTranscriptError] = []
     strategies = build_ytdlp_subtitle_strategies()
     fallback_deadline = build_ytdlp_fallback_deadline()
     for index, strategy in enumerate(strategies, start=1):
+        remaining_strategies = strategies[index:]
         attempt_started_at = time.monotonic()
-        attempt_deadline = build_ytdlp_attempt_deadline(fallback_deadline, strategy, strategies[index:])
+        attempt_deadline = build_ytdlp_attempt_deadline(fallback_deadline, strategy, remaining_strategies)
         remaining_budget_ms = max(0, int((attempt_deadline - attempt_started_at) * 1000))
         try:
             logger.info(
@@ -1036,6 +1038,7 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
         except Exception as exc:
             last_exc = exc
             mapped = classify_ytdlp_subtitle_exception(exc, strategy)
+            failures.append(mapped)
             elapsed_ms = int((time.monotonic() - attempt_started_at) * 1000)
             logger.warning(
                 "youtube_transcript_ytdlp_subtitle_failure video_id=%s strategy=%s proxy_index=%s error_code=%s elapsed_ms=%s remaining_budget_ms=%s",
@@ -1046,10 +1049,19 @@ def _fetch_transcript_via_yt_dlp(video_id: str, deadline: float):
                 elapsed_ms,
                 max(0, int((fallback_deadline - time.monotonic()) * 1000)),
             )
-            if index < len(strategies) and should_continue_ytdlp_subtitle_fallback(mapped):
+            if remaining_strategies and should_continue_ytdlp_subtitle_fallback(mapped):
+                logger.warning(
+                    "youtube_transcript_ytdlp_subtitle_continue video_id=%s previous_error=%s next_strategy=%s remaining_budget_ms=%s",
+                    video_id,
+                    mapped.error_code,
+                    remaining_strategies[0]["name"],
+                    max(0, int((fallback_deadline - time.monotonic()) * 1000)),
+                )
                 continue
-            raise mapped from exc
-    raise classify_ytdlp_subtitle_exception(last_exc or RuntimeError("yt-dlp subtitle fallback failed."), {"name": "yt_dlp_subtitles", "proxy_url": None})
+            raise choose_final_ytdlp_error(failures) from exc
+    raise choose_final_ytdlp_error(
+        failures or [classify_ytdlp_subtitle_exception(last_exc or RuntimeError("yt-dlp subtitle fallback failed."), {"name": "yt_dlp_subtitles", "proxy_url": None})]
+    )
 
 
 def build_ytdlp_fallback_deadline() -> float:
@@ -1310,9 +1322,35 @@ def should_continue_ytdlp_subtitle_fallback(error: YouTubeTranscriptError) -> bo
         "youtube_auth_required",
         "youtube_proxy_auth_failed",
         "youtube_proxy_timeout",
+        "youtube_proxy_request_blocked",
+        "youtube_proxy_ip_blocked",
         "youtube_timeout",
         "youtube_request_failed",
+        "youtube_transcript_not_found",
     }
+
+
+def choose_final_ytdlp_error(failures: list[YouTubeTranscriptError]) -> YouTubeTranscriptError:
+    if not failures:
+        return UpstreamError("yt-dlp subtitle retrieval failed.", error_code="youtube_request_failed")
+
+    actionable_order = {
+        "youtube_cookies_invalid",
+        "youtube_auth_required",
+        "video_unavailable",
+        "ytdlp_not_installed",
+    }
+    for failure in failures:
+        if failure.error_code in actionable_order:
+            return failure
+
+    if all(failure.error_code == "youtube_transcript_not_found" for failure in failures):
+        return failures[-1]
+
+    for failure in reversed(failures):
+        if failure.error_code != "youtube_transcript_not_found":
+            return failure
+    return failures[-1]
 
 
 def diagnose_transcript_fetch(video_id: str) -> dict:

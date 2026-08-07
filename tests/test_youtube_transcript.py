@@ -153,6 +153,17 @@ class FakeProxyThenDirectYtdlpFetch:
         )
 
 
+def fake_ytdlp_strategy(name, proxy_url=None):
+    return {
+        "name": name,
+        "proxy_url": proxy_url,
+        "proxy_host": "proxy.example.test" if proxy_url else "",
+        "proxy_port": 1234 if proxy_url else None,
+        "cookies_file": "/opt/Audilysis-/secrets/youtube_cookies.txt",
+        "cookies_enabled": True,
+    }
+
+
 class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
     def setUp(self):
         app.config["TESTING"] = True
@@ -738,6 +749,110 @@ class YouTubeTranscriptFeatureTestCase(unittest.TestCase):
             [name for name, _deadline in FakeProxyThenDirectYtdlpFetch.calls],
             ["yt_dlp_proxy_1", "yt_dlp_proxy_2", "yt_dlp_direct"],
         )
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_proxy_transcript_not_found_then_next_proxy_success(self, ytdlp_fetch):
+        strategies = [
+            fake_ytdlp_strategy("yt_dlp_proxy_1", "http://user:pass@proxy1.test:1111"),
+            fake_ytdlp_strategy("yt_dlp_proxy_2", "http://user:pass@proxy2.test:2222"),
+            fake_ytdlp_strategy("yt_dlp_direct"),
+        ]
+        ytdlp_fetch.side_effect = [
+            service.UpstreamError("No captions visible on this proxy.", error_code="youtube_transcript_not_found"),
+            (
+                service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+                [{"start": 0.0, "duration": 2.0, "text": "Proxy two captions"}],
+            ),
+        ]
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=strategies):
+            source, segments, status = service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 1)
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Proxy two captions")
+        self.assertEqual(status["strategy"], "yt_dlp_proxy_2")
+        self.assertEqual(ytdlp_fetch.call_count, 2)
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_proxy_transcript_not_found_then_direct_success(self, ytdlp_fetch):
+        strategies = [
+            fake_ytdlp_strategy("yt_dlp_proxy_1", "http://user:pass@proxy1.test:1111"),
+            fake_ytdlp_strategy("yt_dlp_direct"),
+        ]
+        ytdlp_fetch.side_effect = [
+            service.UpstreamError("No captions visible on this proxy.", error_code="youtube_transcript_not_found"),
+            (
+                service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+                [{"start": 0.0, "duration": 2.0, "text": "Direct captions"}],
+            ),
+        ]
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=strategies):
+            source, segments, status = service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 1)
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Direct captions")
+        self.assertEqual(status["strategy"], "yt_dlp_direct")
+        self.assertEqual(ytdlp_fetch.call_count, 2)
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_several_transcript_not_found_results_then_direct_success(self, ytdlp_fetch):
+        strategies = [
+            fake_ytdlp_strategy("yt_dlp_proxy_1", "http://user:pass@proxy1.test:1111"),
+            fake_ytdlp_strategy("yt_dlp_proxy_2", "http://user:pass@proxy2.test:2222"),
+            fake_ytdlp_strategy("yt_dlp_proxy_3", "http://user:pass@proxy3.test:3333"),
+            fake_ytdlp_strategy("yt_dlp_direct"),
+        ]
+        ytdlp_fetch.side_effect = [
+            service.UpstreamError("No captions visible on proxy one.", error_code="youtube_transcript_not_found"),
+            service.UpstreamError("No captions visible on proxy two.", error_code="youtube_transcript_not_found"),
+            service.UpstreamError("No captions visible on proxy three.", error_code="youtube_transcript_not_found"),
+            (
+                service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+                [{"start": 0.0, "duration": 2.0, "text": "Direct finally found captions"}],
+            ),
+        ]
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=strategies):
+            source, segments, status = service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 1)
+        self.assertEqual(source.language_code, "en")
+        self.assertEqual(segments[0]["text"], "Direct finally found captions")
+        self.assertEqual(status["strategy"], "yt_dlp_direct")
+        self.assertEqual(ytdlp_fetch.call_count, 4)
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_all_strategies_transcript_not_found_returns_final_not_found(self, ytdlp_fetch):
+        strategies = [
+            fake_ytdlp_strategy("yt_dlp_proxy_1", "http://user:pass@proxy1.test:1111"),
+            fake_ytdlp_strategy("yt_dlp_proxy_2", "http://user:pass@proxy2.test:2222"),
+            fake_ytdlp_strategy("yt_dlp_direct"),
+        ]
+        ytdlp_fetch.side_effect = [
+            service.UpstreamError("No captions visible on proxy one.", error_code="youtube_transcript_not_found"),
+            service.UpstreamError("No captions visible on proxy two.", error_code="youtube_transcript_not_found"),
+            service.UpstreamError("No captions visible direct.", error_code="youtube_transcript_not_found"),
+        ]
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=strategies):
+            with self.assertRaises(service.UpstreamError) as caught:
+                service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 1)
+        self.assertEqual(caught.exception.error_code, "youtube_transcript_not_found")
+        self.assertEqual(ytdlp_fetch.call_count, 3)
+
+    @patch.object(service, "_fetch_ytdlp_subtitle_segments")
+    def test_ytdlp_transcript_not_found_logs_strategy_continuation(self, ytdlp_fetch):
+        strategies = [
+            fake_ytdlp_strategy("yt_dlp_proxy_1", "http://user:pass@proxy1.test:1111"),
+            fake_ytdlp_strategy("yt_dlp_direct"),
+        ]
+        ytdlp_fetch.side_effect = [
+            service.UpstreamError("No captions visible on this proxy.", error_code="youtube_transcript_not_found"),
+            (
+                service.ResolvedTranscriptSource(language_code="en", language="English", is_generated=True),
+                [{"start": 0.0, "duration": 2.0, "text": "Direct captions"}],
+            ),
+        ]
+        with patch.object(service, "build_ytdlp_subtitle_strategies", return_value=strategies), \
+                self.assertLogs("services.youtube_transcript_service", level="WARNING") as logs:
+            service._fetch_transcript_via_yt_dlp("abcDEF123_4", deadline=service.time.monotonic() + 1)
+        joined = "\n".join(logs.output)
+        self.assertIn("youtube_transcript_ytdlp_subtitle_continue", joined)
+        self.assertIn("previous_error=youtube_transcript_not_found", joined)
+        self.assertIn("next_strategy=yt_dlp_direct", joined)
 
     def test_ytdlp_attempt_deadline_reserves_time_for_direct(self):
         now = service.time.monotonic()
