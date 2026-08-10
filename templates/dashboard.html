@@ -4,6 +4,13 @@
 
 {% block content %}
 <div class="space-y-8 max-w-7xl mx-auto pb-12">
+    {% if run_not_found %}
+    <div class="bg-amber-50 border border-amber-200 rounded-xl p-5 shadow-sm">
+        <h3 class="font-bold text-amber-900">Run Not Found</h3>
+        <p class="mt-2 text-sm text-amber-800">Run {{ requested_run_id }} could not be found. Start a new tracker run or open a valid run-specific dashboard link.</p>
+    </div>
+    {% endif %}
+
     <!-- Dashboard Header -->
     <div class="bg-white border border-slate-200 rounded-xl p-6 md:p-8 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div>
@@ -42,7 +49,11 @@
     <div class="bg-rose-50 border border-rose-200 rounded-xl p-5 shadow-sm">
         <h3 class="font-bold text-rose-900">AI Mention Tracking — Technical Failure Report</h3>
         <p class="mt-2 text-sm text-rose-800">No valid AI platform responses were collected. Client-facing analytics were not generated for this run.</p>
+        {% if source_provenance.dataforseo and source_provenance.dataforseo.status == 'skipped_by_user' %}
+        <p class="mt-2 text-sm text-rose-700">DataForSEO was intentionally disabled for this run. Any visibility metrics that depend on it remain unavailable unless you enable it for a future run.</p>
+        {% else %}
         <p class="mt-2 text-sm text-rose-700">Recommended actions: verify API credentials, check quota/rate limits, check network connectivity, confirm provider availability, and rerun the audit.</p>
+        {% endif %}
     </div>
     {% elif report_mode == 'partial' %}
     <div class="bg-amber-50 border border-amber-200 rounded-xl p-5 shadow-sm">
@@ -56,42 +67,109 @@
 
     <!-- Row 1: Key Summary Stats Cards -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+        <a href="/seo-reports?run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
             <div class="flex items-center justify-between text-slate-400 mb-2">
                 <span class="text-xs font-semibold uppercase tracking-wider">Total Checks</span>
                 <i class="fa-solid fa-clipboard-list text-xl text-slate-400"></i>
             </div>
             <div class="text-2xl font-bold text-slate-900">{{ stat_total_checks }}</div>
             <p class="text-xs text-slate-500 mt-1">Keywords × Platforms analyzed</p>
-        </div>
+            <p class="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Open visibility report</p>
+        </a>
 
-        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+        <a href="/seo-reports?run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
             <div class="flex items-center justify-between text-slate-400 mb-2">
                 <span class="text-xs font-semibold uppercase tracking-wider">Brand Mentions</span>
                 <i class="fa-solid fa-quote-left text-xl text-emerald-500"></i>
             </div>
             <div class="text-2xl font-bold text-slate-900">{{ stat_brand_mentions if stat_brand_mentions is not none else 'Data Unavailable' }}</div>
             <p class="text-xs text-slate-500 mt-1">Mentions across all queries</p>
-        </div>
+            <p class="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Open visibility report</p>
+        </a>
 
-        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+        <a href="/seo-reports?run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
             <div class="flex items-center justify-between text-slate-400 mb-2">
                 <span class="text-xs font-semibold uppercase tracking-wider">Share of Voice</span>
                 <i class="fa-solid fa-chart-pie text-xl text-blue-500"></i>
             </div>
             <div class="text-2xl font-bold text-slate-900">{{ (stat_brand_sov ~ '%') if stat_brand_sov is not none else 'Data Unavailable' }}</div>
             <p class="text-xs text-slate-500 mt-1">Brand relative presence rate</p>
-        </div>
+            <p class="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Open visibility report</p>
+        </a>
 
-        <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+        <a href="/seo-reports?run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
             <div class="flex items-center justify-between text-slate-400 mb-2">
                 <span class="text-xs font-semibold uppercase tracking-wider">API Health</span>
                 <i class="fa-solid fa-heart-pulse text-xl text-rose-500"></i>
             </div>
-            <div class="text-2xl font-bold text-slate-900">{{ stat_api_health }}%</div>
+            <div class="text-2xl font-bold text-slate-900">{{ (stat_api_health ~ '%') if stat_api_health is not none else 'Data Unavailable' }}</div>
             <p class="text-xs text-slate-500 mt-1">Successful API responses</p>
+            <p class="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Open visibility report</p>
+        </a>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+        <a href="/agents?agent=technical_audit&run_id={{ run.id }}" class="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700 transition">Technical SEO</a>
+        <a href="/agents?agent=competitor_analysis&run_id={{ run.id }}" class="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700 transition">Competitors</a>
+        <a href="/agents?agent=keyword_research&run_id={{ run.id }}" class="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700 transition">Keywords</a>
+        <a href="/seo-strategy?run_id={{ run.id }}" class="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700 transition">Strategy</a>
+        <a href="/seo-reports?run_id={{ run.id }}" class="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700 transition">Reports</a>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-database text-blue-500"></i>
+                Data Sources Used
+            </h3>
+        </div>
+        <div class="divide-y divide-slate-100">
+            {% for source_name, source in source_provenance.items() %}
+            <div class="px-6 py-4 flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                <div>
+                    <div class="text-sm font-semibold text-slate-900">{{ source_name|replace('_', ' ')|title }}</div>
+                    <div class="text-sm text-slate-500">{{ source.reason or 'Available for this run.' }}</div>
+                </div>
+                <div class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{{ source.status|replace('_', ' ') }}</div>
+            </div>
+            {% endfor %}
         </div>
     </div>
+
+    {% if openai_interpretation %}
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50">
+            <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-wand-magic-sparkles text-indigo-500"></i>
+                AI Interpretation
+            </h3>
+            <p class="mt-1 text-sm text-slate-500">Interpretation only, based on verified collected data.</p>
+        </div>
+        <div class="p-6 space-y-4">
+            <p class="text-sm leading-6 text-slate-700">{{ openai_interpretation.executive_summary }}</p>
+            {% if openai_interpretation.key_findings %}
+            <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Key Findings</p>
+                <ul class="mt-2 space-y-2 text-sm text-slate-700 list-disc pl-5">
+                    {% for item in openai_interpretation.key_findings %}
+                    <li>{{ item }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+            {% if openai_interpretation.recommendations %}
+            <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recommendations</p>
+                <ul class="mt-2 space-y-2 text-sm text-slate-700 list-disc pl-5">
+                    {% for item in openai_interpretation.recommendations %}
+                    <li>{{ item }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
 
     <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
         <div class="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
@@ -114,6 +192,33 @@
             <div class="mt-2 text-3xl font-bold text-slate-900">{{ agent_counts.Social }}</div>
             <p class="text-sm text-slate-500 mt-1">Current social workflows</p>
         </div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+        <a href="/agents?agent=technical_audit&run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">Crawl Pages</span>
+                <i class="fa-solid fa-spider text-xl text-slate-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ metric_provenance.crawl_pages_crawled.value if metric_provenance.crawl_pages_crawled.value is not none else 'Data Unavailable' }}</div>
+            <p class="text-xs text-slate-500 mt-1">Verified crawl pages collected for this run</p>
+        </a>
+        <a href="/agents?agent=technical_audit&run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">PageSpeed Performance</span>
+                <i class="fa-solid fa-gauge-high text-xl text-emerald-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ (metric_provenance.pagespeed_performance_score.value|round(1) ~ '%') if metric_provenance.pagespeed_performance_score.value is not none else 'Data Unavailable' }}</div>
+            <p class="text-xs text-slate-500 mt-1">Mobile Lighthouse performance score</p>
+        </a>
+        <a href="/agents?agent=technical_audit&run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
+            <div class="flex items-center justify-between text-slate-400 mb-2">
+                <span class="text-xs font-semibold uppercase tracking-wider">CrUX LCP</span>
+                <i class="fa-solid fa-stopwatch text-xl text-blue-500"></i>
+            </div>
+            <div class="text-2xl font-bold text-slate-900">{{ ((metric_provenance.crux_lcp_ms.value / 1000)|round(2) ~ 's') if metric_provenance.crux_lcp_ms.value is not none else 'Data Unavailable' }}</div>
+            <p class="text-xs text-slate-500 mt-1">Field LCP from Chrome UX Report</p>
+        </a>
     </div>
 
     <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
@@ -572,7 +677,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         domains.forEach((dom, index) => {
             const isBrand = dom === 'brand';
-            const dataPoints = trendData.map(entry => entry[dom] || 0);
+            const dataPoints = trendData.map(entry => entry[dom] ?? null);
             const label = isBrand ? brandDomain : dom;
             const color = isBrand ? '#4361ee' : (Object.values(lineColors)[index] || '#94a3b8');
 

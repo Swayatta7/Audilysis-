@@ -1,6 +1,19 @@
 import smtplib
 import socket
+from email.utils import parseaddr
 from email.message import EmailMessage
+
+
+def _normalize_recipients(recipients):
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in recipients.replace(";", ",").split(",") if r.strip()]
+    return [recipient for recipient in (recipients or []) if recipient]
+
+
+def _is_valid_email(value: str) -> bool:
+    _, parsed = parseaddr(value or "")
+    return bool(parsed and "@" in parsed and "." in parsed.rsplit("@", 1)[-1])
+
 
 def send_report_email(smtp_host, smtp_port, sender_email, sender_password,
                       recipients, subject, body_html, report_pdf, report_filename):
@@ -11,8 +24,20 @@ def send_report_email(smtp_host, smtp_port, sender_email, sender_password,
     If failed, recipient_string is None.
     """
     try:
-        if isinstance(recipients, str):
-            recipients = [r.strip() for r in recipients.split(",") if r.strip()]
+        recipients = _normalize_recipients(recipients)
+        if not smtp_host:
+            return None, "Email server unavailable. SMTP host is required."
+        if not smtp_port:
+            return None, "Email server unavailable. SMTP port is required."
+        if not _is_valid_email(sender_email):
+            return None, "Email sender address is invalid."
+        if not recipients:
+            return None, "Email recipient address is required."
+        invalid_recipients = [recipient for recipient in recipients if not _is_valid_email(recipient)]
+        if invalid_recipients:
+            return None, "Email recipient address is invalid."
+        if not report_pdf:
+            return None, "Email delivery failed because the report attachment was empty."
 
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -32,16 +57,31 @@ def send_report_email(smtp_host, smtp_port, sender_email, sender_password,
             filename=report_filename,
         )
 
-        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=30) as server:
-            server.starttls()  # secure the connection
+        port = int(smtp_port)
+        smtp_client = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+        with smtp_client(smtp_host, port, timeout=30) as server:
+            server.ehlo()
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
             server.login(sender_email, sender_password)
             server.send_message(msg)
 
         return ", ".join(recipients), None
 
     except smtplib.SMTPAuthenticationError:
-        return None, "Email authentication failed. For Gmail/Outlook use an App Password, not your normal account password."
-    except (smtplib.SMTPConnectError, socket.timeout, OSError) as e:
-        return None, f"Could not reach the mail server. Check the SMTP host and port. Error details: {str(e)}"
-    except Exception as e:
-        return None, f"Could not send the email: {str(e)}. The report is still available to download."
+        return None, "Email authentication failed."
+    except smtplib.SMTPRecipientsRefused:
+        return None, "Email delivery failed because the recipient address was rejected."
+    except smtplib.SMTPSenderRefused:
+        return None, "Email sender address was rejected by the mail server."
+    except smtplib.SMTPNotSupportedError:
+        return None, "Email delivery failed because the server does not support the required TLS/authentication flow."
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, TimeoutError):
+        return None, "Email server unavailable."
+    except (socket.gaierror, OSError):
+        return None, "Email delivery failed because the mail server could not be reached."
+    except ValueError:
+        return None, "Email server unavailable. SMTP port is invalid."
+    except Exception:
+        return None, "Email delivery failed. The report is still available to download."

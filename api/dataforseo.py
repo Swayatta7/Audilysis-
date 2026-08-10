@@ -1,14 +1,11 @@
 import logging
-import time
-
-import requests
-from requests.auth import HTTPBasicAuth
 
 from services.report_health import (
     VALID_RESPONSE_STATUSES,
     retry_recommendation_for_status,
     safe_error_message_for_status,
 )
+from services.dataforseo_client import post_dataforseo_task
 
 
 logger = logging.getLogger(__name__)
@@ -24,9 +21,8 @@ def query_platform(platform, keyword, credentials, brand_domain, brand_name, com
     if not login or not password:
         return build_failure_result(platform, keyword, "authentication_error", "Missing DataForSEO credentials.")
 
-    base_url = "https://api.dataforseo.com/v3"
     if platform == "google":
-        url = f"{base_url}/serp/google/ai_mode/live/advanced"
+        endpoint = "serp/google/ai_mode/live/advanced"
         payload = [{
             "keyword": keyword,
             "location_name": country,
@@ -45,7 +41,7 @@ def query_platform(platform, keyword, credentials, brand_domain, brand_name, com
             "gemini": "gemini-2.0-flash",
             "claude": "claude-haiku-4-5",
         }
-        url = f"{base_url}/ai_optimization/{endpoints.get(platform)}/llm_responses/live"
+        endpoint = f"ai_optimization/{endpoints.get(platform)}/llm_responses/live"
         payload = [{
             "user_prompt": keyword,
             "model_name": models.get(platform),
@@ -54,62 +50,40 @@ def query_platform(platform, keyword, credentials, brand_domain, brand_name, com
         }]
 
     logger.info("platform_request_start platform=%s keyword=%s", platform, keyword)
-    max_retries = 3
-    retry_delay = 2
+    response = post_dataforseo_task(
+        endpoint,
+        payload,
+        credentials,
+        timeout=120,
+        max_retries=3,
+        retry_delay=2,
+        purpose=f"platform:{platform}",
+    )
+    if not response["ok"]:
+        status_map = {
+            "authentication_failed": "authentication_error",
+            "rate_limited": "rate_limit",
+            "timeout": "timeout",
+            "unavailable": "platform_unavailable",
+            "failed": "invalid_response",
+        }
+        return build_failure_result(
+            platform,
+            keyword,
+            status_map.get(response["status"], "unknown_error"),
+            response["message"],
+        )
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                auth=HTTPBasicAuth(login, password),
-                timeout=120,
-            )
-
-            if response.status_code in {401, 403}:
-                return build_failure_result(platform, keyword, "authentication_error", f"DataForSEO rejected the credentials (HTTP {response.status_code}).")
-            if response.status_code == 429:
-                if attempt < max_retries:
-                    logger.warning("platform_request_failure platform=%s keyword=%s status=rate_limit retry=%s", platform, keyword, attempt + 1)
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                return build_failure_result(platform, keyword, "rate_limit", "DataForSEO rate limit or quota was reached.")
-            if response.status_code >= 500:
-                return build_failure_result(platform, keyword, "platform_unavailable", f"DataForSEO was unavailable (HTTP {response.status_code}).")
-            if response.status_code != 200:
-                return build_failure_result(platform, keyword, "invalid_response", f"DataForSEO returned HTTP {response.status_code}.")
-
-            try:
-                data = response.json()
-            except ValueError:
-                return build_failure_result(platform, keyword, "invalid_response", "DataForSEO returned non-JSON content.")
-
-            normalized = parse_dataforseo_response(platform, keyword, data)
-            logger.info(
-                "platform_request_%s platform=%s keyword=%s status=%s valid=%s",
-                "success" if normalized["has_valid_data"] else "failure",
-                platform,
-                keyword,
-                normalized["response_status"],
-                normalized["has_valid_data"],
-            )
-            return normalized
-
-        except requests.exceptions.Timeout:
-            if attempt < 1:
-                logger.warning("platform_request_failure platform=%s keyword=%s status=timeout retry=1", platform, keyword)
-                time.sleep(1)
-                continue
-            return build_failure_result(platform, keyword, "timeout", "The DataForSEO request timed out.")
-        except requests.exceptions.ConnectionError:
-            return build_failure_result(platform, keyword, "network_error", "The server could not reach DataForSEO.")
-        except requests.exceptions.RequestException as exc:
-            return build_failure_result(platform, keyword, "network_error", f"Network request failed: {exc.__class__.__name__}.")
-        except Exception as exc:
-            return build_failure_result(platform, keyword, "unknown_error", f"Unexpected request failure: {exc.__class__.__name__}.")
-
-    return build_failure_result(platform, keyword, "unknown_error", "The platform request failed after retries.")
+    normalized = parse_dataforseo_response(platform, keyword, response["data"])
+    logger.info(
+        "platform_request_%s platform=%s keyword=%s status=%s valid=%s",
+        "success" if normalized["has_valid_data"] else "failure",
+        platform,
+        keyword,
+        normalized["response_status"],
+        normalized["has_valid_data"],
+    )
+    return normalized
 
 
 def parse_dataforseo_response(platform: str, keyword: str, data: dict) -> dict:

@@ -8,11 +8,12 @@ Provides shared utilities:
 - Honest missing-data / missing-key errors
 """
 import time
-import requests
 from abc import ABC, abstractmethod
-from requests.auth import HTTPBasicAuth
+
+from flask import has_request_context, session
 
 from agents.runtime_config import get_env_value, load_env_config
+from services.dataforseo_client import extract_first_task_result, post_dataforseo_task
 
 
 class BaseAgent(ABC):
@@ -31,8 +32,6 @@ class BaseAgent(ABC):
     ICON = "fa-robot"
     CATEGORY = "General"
     INPUT_SCHEMA = []  # Agent-specific extra fields
-
-    DATAFORSEO_BASE = "https://api.dataforseo.com/v3"
 
     @abstractmethod
     def run(self, input_data: dict) -> dict:
@@ -105,9 +104,12 @@ class BaseAgent(ABC):
 
     def get_dataforseo_credentials(self, input_data: dict) -> dict:
         creds = input_data.get("credentials", {}) or {}
+        session_creds = {}
+        if has_request_context():
+            session_creds = session.get("credentials", {}) or {}
         return {
-            "login": (creds.get("login") or get_env_value("DATAFORSEO_LOGIN")).strip(),
-            "password": (creds.get("password") or get_env_value("DATAFORSEO_PASSWORD")).strip(),
+            "login": (creds.get("login") or session_creds.get("login") or get_env_value("DATAFORSEO_LOGIN")).strip(),
+            "password": (creds.get("password") or session_creds.get("password") or get_env_value("DATAFORSEO_PASSWORD")).strip(),
         }
 
     def missing_key_response(self, missing_key: str, input_data: dict | None = None) -> dict:
@@ -146,33 +148,25 @@ class BaseAgent(ABC):
         Make an authenticated POST to DataForSEO.
         Returns (data_dict, error_string).
         """
-        login = credentials.get("login", "")
-        password = credentials.get("password", "")
-        url = f"{self.DATAFORSEO_BASE}/{endpoint}"
+        response = post_dataforseo_task(
+            endpoint,
+            payload,
+            credentials,
+            timeout=60,
+            max_retries=0,
+            purpose=f"agent:{self.NAME}",
+        )
+        if not response["ok"]:
+            status_messages = {
+                "authentication_failed": "DataForSEO credentials were rejected.",
+                "rate_limited": "Rate limited by DataForSEO (HTTP 429). Try again in a moment.",
+                "timeout": "DataForSEO request timed out after 60 seconds.",
+                "unavailable": "The server could not reach DataForSEO.",
+                "failed": response["message"],
+            }
+            return None, status_messages.get(response["status"], response["message"])
 
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                auth=HTTPBasicAuth(login, password),
-                timeout=60
-            )
-            if response.status_code == 429:
-                return None, "Rate limited by DataForSEO (HTTP 429). Try again in a moment."
-            if response.status_code != 200:
-                return None, f"DataForSEO returned HTTP {response.status_code}."
-            data = response.json()
-            tasks = data.get("tasks", [])
-            if not tasks:
-                return None, "API returned empty task list."
-            task = tasks[0]
-            if task.get("status_code") not in [20000, 20100]:
-                return None, f"Task error: {task.get('status_message', 'Unknown error')}"
-            result = task.get("result", [])
-            if not result:
-                return None, "Task returned empty result."
-            return result[0], None
-        except requests.exceptions.Timeout:
-            return None, "DataForSEO request timed out after 60 seconds."
-        except Exception as e:
-            return None, f"Request failed: {str(e)}"
+        first_result, error = extract_first_task_result(response["data"])
+        if error:
+            return None, error
+        return first_result, None

@@ -31,6 +31,7 @@ from services.report_health import (
     evaluate_report_data_health,
     is_valid_platform_result,
 )
+from services.run_context import load_run_analysis_context
 
 # ================= Matplotlib Chart Plotting Functions =================
 
@@ -113,13 +114,17 @@ def generate_trend_chart(trend_data, brand_domain, competitor_domains):
     fig, ax = plt.subplots(figsize=(5.5, 2.8))
     
     # Plot Brand
-    brand_points = [entry.get("brand", 0) for entry in trend_data]
+    brand_points = [entry.get("brand") for entry in trend_data]
+    if not any(point is not None for point in brand_points):
+        return None
     ax.plot(dates, brand_points, color='#4361ee', label=brand_domain, linewidth=2.5, marker='o', markersize=5)
     
     # Plot Competitors
     comp_colors = ['#fb7185', '#38bdf8', '#a78bfa', '#fbbf24']
     for idx, comp in enumerate(competitor_domains):
-        comp_points = [entry.get(comp.lower(), 0) for entry in trend_data]
+        comp_points = [entry.get(comp.lower()) for entry in trend_data]
+        if not any(point is not None for point in comp_points):
+            continue
         color = comp_colors[idx % len(comp_colors)]
         ax.plot(dates, comp_points, color=color, label=comp, linewidth=1.5, marker='x', markersize=4)
         
@@ -350,13 +355,21 @@ def build_technical_failure_pdf(run: dict, report_health: dict, results: list[di
     story.append(status_table)
     story.append(Spacer(1, 16))
     story.append(Paragraph("Recommended Actions", h1_style))
-    for action in [
-        "Verify API credentials.",
-        "Verify quota and rate limits.",
-        "Check network connectivity from the server.",
-        "Check provider availability.",
-        "Rerun the audit after resolving the failures.",
-    ]:
+    if not bool(run.get("use_dataforseo", 1)):
+        actions = [
+            "DataForSEO was not enabled for this run.",
+            "Enable DataForSEO in a future run if you need AI visibility metrics from that provider.",
+            "Review the run data source settings before rerunning the audit.",
+        ]
+    else:
+        actions = [
+            "Verify API credentials.",
+            "Verify quota and rate limits.",
+            "Check network connectivity from the server.",
+            "Check provider availability.",
+            "Rerun the audit after resolving the failures.",
+        ]
+    for action in actions:
         story.append(Paragraph(f"• {action}", body_style))
     story.append(Spacer(1, 12))
     story.append(Paragraph("Safe Technical Diagnostics", h1_style))
@@ -369,17 +382,21 @@ def generate_pdf_report(run_id):
     Retrieves database results for run_id and generates a polished, multi-page PDF.
     Returns: PDF file bytes.
     """
-    run = get_run(run_id)
-    if not run:
+    run_context = load_run_analysis_context(run_id)
+    if not run_context:
         return None
-        
-    results = get_mention_results(run_id)
-    report_health = evaluate_report_data_health(results)
-    if report_health["report_mode"] == "technical_failure":
+
+    run = run_context["run"]
+    results = run_context["results"]
+    report_health = {
+        **run_context["report_health"],
+        "platform_summaries": run_context["platform_summaries"],
+    }
+    if run_context["report_mode"] == "technical_failure":
         return build_technical_failure_pdf(run, report_health, results)
 
-    valid_results = [row for row in results if is_valid_platform_result(row)]
-    metrics = get_competitor_metrics(run_id)
+    valid_results = run_context["valid_results"]
+    metrics = run_context["metrics"]
     
     # Calculations
     total_checks = len(results)
@@ -387,7 +404,7 @@ def generate_pdf_report(run_id):
     successful_checks = len(valid_results)
 
     brand_sov = round((brand_mentions / successful_checks * 100), 1) if successful_checks > 0 else None
-    api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else 0.0
+    api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else None
 
     competitors = []
     if run.get("competitors"):
@@ -451,7 +468,7 @@ def generate_pdf_report(run_id):
             "confidence": confidence
         }
     
-    keywords = sorted(list(set(r["keyword"] for r in results)))
+    keywords = sorted(list(set(r["keyword"] for r in results))) or run.get("keywords", [])
     
     heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
     for r in results:

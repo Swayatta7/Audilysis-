@@ -78,10 +78,10 @@ class TechnicalAuditAgent(BaseAgent):
             audits = lighthouse.get("audits", {})
             loading = payload.get("loadingExperience", {}).get("metrics", {})
             return {
-                "performance_score": (categories.get("performance", {}).get("score") or 0) * 100,
-                "accessibility_score": (categories.get("accessibility", {}).get("score") or 0) * 100,
-                "best_practices_score": (categories.get("best-practices", {}).get("score") or 0) * 100,
-                "seo_score": (categories.get("seo", {}).get("score") or 0) * 100,
+                "performance_score": None if categories.get("performance", {}).get("score") is None else categories.get("performance", {}).get("score") * 100,
+                "accessibility_score": None if categories.get("accessibility", {}).get("score") is None else categories.get("accessibility", {}).get("score") * 100,
+                "best_practices_score": None if categories.get("best-practices", {}).get("score") is None else categories.get("best-practices", {}).get("score") * 100,
+                "seo_score": None if categories.get("seo", {}).get("score") is None else categories.get("seo", {}).get("score") * 100,
                 "core_web_vitals": {
                     "largest_contentful_paint_ms": loading.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile"),
                     "cumulative_layout_shift": loading.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile"),
@@ -241,7 +241,15 @@ class TechnicalAuditAgent(BaseAgent):
             warnings.append(self._issue_group("Chrome UX Report Coverage", "Low", [website_url], 1, [website_url], crux_note, "Connect CrUX for field data.", "Low SEO Impact", "5-10 minutes"))
 
         cwv = pagespeed_data.get("core_web_vitals", {}) if pagespeed_data else {}
-        cwv_passed = bool(cwv and (cwv.get("largest_contentful_paint_ms") or 0) <= 2500 and (cwv.get("cumulative_layout_shift") or 0) <= 0.1 and (cwv.get("interaction_to_next_paint_ms") or 0) <= 200)
+        cwv_values_available = all(
+            cwv.get(key) is not None for key in ["largest_contentful_paint_ms", "cumulative_layout_shift", "interaction_to_next_paint_ms"]
+        )
+        cwv_passed = bool(
+            cwv_values_available
+            and cwv.get("largest_contentful_paint_ms") <= 2500
+            and cwv.get("cumulative_layout_shift") <= 0.1
+            and cwv.get("interaction_to_next_paint_ms") <= 200
+        )
         score_components = [
             {"label": "HTTP Status", "max_points": 10, "earned_points": 10 if all(page["http_status"] < 400 for page in pages) else max(0, 10 - len([page for page in pages if page["http_status"] >= 400]) * 5)},
             {"label": "HTTPS", "max_points": 5, "earned_points": 5 if not non_https_pages else 0},
@@ -260,11 +268,13 @@ class TechnicalAuditAgent(BaseAgent):
             {"label": "Redirect Hygiene", "max_points": 5, "earned_points": 5 if not redirect_chain_pages else max(0, 5 - len(redirect_chain_pages))},
         ]
         if pagespeed_data:
+            pagespeed_component_score = pagespeed_data.get("performance_score")
             score_components.extend([
-                {"label": "PageSpeed Performance", "max_points": 5, "earned_points": round((pagespeed_data.get("performance_score") or 0) / 20)},
-                {"label": "Core Web Vitals", "max_points": 5, "earned_points": 5 if cwv_passed else 2},
+                {"label": "PageSpeed Performance", "max_points": 5, "earned_points": round(pagespeed_component_score / 20) if pagespeed_component_score is not None else None},
+                {"label": "Core Web Vitals", "max_points": 5, "earned_points": 5 if cwv_passed else (2 if cwv_values_available else None)},
             ])
-        score = round(sum(item["earned_points"] for item in score_components) / sum(item["max_points"] for item in score_components) * 100)
+        available_score_components = [item for item in score_components if item["earned_points"] is not None]
+        score = round(sum(item["earned_points"] for item in available_score_components) / sum(item["max_points"] for item in available_score_components) * 100)
         score_status = self._score_status(score)
 
         technical_metrics = {
@@ -288,7 +298,7 @@ class TechnicalAuditAgent(BaseAgent):
             "xml_sitemap": "Found" if sitemap_ok else "Missing",
             "ssl": "Valid" if not non_https_pages else "Issues Detected",
             "http_status": "Healthy" if all(page["http_status"] < 400 for page in pages) else "Errors Detected",
-            "core_web_vitals": "Passed" if cwv_passed else ("Unavailable" if not pagespeed_data else "Needs Attention"),
+            "core_web_vitals": "Passed" if cwv_passed else ("Unavailable" if not cwv_values_available else "Needs Attention"),
         }
         recommendations = [
             "Compress large hero images and reduce render-blocking resources on slow pages." if slow_pages else "",
@@ -341,6 +351,18 @@ class TechnicalAuditAgent(BaseAgent):
                 ],
                 "technical_metrics": technical_metrics,
                 "score_breakdown": score_components,
+                "metric_provenance": {
+                    "pagespeed": {
+                        "status": "available" if pagespeed_data else "unavailable",
+                        "source": "pagespeed",
+                        "reason": pagespeed_note,
+                    },
+                    "crux": {
+                        "status": "available" if crux_data else "unavailable",
+                        "source": "crux",
+                        "reason": crux_note,
+                    },
+                },
                 "priority_fixes": [{"issue": item["issue"], "severity": item["severity"], "affected_pages": item["affected_pages"], "estimated_seo_impact": item["estimated_seo_impact"], "recommended_fix": item["recommended_fix"], "estimated_time_to_fix": item["estimated_time_to_fix"]} for item in (critical_errors + warnings)[:6]],
                 "crawled_urls": crawl["crawled_urls"],
                 "broken_links": broken_links,
@@ -349,7 +371,7 @@ class TechnicalAuditAgent(BaseAgent):
                 "pagespeed": pagespeed_data or {},
                 "crux": crux_data or {},
                 "data_source": "real_crawl_and_api" if (pagespeed_data or crux_data or openai_key) else "real_crawl",
-                "unavailable_metrics": [item for item in ["PageSpeed / Core Web Vitals" if not pagespeed_data else "", "Chrome UX field data" if not crux_data else ""] if item],
+                "unavailable_metrics": [{"metric": "PageSpeed / Core Web Vitals", "status": "unavailable", "reason": pagespeed_note}] * (0 if pagespeed_data else 1) + [{"metric": "Chrome UX field data", "status": "unavailable", "reason": crux_note}] * (0 if crux_data else 1),
                 "missing_api_keys": [key for key in ["PAGESPEED_API_KEY", "CRUX_API_KEY", "OPENAI_API_KEY"] if not get_env_value(key)],
                 "technical_summary": {"score_status": score_status, "top_issue": (critical_errors + warnings)[0]["issue"] if (critical_errors + warnings) else "No major issues detected", "executive_note": "This report focuses on technical SEO health only and does not include competitor comparisons.", "pages_crawled": len(pages), "crawl_duration_ms": crawl_duration_ms},
                 "pagespeed_note": pagespeed_note,

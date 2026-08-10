@@ -11,35 +11,61 @@
 
     <form id="setup-form" class="space-y-8 bg-white border border-slate-200 rounded-xl shadow-sm p-6 md:p-8">
         
-        <!-- Section A: DataForSEO Credentials -->
+        <!-- Section A: Data Source Mode -->
+        <div>
+            <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                <i class="fa-solid fa-database text-blue-500 text-base"></i>
+                Section A: Data Source Mode
+            </h3>
+            <div class="mt-4 space-y-3">
+                <label class="flex items-start gap-3 rounded-lg border border-slate-200 px-4 py-3 cursor-pointer hover:border-blue-300 transition-all">
+                    <input type="radio" id="use_dataforseo_true" name="use_dataforseo" value="true" checked
+                           class="mt-1 h-4 w-4 border-slate-300 text-blue-600 focus:ring-blue-500">
+                    <span>
+                        <span class="block text-sm font-semibold text-slate-900">Use DataForSEO</span>
+                        <span class="block text-sm text-slate-500">Use DataForSEO together with all other available data sources.</span>
+                    </span>
+                </label>
+                <label class="flex items-start gap-3 rounded-lg border border-slate-200 px-4 py-3 cursor-pointer hover:border-blue-300 transition-all">
+                    <input type="radio" id="use_dataforseo_false" name="use_dataforseo" value="false"
+                           class="mt-1 h-4 w-4 border-slate-300 text-blue-600 focus:ring-blue-500">
+                    <span>
+                        <span class="block text-sm font-semibold text-slate-900">Run Without DataForSEO</span>
+                        <span class="block text-sm text-slate-500">Skip DataForSEO and run the analysis using all other available configured data sources.</span>
+                    </span>
+                </label>
+            </div>
+        </div>
+
+        <!-- Section B: DataForSEO Credentials -->
         <div>
             <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
                 <i class="fa-solid fa-key text-blue-500 text-base"></i>
-                Section A: DataForSEO Credentials
+                Section B: DataForSEO Credentials
             </h3>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+            <div id="dataforseo-credentials-grid" class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
                 <div>
-                    <label for="api_login" class="block text-sm font-medium text-slate-700 mb-1">API Login <span class="text-red-500">*</span></label>
+                    <label for="api_login" class="block text-sm font-medium text-slate-700 mb-1">API Login <span id="api-login-required" class="text-red-500">*</span></label>
                     <input type="text" id="api_login" name="api_login" placeholder="your-dataforseo-login@email.com" required
                            class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
                 </div>
                 <div>
-                    <label for="api_password" class="block text-sm font-medium text-slate-700 mb-1">API Password <span class="text-red-500">*</span></label>
+                    <label for="api_password" class="block text-sm font-medium text-slate-700 mb-1">API Password <span id="api-password-required" class="text-red-500">*</span></label>
                     <input type="password" id="api_password" name="api_password" placeholder="••••••••" required
                            class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
                 </div>
             </div>
             <p class="mt-2 text-xs text-slate-500">
                 <i class="fa-solid fa-circle-info mr-1"></i>
-                Get your API key at <a href="https://dataforseo.com" target="_blank" class="text-blue-600 hover:underline font-medium">dataforseo.com</a>. You can use <code class="bg-slate-100 px-1 py-0.5 rounded text-red-600">mock</code> as login and password for testing.
+                Get your API key at <a href="https://dataforseo.com" target="_blank" class="text-blue-600 hover:underline font-medium">dataforseo.com</a>.
             </p>
         </div>
 
-        <!-- Section B: Your Brand -->
+        <!-- Section C: Your Brand -->
         <div>
             <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
                 <i class="fa-solid fa-copyright text-blue-500 text-base"></i>
-                Section B: Your Brand
+                Section C: Your Brand
             </h3>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
                 <div>
@@ -84,12 +110,12 @@
             </div>
         </div>
 
-        <!-- Section C: Competitor Domains -->
+        <!-- Section D: Competitor Domains -->
         <div>
             <div class="flex items-center justify-between border-b border-slate-100 pb-3">
                 <h3 class="text-lg font-semibold text-slate-900 flex items-center gap-2">
                     <i class="fa-solid fa-users-rectangle text-blue-500 text-base"></i>
-                    Section C: Competitor Domains
+                    Section D: Competitor Domains
                 </h3>
                 <button type="button" id="add-competitor-btn" class="text-sm font-medium text-blue-600 hover:text-blue-700 flex items-center gap-1">
                     <i class="fa-solid fa-plus"></i> Add Competitor
@@ -124,11 +150,11 @@
             </div>
         </div>
 
-        <!-- Section D: Keywords to Track -->
+        <!-- Section E: Keywords to Track -->
         <div>
             <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
                 <i class="fa-solid fa-tags text-blue-500 text-base"></i>
-                Section D: Keywords to Track
+                Section E: Keywords to Track
             </h3>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
                 <div>
@@ -144,11 +170,11 @@
             </div>
         </div>
 
-        <!-- Section E: Email Settings (OPTIONAL) -->
+        <!-- Section F: Email Settings (OPTIONAL) -->
         <div>
             <h3 class="text-lg font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
                 <i class="fa-solid fa-envelope text-blue-500 text-base"></i>
-                Section E: Email Settings <span class="text-xs font-normal text-slate-400 ml-1">(Optional)</span>
+                Section F: Email Settings <span class="text-xs font-normal text-slate-400 ml-1">(Optional)</span>
             </h3>
             
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
@@ -191,7 +217,7 @@
             </p>
         </div>
 
-        <!-- Section F: Submit -->
+        <!-- Section G: Submit -->
         <div class="pt-4 border-t border-slate-100 flex justify-end">
             <button type="submit" class="w-full md:w-auto px-8 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2">
                 <i class="fa-solid fa-play text-xs"></i>
@@ -223,6 +249,38 @@ async function parseJsonResponse(response, fallbackMessage) {
 document.addEventListener("DOMContentLoaded", () => {
     const container = document.getElementById("competitors-container");
     const addBtn = document.getElementById("add-competitor-btn");
+    const dataforseoModeInputs = Array.from(document.querySelectorAll('input[name="use_dataforseo"]'));
+    const apiLoginInput = document.getElementById("api_login");
+    const apiPasswordInput = document.getElementById("api_password");
+    const credentialsGrid = document.getElementById("dataforseo-credentials-grid");
+    const apiLoginRequired = document.getElementById("api-login-required");
+    const apiPasswordRequired = document.getElementById("api-password-required");
+
+    function useDataForSeoEnabled() {
+        const selected = dataforseoModeInputs.find(input => input.checked);
+        return !selected || selected.value === "true";
+    }
+
+    function syncDataForSeoModeUI() {
+        const enabled = useDataForSeoEnabled();
+        apiLoginInput.required = enabled;
+        apiPasswordInput.required = enabled;
+        apiLoginInput.disabled = !enabled;
+        apiPasswordInput.disabled = !enabled;
+        credentialsGrid.classList.toggle("opacity-60", !enabled);
+        credentialsGrid.classList.toggle("pointer-events-none", !enabled);
+        apiLoginRequired.classList.toggle("hidden", !enabled);
+        apiPasswordRequired.classList.toggle("hidden", !enabled);
+        if (!enabled) {
+            apiLoginInput.value = "";
+            apiPasswordInput.value = "";
+        }
+    }
+
+    dataforseoModeInputs.forEach(input => {
+        input.addEventListener("change", syncDataForSeoModeUI);
+    });
+    syncDataForSeoModeUI();
     
     // Add competitor input row
     addBtn.addEventListener("click", () => {
@@ -261,6 +319,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const brandName = document.getElementById("brand_name").value.trim();
         const country = document.getElementById("country").value;
         const language = document.getElementById("language").value;
+        const useDataForSeo = useDataForSeoEnabled();
         
         const apiLogin = document.getElementById("api_login").value.trim();
         const apiPassword = document.getElementById("api_password").value.trim();
@@ -287,8 +346,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const emailAutomatically = document.getElementById("email_automatically").checked;
 
         // Validations
-        if (!brandDomain || !brandName || !apiLogin || !apiPassword) {
-            alert("Please fill in all required brand and credentials fields.");
+        if (!brandDomain || !brandName) {
+            alert("Please fill in all required brand fields.");
+            return;
+        }
+
+        if (useDataForSeo && (!apiLogin || !apiPassword)) {
+            alert("Please fill in the required DataForSEO credentials fields.");
             return;
         }
 
@@ -311,12 +375,15 @@ document.addEventListener("DOMContentLoaded", () => {
                 password: apiPassword
             },
             config: {
+                use_dataforseo: useDataForSeo,
                 brand_domain: brandDomain,
                 brand_name: brandName,
                 country: country,
                 language: language,
                 competitors: competitors,
-                keywords: keywords
+                keywords: keywords,
+                high_volume_keywords: hvKws,
+                brand_keywords: bKws
             },
             email_settings: {
                 smtp_host: smtpHost,

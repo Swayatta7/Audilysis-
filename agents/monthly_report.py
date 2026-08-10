@@ -1,6 +1,6 @@
 from agents.base_agent import BaseAgent
 from agents.weekly_report import SEO_REPORT_AGENT_OPTIONS
-from db.storage import get_latest_run, get_mention_results, get_competitor_metrics
+from services.run_context import load_run_analysis_context
 
 
 class MonthlyReportAgent(BaseAgent):
@@ -21,28 +21,34 @@ class MonthlyReportAgent(BaseAgent):
     ]
 
     def run(self, input_data: dict) -> dict:
-        latest = get_latest_run()
-        if not latest:
+        run_context = load_run_analysis_context(input_data.get("run_id"))
+        if not run_context:
             return {
                 "success": False,
                 "agent": self.NAME,
                 "error": "Missing data",
-                "message": "No tracker runs exist in the database. Run the tracker first to generate a monthly report.",
+                "message": "A valid run_id is required to generate a monthly report from verified tracker data.",
             }
-        results = get_mention_results(latest["id"])
-        metrics = get_competitor_metrics(latest["id"])
         return self.build_structured_response(
             input_data,
-            f"Monthly report compiled from the latest real tracker run #{latest['id']}.",
+            f"Monthly report compiled from verified tracker run #{run_context['run_id']}.",
             ["Review trend changes across repeated runs.", "Use the database output to set next-month targets."],
             {
-                "run_id": latest["id"],
-                "results_count": len(results),
-                "competitor_metrics_count": len(metrics),
+                "run_id": run_context["run_id"],
+                "results_count": len(run_context["results"]),
+                "competitor_metrics_count": len(run_context["metrics"]),
                 "monthly_goals": ["traffic", "rankings", "links"],
                 "status": "database_snapshot",
                 "data_source": "real_database_data",
                 "api_used": [],
                 "missing_api_keys": [],
+                "verified_run_summary": {
+                    "brand_name": run_context["run"]["brand_name"],
+                    "brand_domain": run_context["run"]["brand_domain"],
+                    "report_mode": run_context["report_mode"],
+                    "brand_mentions": run_context["brand_mentions_metric"],
+                    "share_of_voice": run_context["share_of_voice_metric"],
+                    "api_health": run_context["api_health_metric"],
+                },
             },
         )

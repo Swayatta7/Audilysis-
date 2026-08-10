@@ -90,8 +90,8 @@ class CompetitorAnalysisAgent(BaseAgent):
             categories = lighthouse.get("categories", {})
             audits = lighthouse.get("audits", {})
             return {
-                "performance_score": (categories.get("performance", {}).get("score") or 0) * 100,
-                "seo_score": (categories.get("seo", {}).get("score") or 0) * 100,
+                "performance_score": None if categories.get("performance", {}).get("score") is None else categories.get("performance", {}).get("score") * 100,
+                "seo_score": None if categories.get("seo", {}).get("score") is None else categories.get("seo", {}).get("score") * 100,
                 "lcp_ms": (audits.get("largest-contentful-paint", {}) or {}).get("numericValue"),
                 "fcp_ms": (audits.get("first-contentful-paint", {}) or {}).get("numericValue"),
                 "tbt_ms": (audits.get("total-blocking-time", {}) or {}).get("numericValue"),
@@ -174,11 +174,11 @@ class CompetitorAnalysisAgent(BaseAgent):
                 "images_missing_alt": len(page["images_missing_alt"]),
                 "response_time_ms": page["response_time_ms"],
                 "page_size_kb": round(page["page_size_bytes"] / 1024, 2),
-                "pagespeed_score": ps.get("performance_score") if ps else "Unavailable in Free Mode",
-                "seo_score": ps.get("seo_score") if ps else "Unavailable in Free Mode",
-                "lcp_ms": crux.get("lcp_ms") if crux else (ps.get("lcp_ms") if ps else "Unavailable in Free Mode"),
-                "cls": crux.get("cls") if crux else "Unavailable in Free Mode",
-                "inp_ms": crux.get("inp_ms") if crux else "Unavailable in Free Mode",
+                "pagespeed_score": ps.get("performance_score") if ps else None,
+                "seo_score": ps.get("seo_score") if ps else None,
+                "lcp_ms": crux.get("lcp_ms") if crux else (ps.get("lcp_ms") if ps else None),
+                "cls": crux.get("cls") if crux else None,
+                "inp_ms": crux.get("inp_ms") if crux else None,
             })
 
         if not rows:
@@ -256,7 +256,19 @@ class CompetitorAnalysisAgent(BaseAgent):
                 "api_used": api_used,
                 "premium_apis": services,
                 "warnings": warnings,
-                "unavailable_metrics": [{"metric": "Organic Traffic", "status": "Unavailable in Free Mode"}, {"metric": "Domain Authority", "status": "Unavailable in Free Mode"}, {"metric": "Backlinks", "status": "Unavailable in Free Mode"}, {"metric": "Referring Domains", "status": "Unavailable in Free Mode"}, {"metric": "Ranking Keywords", "status": "Unavailable in Free Mode"}, {"metric": "Search Volume", "status": "Unavailable in Free Mode"}, {"metric": "Keyword Difficulty", "status": "Unavailable in Free Mode"}],
+                "metric_provenance": {
+                    "pagespeed": {"status": "available" if pagespeed_used else "unavailable", "source": "pagespeed", "reason": None if pagespeed_used else "PageSpeed Insights was unavailable for this comparison."},
+                    "crux": {"status": "available" if crux_used else "unavailable", "source": "crux", "reason": None if crux_used else "Chrome UX Report was unavailable for this comparison."},
+                },
+                "unavailable_metrics": [
+                    {"metric": "Organic Traffic", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Domain Authority", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Backlinks", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Referring Domains", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Ranking Keywords", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Search Volume", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                    {"metric": "Keyword Difficulty", "status": "unavailable", "reason": "No connected provider in this workflow."},
+                ],
                 "data_source": "real_crawl_and_api" if (pagespeed_used or crux_used or openai_used) else "real_crawl",
                 "missing_api_keys": missing_premium + [key for key in ["PAGESPEED_API_KEY", "CRUX_API_KEY", "OPENAI_API_KEY"] if not get_env_value(key)],
             },

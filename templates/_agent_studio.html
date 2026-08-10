@@ -13,6 +13,26 @@
         </div>
     </div>
 
+    {% if run_not_found %}
+    <div class="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900">
+        Run {{ selected_run_id }} was not found. You can still use this tool manually, but run-backed context is unavailable.
+    </div>
+    {% elif selected_run %}
+    <div class="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+        <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Selected Run</p>
+                <p class="mt-1 text-sm font-semibold text-slate-900">Run #{{ selected_run.id }} · {{ selected_run.brand_name }} · {{ selected_run.brand_domain }}</p>
+                <p class="mt-1 text-sm text-slate-600">{{ selected_run.country }} · {{ selected_run.language }}</p>
+            </div>
+            <a href="/dashboard?run_id={{ selected_run.id }}" class="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-700">
+                <i class="fa-solid fa-arrow-up-right-from-square"></i>
+                View dashboard summary
+            </a>
+        </div>
+    </div>
+    {% endif %}
+
     <div class="agent-studio-layout">
         <div class="agent-studio-sidebar bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
             <div class="flex items-center justify-between mb-4">
@@ -72,6 +92,9 @@
 </div>
 
 <script>
+    const SELECTED_RUN = {{ selected_run|tojson if selected_run else 'null' }};
+    const SELECTED_RUN_ID = {{ selected_run_id|tojson if selected_run_id else 'null' }};
+
     function escapeHtml(value) {
         return String(value ?? '')
             .replace(/&/g, '&amp;')
@@ -88,7 +111,7 @@
     }
 
     function formatValue(value) {
-        if (value === null || value === undefined || value === '') return 'N/A';
+        if (value === null || value === undefined || value === '') return 'Data Unavailable';
         if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
         if (typeof value === 'boolean') return value ? 'Yes' : 'No';
         return String(value);
@@ -298,7 +321,7 @@
     function renderKeywordOpportunityRows(rows) {
         const list = rows || [];
         const metricValue = function(value) {
-            return value === null || value === undefined || value === '' ? 'Unavailable in Free Mode' : value;
+            return value === null || value === undefined || value === '' ? 'Data Unavailable' : value;
         };
         if (!list.length) {
             return `<tr><td colspan="13" class="px-3 py-3 text-sm text-slate-500">No matching keywords.</td></tr>`;
@@ -2165,6 +2188,7 @@
             card.classList.toggle('shadow-sm', isActive);
         });
         renderFieldsForAgent(agentId);
+        applyRunDefaults(agentId);
         if (isNegativeKeywordAgent(agentId)) {
             loadNegativeKeywordStatus();
         }
@@ -2202,6 +2226,9 @@
     function collectPayload(agentId) {
         const container = document.getElementById('agent-fields-container');
         const payload = { agent: agentId, agent_id: agentId };
+        if (SELECTED_RUN_ID) {
+            payload.run_id = SELECTED_RUN_ID;
+        }
         container.querySelectorAll('[data-field-id]').forEach(function(control) {
             const id = control.dataset.fieldId;
             const type = control.dataset.fieldType;
@@ -2227,6 +2254,41 @@
             payload[id] = control.value;
         });
         return payload;
+    }
+
+    function applyRunDefaults(agentId) {
+        if (!SELECTED_RUN || isNegativeKeywordAgent(agentId)) return;
+        let competitors = [];
+        if (Array.isArray(SELECTED_RUN.competitors)) {
+            competitors = SELECTED_RUN.competitors;
+        } else {
+            try {
+                competitors = JSON.parse(SELECTED_RUN.competitors || '[]');
+            } catch (error) {
+                competitors = [];
+            }
+        }
+        const defaults = {
+            website_url: 'https://' + SELECTED_RUN.brand_domain,
+            brand_name: SELECTED_RUN.brand_name,
+            country: SELECTED_RUN.country,
+            location: SELECTED_RUN.country,
+            target_country: SELECTED_RUN.country,
+            language: SELECTED_RUN.language,
+            competitor_urls: competitors,
+            competitors: competitors
+        };
+        Object.keys(defaults).forEach(function(fieldId) {
+            const control = document.querySelector('[data-field-id="' + fieldId + '"]');
+            if (!control) return;
+            const currentValue = control.tagName === 'TEXTAREA'
+                ? String(control.value || '').trim()
+                : String(control.value || '').trim();
+            if (currentValue) return;
+            const value = defaults[fieldId];
+            if (value === undefined || value === null) return;
+            control.value = Array.isArray(value) ? value.join('\n') : String(value);
+        });
     }
 
     function collectFormData(agentId) {

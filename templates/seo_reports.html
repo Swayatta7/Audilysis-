@@ -10,6 +10,26 @@
         <p class="mt-2 text-sm text-slate-600">Choose a reporting workflow for weekly and monthly SEO performance summaries.</p>
     </div>
 
+    {% if run_not_found %}
+    <div class="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900">
+        Run {{ selected_run_id }} was not found. Choose a valid dashboard run before generating a report.
+    </div>
+    {% elif run_context %}
+    <div class="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+        <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Report Source</p>
+                <p class="mt-1 text-sm font-semibold text-slate-900">Run #{{ run_context.run_id }} · {{ run_context.run.brand_name }} · {{ run_context.run.brand_domain }}</p>
+                <p class="mt-1 text-sm text-slate-600">Mode: {{ run_context.report_mode|replace('_', ' ')|title }} · Valid provider responses: {{ run_context.successful_checks }}/{{ run_context.total_checks }}</p>
+            </div>
+            <a href="/dashboard?run_id={{ run_context.run_id }}" class="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-700">
+                <i class="fa-solid fa-arrow-up-right-from-square"></i>
+                Open dashboard
+            </a>
+        </div>
+    </div>
+    {% endif %}
+
     <div class="agent-page-equal-col">
         <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
             <div class="flex items-center gap-2 text-indigo-600 mb-3">
@@ -62,6 +82,7 @@
         event.preventDefault();
         const payload = {
             agent: 'weekly_report',
+            run_id: {{ run_context.run_id if run_context else 'null' }},
             website_url: document.getElementById('weekly_website_url').value,
             keyword: document.getElementById('weekly_keyword').value
         };
@@ -82,6 +103,7 @@
         event.preventDefault();
         const payload = {
             agent: 'monthly_report',
+            run_id: {{ run_context.run_id if run_context else 'null' }},
             website_url: document.getElementById('monthly_website_url').value,
             keyword: document.getElementById('monthly_keyword').value
         };

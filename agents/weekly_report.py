@@ -1,7 +1,7 @@
 from datetime import date
 
 from agents.base_agent import BaseAgent
-from db.storage import get_latest_run, get_mention_results, get_competitor_metrics
+from services.run_context import load_run_analysis_context
 
 
 SEO_REPORT_AGENT_OPTIONS = [
@@ -55,30 +55,36 @@ class WeeklyReportAgent(BaseAgent):
         return None
 
     def run(self, input_data: dict) -> dict:
-        latest = get_latest_run()
-        if not latest:
+        run_context = load_run_analysis_context(input_data.get("run_id"))
+        if not run_context:
             return {
                 "success": False,
                 "agent": self.NAME,
                 "error": "Missing data",
-                "message": "No tracker runs exist in the database. Run the tracker first to generate a weekly report.",
+                "message": "A valid run_id is required to generate a weekly report from verified tracker data.",
             }
-        results = get_mention_results(latest["id"])
-        metrics = get_competitor_metrics(latest["id"])
         date_range_warning = self._date_range_warning(input_data)
         return self.build_structured_response(
             input_data,
-            f"Weekly report compiled from the latest real tracker run #{latest['id']}.",
+            f"Weekly report compiled from verified tracker run #{run_context['run_id']}.",
             ["Review the weakest platform coverage.", "Prioritize pages tied to keywords without mentions."],
             {
-                "run_id": latest["id"],
-                "results_count": len(results),
-                "competitor_metrics_count": len(metrics),
+                "run_id": run_context["run_id"],
+                "results_count": len(run_context["results"]),
+                "competitor_metrics_count": len(run_context["metrics"]),
                 "focus": ["content", "technical", "links"],
                 "week": "current",
                 "date_range_warning": date_range_warning,
                 "data_source": "real_database_data",
                 "api_used": [],
                 "missing_api_keys": [],
+                "verified_run_summary": {
+                    "brand_name": run_context["run"]["brand_name"],
+                    "brand_domain": run_context["run"]["brand_domain"],
+                    "report_mode": run_context["report_mode"],
+                    "brand_mentions": run_context["brand_mentions_metric"],
+                    "share_of_voice": run_context["share_of_voice_metric"],
+                    "api_health": run_context["api_health_metric"],
+                },
             },
         )
