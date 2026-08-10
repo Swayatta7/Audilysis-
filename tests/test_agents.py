@@ -168,7 +168,8 @@ class AgentRoutesTestCase(unittest.TestCase):
             'competitors': ['https://competitor1.com']
         }
 
-        content_response = self.client.post('/run-agent', json={**base_payload, 'agent': 'content_calendar'})
+        with patch.dict(os.environ, {'OPENAI_API_KEY': ''}):
+            content_response = self.client.post('/run-agent', json={**base_payload, 'agent': 'content_calendar'})
         self.assertEqual(content_response.status_code, 400)
         self.assertEqual(content_response.get_json()['missing_key'], 'OPENAI_API_KEY')
 
@@ -660,7 +661,8 @@ class AgentRoutesTestCase(unittest.TestCase):
             'outreach': ('OPENAI_API_KEY', {'website_url': 'https://example.com', 'business_goal': 'Earn links'}),
         }
         for agent_id, (missing_key, extra_payload) in cases.items():
-            response = self.client.post('/run-agent', json={'agent': agent_id, **extra_payload})
+            with patch.dict(os.environ, {missing_key: ''}):
+                response = self.client.post('/run-agent', json={'agent': agent_id, **extra_payload})
             self.assertEqual(response.status_code, 400, agent_id)
             data = response.get_json()
             self.assertFalse(data['success'], agent_id)
