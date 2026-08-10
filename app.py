@@ -10,14 +10,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
 
-from flask import Flask, request, jsonify, render_template, redirect, url_for, session, Response
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session, Response, has_request_context
 from werkzeug.exceptions import HTTPException
 
 # Imports from local packages
 from db.storage import (
     init_db, create_run, insert_mention_result, insert_competitor_metrics,
-    get_negative_keyword_report,
-    get_run, get_latest_run, get_mention_results, get_competitor_metrics, get_trend_data,
+    get_negative_keyword_report, upsert_run_provider_result,
+    get_run, get_run_for_user, get_mention_results, get_competitor_metrics, get_trend_data,
     list_negative_keyword_audit,
 )
 from api.dataforseo import query_platform
@@ -81,6 +81,19 @@ from services.report_health import (
     evaluate_report_data_health,
     is_valid_platform_result,
 )
+from services.run_context import build_metric_record, load_run_analysis_context
+from services.tracker_interpretation import generate_tracker_interpretation
+from services.tracker_providers import (
+    combine_keywords,
+    collect_tracker_provider_bundle,
+    normalize_competitor_domains,
+    normalize_domain,
+)
+from services.dataforseo_client import (
+    build_dataforseo_provider_payload,
+    build_skipped_dataforseo_payload,
+    verify_dataforseo_credentials,
+)
 from agents.runtime_config import get_env_value
 from agents.agent_manager import (
     CONTENT_GROUP,
@@ -130,22 +143,26 @@ def generate_report_content(run_id):
     Utility to fetch all dashboard statistics and build templates arguments.
     Reused by Dashboard view, Report export download, and SMTP email attachment.
     """
-    run = get_run(run_id)
-    if not run:
+    auth_user = current_user() if has_request_context() else None
+    user_id = int(auth_user["id"]) if auth_user else None
+    run_context = load_run_analysis_context(run_id, user_id=user_id)
+    if not run_context:
         return None
-        
-    results = get_mention_results(run_id)
-    metrics = get_competitor_metrics(run_id)
 
-    report_health = evaluate_report_data_health(results)
-    valid_results = [row for row in results if is_valid_platform_result(row)]
-    total_checks = len(results)
-    brand_mentions = sum(1 for r in valid_results if r.get("mentioned"))
-    successful_checks = len(valid_results)
-    brand_sov = round((brand_mentions / successful_checks * 100), 1) if successful_checks > 0 else None
-    api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else 0.0
+    run = run_context["run"]
+    results = run_context["results"]
+    metrics = run_context["metrics"]
+    report_health = {
+        **run_context["report_health"],
+        "platform_summaries": run_context["platform_summaries"],
+    }
+    valid_results = run_context["valid_results"]
+    total_checks = run_context["total_checks"]
+    brand_mentions_metric = run_context["brand_mentions_metric"]
+    share_of_voice_metric = run_context["share_of_voice_metric"]
+    api_health_metric = run_context["api_health_metric"]
 
-    keywords = sorted(list(set(r["keyword"] for r in results)))
+    keywords = sorted(list(set(r["keyword"] for r in results))) or run.get("keywords", [])
     heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
     for r in results:
         kw = r["keyword"]
@@ -174,16 +191,15 @@ def generate_report_content(run_id):
     top_domains = [{"domain": dom, "count": count} for dom, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)]
 
     top_competitor_name = "None"
-    top_competitor_mentions = 0
-    competitor_metrics = [m for m in metrics if m["domain"].lower() != run["brand_domain"].lower()]
-    if competitor_metrics:
-        top_comp = max(competitor_metrics, key=lambda x: x["total_mentions"])
-        if top_comp["total_mentions"] > 0:
-            top_competitor_name = top_comp["domain"]
-            top_competitor_mentions = top_comp["total_mentions"]
+    top_competitor_mentions = None
+    top_comp = run_context.get("top_competitor")
+    if top_comp and top_comp.get("total_mentions", 0) > 0:
+        top_competitor_name = top_comp["domain"]
+        top_competitor_mentions = top_comp["total_mentions"]
 
     return {
         "run": run,
+        "run_id": int(run["id"]),
         "results": results,
         "metrics": metrics,
         "keywords": keywords,
@@ -192,14 +208,118 @@ def generate_report_content(run_id):
         "trend_data": trend_data,
         "top_domains": top_domains,
         "stat_total_checks": total_checks,
-        "stat_brand_mentions": brand_mentions if report_health["report_mode"] != "technical_failure" else None,
-        "stat_brand_sov": brand_sov,
-        "stat_api_health": api_health,
+        "stat_brand_mentions": brand_mentions_metric["value"],
+        "stat_brand_sov": share_of_voice_metric["value"],
+        "stat_api_health": api_health_metric["value"],
+        "metric_provenance": {
+            "brand_mentions": brand_mentions_metric,
+            "share_of_voice": share_of_voice_metric,
+            "api_health": api_health_metric,
+            **run_context["provider_metrics"],
+            "top_competitor_mentions": build_metric_record(
+                top_competitor_mentions,
+                source="database",
+                run_id=int(run["id"]),
+                reason="No competitor mentions were recorded for this run." if top_competitor_mentions is None else None,
+                collected_at=run_context["collected_at"],
+            ),
+        },
         "report_health": report_health,
-        "report_mode": report_health["report_mode"],
+        "report_mode": run_context["report_mode"],
         "valid_results": valid_results,
+        "keyword_groups": {
+            "high_volume_keywords": run.get("high_volume_keywords", []),
+            "brand_keywords": run.get("brand_keywords", []),
+        },
+        "openai_interpretation": run_context.get("openai_interpretation"),
         "top_competitor_name": top_competitor_name,
-        "top_competitor_mentions": top_competitor_mentions
+        "top_competitor_mentions": top_competitor_mentions,
+        "source_provenance": {
+            **run_context["provider_provenance"],
+        },
+    }
+
+
+def resolve_requested_run_id(*, allow_session_default: bool = True) -> int | None:
+    explicit_run_id = request.args.get("run_id", type=int)
+    if explicit_run_id is not None:
+        return explicit_run_id
+    if allow_session_default:
+        session_run_id = session.get("last_run_id")
+        try:
+            return int(session_run_id) if session_run_id is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def get_current_user_id() -> int | None:
+    user = current_user()
+    if not user:
+        return None
+    return int(user["id"])
+
+
+def build_dashboard_not_found_context(requested_run_id: int | None) -> dict:
+    grouped_agents = get_all_agents()
+    return {
+        "run_not_found": True,
+        "requested_run_id": requested_run_id,
+        "run": {
+            "id": requested_run_id,
+            "brand_name": "Run not found",
+            "brand_domain": "Data Unavailable",
+            "run_date": "Data Unavailable",
+            "country": "Data Unavailable",
+            "language": "Data Unavailable",
+        },
+        "results": [],
+        "metrics": [],
+        "keywords": [],
+        "heatmap_data": {},
+        "platform_breakdown": {},
+        "trend_data": [],
+        "top_domains": [],
+        "stat_total_checks": 0,
+        "stat_brand_mentions": None,
+        "stat_brand_sov": None,
+        "stat_api_health": None,
+        "metric_provenance": {
+            "crawl_pages_crawled": {"value": None},
+            "pagespeed_performance_score": {"value": None},
+            "crux_lcp_ms": {"value": None},
+        },
+        "source_provenance": {
+            "dataforseo": {
+                "enabled": None,
+                "status": "unavailable",
+                "source": "dataforseo",
+                "reason": "The requested run was not found.",
+                "run_id": requested_run_id,
+                "collected_at": None,
+            },
+            "database": {
+                "enabled": True,
+                "status": "unavailable",
+                "source": "database",
+                "reason": "The requested run was not found.",
+                "run_id": requested_run_id,
+                "collected_at": None,
+            },
+        },
+        "report_health": {"platform_summaries": [], "report_mode": "technical_failure"},
+        "report_mode": "technical_failure",
+        "valid_results": [],
+        "openai_interpretation": None,
+        "top_competitor_name": "None",
+        "top_competitor_mentions": None,
+        "email_enabled": False,
+        "agent_counts": {
+            "SEO": len(grouped_agents.get(SEO_GROUP, [])),
+            "PPC": len(grouped_agents.get(PPC_GROUP, [])),
+            "Content": len(grouped_agents.get(CONTENT_GROUP, [])),
+            "Social": len(grouped_agents.get(SOCIAL_GROUP, [])),
+        },
     }
 
 # ================= Routes =================
@@ -207,8 +327,7 @@ def generate_report_content(run_id):
 @app.route("/")
 def index():
     """Default landing routing logic."""
-    latest = get_latest_run()
-    if latest:
+    if session.get("last_run_id"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("setup"))
 
@@ -394,20 +513,52 @@ def api_run():
         return jsonify({"status": "error", "message": "Missing payload."}), 400
         
     credentials = data.get("credentials")
-    config = data.get("config")
+    config = dict(data.get("config") or {})
     email_settings = data.get("email_settings")
     
     # Validations
-    if not credentials or not credentials.get("login") or not credentials.get("password"):
-        return jsonify({"status": "error", "message": "DataForSEO credentials are required."}), 400
     if not config or not config.get("brand_domain") or not config.get("brand_name"):
         return jsonify({"status": "error", "message": "Brand domain and brand name are required."}), 400
-    if not config.get("keywords") or len(config.get("keywords")) == 0:
+    high_volume_keywords = [item.strip() for item in (config.get("high_volume_keywords") or []) if str(item).strip()]
+    brand_keywords = [item.strip() for item in (config.get("brand_keywords") or []) if str(item).strip()]
+    fallback_keywords = [item.strip() for item in (config.get("keywords") or []) if str(item).strip()]
+    combined_keywords = combine_keywords(
+        high_volume_keywords or fallback_keywords,
+        brand_keywords if high_volume_keywords or brand_keywords else [],
+    )
+    if not combined_keywords:
         return jsonify({"status": "error", "message": "At least one keyword is required."}), 400
-    if len(config.get("keywords") or []) < 3:
+    if len(combined_keywords) < 3:
         return jsonify({"status": "error", "message": "Provide at least 3 keywords for adequate report coverage."}), 400
     if config.get("country") not in SUPPORTED_TARGET_COUNTRIES:
         return jsonify({"status": "error", "message": "Select a supported target country."}), 400
+    brand_domain = normalize_domain(config.get("brand_domain") or "")
+    if not brand_domain:
+        return jsonify({"status": "error", "message": "Enter a valid brand domain."}), 400
+    normalized_competitors = normalize_competitor_domains(config.get("competitors") or [])
+    normalized_competitors = [domain for domain in normalized_competitors if domain != brand_domain]
+    config["brand_domain"] = brand_domain
+    config["competitors"] = normalized_competitors
+    config["high_volume_keywords"] = high_volume_keywords
+    config["brand_keywords"] = brand_keywords
+    config["keywords"] = combined_keywords
+    use_dataforseo = bool(config.get("use_dataforseo", True))
+    if use_dataforseo and (not credentials or not credentials.get("login") or not credentials.get("password")):
+        return jsonify({"status": "error", "message": "DataForSEO credentials are required when DataForSEO is enabled."}), 400
+    if not use_dataforseo:
+        credentials = {"login": "", "password": ""}
+    email_settings = email_settings or {}
+    if email_settings.get("email_automatically"):
+        required_email_fields = {
+            "smtp_host": "SMTP host",
+            "smtp_port": "SMTP port",
+            "sender_email": "sender email",
+            "sender_password": "sender app password",
+            "recipient_emails": "recipient email(s)",
+        }
+        missing = [label for key, label in required_email_fields.items() if not str(email_settings.get(key) or "").strip()]
+        if missing:
+            return jsonify({"status": "error", "message": f"Automatic email requires: {', '.join(missing)}."}), 400
         
     # Store settings in flask session
     session["credentials"] = credentials
@@ -447,7 +598,7 @@ def stream():
     email_cfg = session.get("email_settings")
     session_run_id = session.get("session_run_id")
     
-    if not config or not creds or not session_run_id:
+    if not config or session_run_id is None:
         # Yield single error and exit
         def err_gen():
             yield f"data: {json.dumps({'status': 'error', 'error_message': 'Session expired or configuration missing.'})}\n\n"
@@ -460,22 +611,106 @@ def stream():
     language = config.get("language", "en")
     competitor_domains = config.get("competitors", [])
     keywords = config.get("keywords", [])
+    high_volume_keywords = config.get("high_volume_keywords", [])
+    brand_keywords = config.get("brand_keywords", [])
+    use_dataforseo = bool(config.get("use_dataforseo", True))
     
-    run_id = create_run(brand_domain, brand_name, country, language, competitor_domains)
+    run_id = create_run(
+        brand_domain,
+        brand_name,
+        country,
+        language,
+        competitor_domains,
+        use_dataforseo=use_dataforseo,
+        high_volume_keywords=high_volume_keywords,
+        brand_keywords=brand_keywords,
+        user_id=get_current_user_id(),
+    )
     session["last_run_id"] = run_id
     
     # Outer generator execution scope passing isolated variables
     def generate(config, creds, email_cfg, run_id, session_run_id):
-        platforms = ["google", "chat_gpt", "perplexity", "gemini", "claude"]
-        total_steps = len(keywords) * len(platforms)
+        provider_plan = [
+            ("crawl", "Collecting crawl data..."),
+            ("pagespeed", "Collecting PageSpeed data..."),
+            ("crux", "Collecting Chrome UX Report data..."),
+        ]
+        platforms = ["google", "chat_gpt", "perplexity", "gemini", "claude"] if use_dataforseo else []
+        verification_steps = 1
+        total_steps = len(provider_plan) + verification_steps + (len(keywords) * len(platforms))
         current_step = 0
         
         # Clear cancellations list for this new thread execution if present
         if session_run_id in cancelled_runs:
             cancelled_runs.remove(session_run_id)
             
+        website_url = f"https://{brand_domain}"
+        provider_results = collect_tracker_provider_bundle(website_url)
+        for index, provider_result in enumerate(provider_results, start=1):
+            current_step += 1
+            progress = (current_step / total_steps) * 100 if total_steps else 100
+            provider = provider_result["provider"]
+            upsert_run_provider_result(
+                run_id,
+                provider,
+                provider_result["status"],
+                payload=provider_result.get("payload"),
+                reason=provider_result.get("reason"),
+            )
+            status_text = provider_result["status"].replace("_", " ")
+            reason_text = provider_result.get("reason")
+            message = f"[SOURCE] {provider.title()} → {status_text}"
+            if reason_text:
+                message += f" ({reason_text})"
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})}\n\n"
+
+        current_step += 1
+        progress = (current_step / total_steps) * 100 if total_steps else 100
+        dataforseo_enabled_message = "[SOURCE] DataForSEO verification → "
+        dataforseo_ready = use_dataforseo
+        if not use_dataforseo:
+            upsert_run_provider_result(
+                run_id,
+                "dataforseo",
+                "skipped_by_user",
+                payload=build_skipped_dataforseo_payload(run_id=run_id),
+                reason="DataForSEO was intentionally disabled for this run.",
+            )
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'skipped by user', 'status': 'running'})}\n\n"
+        else:
+            verification_keyword = keywords[0] if keywords else brand_name
+            verification = verify_dataforseo_credentials(
+                creds,
+                keyword=verification_keyword,
+                country=country,
+                language=language,
+                run_id=run_id,
+            )
+            verified_status = verification["status"]
+            verified_reason = verification["message"]
+            upsert_run_provider_result(
+                run_id,
+                "dataforseo",
+                verified_status,
+                payload=verification.get("provider_payload"),
+                reason=verified_reason,
+            )
+            if verification["connected"]:
+                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'connected', 'status': 'running'})}\n\n"
+            else:
+                dataforseo_ready = False
+                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + verified_status.replace('_', ' '), 'status': 'running'})}\n\n"
+
+        if not use_dataforseo:
+            progress = (current_step / total_steps) * 100 if total_steps else 100
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO was disabled for this run. Skipping AI visibility collection and continuing with other real providers.', 'status': 'running'})}\n\n"
+        elif not dataforseo_ready:
+            progress = (current_step / total_steps) * 100 if total_steps else 100
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO authentication failed or the provider was unavailable. Skipping DataForSEO-dependent analysis and continuing with other real providers.', 'status': 'running'})}\n\n"
+
+        active_platforms = platforms if dataforseo_ready else []
         for keyword in keywords:
-            for platform in platforms:
+            for platform in active_platforms:
                 # Polling Cancel Check
                 if session_run_id in cancelled_runs:
                     yield f"data: {json.dumps({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user.', 'status': 'error', 'error_message': 'User cancelled run.'})}\n\n"
@@ -569,6 +804,27 @@ def stream():
         domain_positions = {d: [] for d in domains_to_track}
         valid_total_checks = len(valid_results)
 
+        if use_dataforseo and dataforseo_ready:
+            if valid_total_checks > 0:
+                dataforseo_final_status = "success"
+                dataforseo_final_reason = None
+            else:
+                dataforseo_final_status = "failed"
+                dataforseo_final_reason = "DataForSEO credentials were verified, but no valid provider responses were collected for this run."
+            upsert_run_provider_result(
+                run_id,
+                "dataforseo",
+                dataforseo_final_status,
+                payload=build_dataforseo_provider_payload(
+                    enabled=True,
+                    status=dataforseo_final_status,
+                    authentication="verified",
+                    endpoint="tracker_visibility",
+                    run_id=run_id,
+                ),
+                reason=dataforseo_final_reason,
+            )
+
         for res in valid_results:
             text = res.get("ai_response_text")
             if not text:
@@ -588,11 +844,28 @@ def stream():
                         domain_positions[comp.lower()].append(avg_p)
                         
         # Store competitor metrics
-        for dom in domains_to_track:
-            mentions_count = domain_mentions[dom]
-            avg_pos = sum(domain_positions[dom]) / len(domain_positions[dom]) if domain_positions[dom] else 0.0
-            sov = round((mentions_count / valid_total_checks * 100), 1) if valid_total_checks > 0 else 0.0
-            insert_competitor_metrics(run_id, dom, mentions_count, avg_pos, sov)
+        if valid_total_checks > 0:
+            for dom in domains_to_track:
+                mentions_count = domain_mentions[dom]
+                avg_pos = sum(domain_positions[dom]) / len(domain_positions[dom]) if domain_positions[dom] else None
+                sov = round((mentions_count / valid_total_checks * 100), 1)
+                insert_competitor_metrics(run_id, dom, mentions_count, avg_pos, sov)
+
+        report_data = generate_report_content(run_id)
+        interpretation = generate_tracker_interpretation(report_data) if report_data else {
+            "provider": "openai",
+            "status": "failed",
+            "reason": "Report data could not be generated for interpretation.",
+            "role": "interpretation_only",
+            "payload": None,
+        }
+        upsert_run_provider_result(
+            run_id,
+            "openai",
+            interpretation["status"],
+            payload=interpretation.get("payload"),
+            reason=interpretation.get("reason"),
+        )
 
         # Handle automatic emailing if configured
         if email_cfg and email_cfg.get("email_automatically"):
@@ -633,7 +906,7 @@ def stream():
                             </tr>
                             <tr>
                                 <td style="padding: 8px 0; font-weight: bold; color: #475569;">Top Competitor:</td>
-                                <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({report_data['top_competitor_mentions']} mentions)</td>
+                                <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({"Data Unavailable" if report_data['top_competitor_mentions'] is None else str(report_data['top_competitor_mentions']) + " mentions"})</td>
                             </tr>
                         </table>
                         <p style="margin-top: 24px; font-size: 14px;">The complete interactive PDF report is attached to this email. You can open and view it in any PDF reader.</p>
@@ -672,26 +945,58 @@ def stream():
 def agents_page():
     """SEO agent studio UI."""
     selected_agent = (request.args.get("agent") or "").strip()
+    selected_run_id = request.args.get("run_id", type=int)
+    selected_run = get_run_for_user(selected_run_id, get_current_user_id()) if selected_run_id else None
     if selected_agent == "negative_keyword":
         agent = get_agent_metadata("negative_keyword")
         if not agent:
             return redirect(url_for("agents_page"))
-        return render_template("agents.html", agents=[agent], standalone_agent=agent)
-    return render_template("agents.html", agents=get_agents_by_group(SEO_GROUP), standalone_agent=None)
+        return render_template(
+            "agents.html",
+            agents=[agent],
+            standalone_agent=agent,
+            selected_run=selected_run,
+            selected_run_id=selected_run_id,
+            run_not_found=bool(selected_run_id and not selected_run),
+        )
+    return render_template(
+        "agents.html",
+        agents=get_agents_by_group(SEO_GROUP),
+        standalone_agent=None,
+        selected_run=selected_run,
+        selected_run_id=selected_run_id,
+        run_not_found=bool(selected_run_id and not selected_run),
+    )
 
 
 @app.route("/content-agents")
 @login_required
 def content_agents_page():
     """Content marketing agent studio UI."""
-    return render_template("content_agents.html", agents=get_agents_by_group(CONTENT_GROUP))
+    selected_run_id = request.args.get("run_id", type=int)
+    selected_run = get_run_for_user(selected_run_id, get_current_user_id()) if selected_run_id else None
+    return render_template(
+        "content_agents.html",
+        agents=get_agents_by_group(CONTENT_GROUP),
+        selected_run=selected_run,
+        selected_run_id=selected_run_id,
+        run_not_found=bool(selected_run_id and not selected_run),
+    )
 
 
 @app.route("/social-agents")
 @login_required
 def social_agents_page():
     """Social media agent studio UI."""
-    return render_template("social_agents.html", agents=get_agents_by_group(SOCIAL_GROUP))
+    selected_run_id = request.args.get("run_id", type=int)
+    selected_run = get_run_for_user(selected_run_id, get_current_user_id()) if selected_run_id else None
+    return render_template(
+        "social_agents.html",
+        agents=get_agents_by_group(SOCIAL_GROUP),
+        selected_run=selected_run,
+        selected_run_id=selected_run_id,
+        run_not_found=bool(selected_run_id and not selected_run),
+    )
 
 
 @app.route("/youtube-multilingual-transcripter")
@@ -993,14 +1298,28 @@ def negative_keyword_export_csv():
 @login_required
 def seo_reports_page():
     """SEO reports page showing reporting agents."""
-    return render_template("seo_reports.html")
+    run_id = resolve_requested_run_id()
+    run_context = load_run_analysis_context(run_id, user_id=get_current_user_id()) if run_id else None
+    return render_template(
+        "seo_reports.html",
+        run_context=run_context,
+        selected_run_id=run_id,
+        run_not_found=bool(run_id and not run_context),
+    )
 
 
 @app.route("/seo-strategy")
 @login_required
 def seo_strategy_page():
     """SEO strategy page showing the strategy agent."""
-    return render_template("seo_strategy.html")
+    run_id = resolve_requested_run_id()
+    run_context = load_run_analysis_context(run_id, user_id=get_current_user_id()) if run_id else None
+    return render_template(
+        "seo_strategy.html",
+        run_context=run_context,
+        selected_run_id=run_id,
+        run_not_found=bool(run_id and not run_context),
+    )
 
 
 @app.route("/run-agent", methods=["POST"])
@@ -1018,6 +1337,23 @@ def run_agent_route():
     owner = get_owner_context()
     payload["_owner_key"] = owner.owner_key
     payload["_user_id"] = owner.user_id
+    payload_run_id = payload.get("run_id")
+    if payload_run_id not in (None, "", []):
+        run_context = load_run_analysis_context(payload_run_id, user_id=get_current_user_id())
+        if not run_context:
+            return json_error_response("Run not found", 404, "run_not_found")
+        run = run_context["run"]
+        try:
+            run_competitors = json.loads(run["competitors"]) if run.get("competitors") else []
+        except (TypeError, ValueError):
+            run_competitors = []
+        payload["run_id"] = run_context["run_id"]
+        payload["_tracker_run_context"] = run_context
+        payload.setdefault("website_url", f"https://{run['brand_domain']}")
+        payload.setdefault("brand_name", run["brand_name"])
+        payload.setdefault("country", run["country"])
+        payload.setdefault("language", run["language"])
+        payload.setdefault("competitors", run_competitors)
     agent_id = (payload.get("agent") or payload.get("agent_id") or "").strip()
     if not agent_id:
         return jsonify({"success": False, "message": "Agent is required.", "agent": None, "summary": "", "recommendations": [], "data": {}}), 400
@@ -1058,19 +1394,13 @@ def download_negative_keyword_report(filename):
 @login_required
 def dashboard():
     """Analytics dashboard main interface view."""
-    # Read last run ID
-    run_id = session.get("last_run_id")
+    run_id = resolve_requested_run_id()
     if not run_id:
-        # Fall back to latest in SQLite
-        latest = get_latest_run()
-        if latest:
-            run_id = latest["id"]
-        else:
-            return redirect(url_for("setup"))
-            
+        return redirect(url_for("setup"))
+
     report_data = generate_report_content(run_id)
     if not report_data:
-        return redirect(url_for("setup"))
+        return render_template("dashboard.html", **build_dashboard_not_found_context(run_id))
         
     # Check if SMTP email credentials exist in current session
     email_enabled = False
@@ -1092,15 +1422,12 @@ def dashboard():
 @login_required
 def download_report():
     """Generates a downloadable offline PDF file."""
-    run_id = request.args.get("run_id", type=int)
+    run_id = resolve_requested_run_id()
     if not run_id:
-        latest = get_latest_run()
-        if latest:
-            run_id = latest["id"]
-        else:
-            return "No runs available.", 404
-            
-    run_data = get_run(run_id)
+        return "Run not found.", 404
+
+    user_id = get_current_user_id()
+    run_data = get_run_for_user(run_id, user_id) if user_id is not None else None
     if not run_data:
         return "Run not found.", 404
         
@@ -1126,18 +1453,20 @@ def download_report():
 def api_email_report():
     """AJAX endpoint to email latest report on demand as PDF."""
     data = request.json or {}
-    run_id = data.get("run_id")
-    
+    run_id = data.get("run_id") or session.get("last_run_id")
     if not run_id:
-        latest = get_latest_run()
-        if latest:
-            run_id = latest["id"]
-        else:
-            return jsonify({"status": "error", "message": "No run data available to email."}), 404
+        return jsonify({"status": "error", "message": "No run data available to email."}), 404
             
     # Read SMTP configurations from session
     email_cfg = session.get("email_settings")
-    if not email_cfg or not email_cfg.get("smtp_host") or not email_cfg.get("sender_email") or not email_cfg.get("sender_password"):
+    if (
+        not email_cfg
+        or not email_cfg.get("smtp_host")
+        or not email_cfg.get("smtp_port")
+        or not email_cfg.get("sender_email")
+        or not email_cfg.get("sender_password")
+        or not email_cfg.get("recipient_emails")
+    ):
         return jsonify({"status": "error", "message": "Email settings are missing in current session. Configure SMTP settings in Setup page first."}), 400
         
     report_data = generate_report_content(run_id)
@@ -1170,7 +1499,7 @@ def api_email_report():
                 </tr>
                 <tr>
                     <td style="padding: 8px 0; font-weight: bold; color: #475569;">Mention Rate (SOV):</td>
-                    <td style="padding: 8px 0; text-align: right; color: #10b981; font-weight: bold;">{report_data['stat_brand_sov']}%</td>
+                    <td style="padding: 8px 0; text-align: right; color: #10b981; font-weight: bold;">{"Data Unavailable" if report_data['stat_brand_sov'] is None else str(report_data['stat_brand_sov']) + "%"}</td>
                 </tr>
                 <tr>
                     <td style="padding: 8px 0; font-weight: bold; color: #475569;">Total Checks:</td>
@@ -1178,7 +1507,7 @@ def api_email_report():
                 </tr>
                 <tr>
                     <td style="padding: 8px 0; font-weight: bold; color: #475569;">Top Competitor:</td>
-                    <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({report_data['top_competitor_mentions']} mentions)</td>
+                    <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({"Data Unavailable" if report_data['top_competitor_mentions'] is None else str(report_data['top_competitor_mentions']) + " mentions"})</td>
                 </tr>
             </table>
             <p style="margin-top: 24px; font-size: 14px;">Your complete Audilysis 2.0 report is attached as a PDF file. You can view it in any PDF reader.</p>
@@ -1205,8 +1534,9 @@ def api_email_report():
             
         return jsonify({"status": "sent", "to": to_str})
         
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Server encountered mail error: {str(e)}"}), 500
+    except Exception:
+        app.logger.exception("email_report_route_failed run_id=%s", run_id)
+        return jsonify({"status": "error", "message": "Email delivery failed."}), 500
 
 # ================= Startup =================
 

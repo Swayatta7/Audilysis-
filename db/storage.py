@@ -35,18 +35,35 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             brand_domain TEXT NOT NULL,
             brand_name TEXT NOT NULL,
             country TEXT NOT NULL,
             language TEXT NOT NULL,
             competitors TEXT,
-            run_date DATETIME DEFAULT CURRENT_TIMESTAMP
+            high_volume_keywords TEXT,
+            brand_keywords TEXT,
+            use_dataforseo INTEGER DEFAULT 1,
+            run_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
         )
     """)
     cursor.execute("PRAGMA table_info(runs)")
     run_columns = [col[1] for col in cursor.fetchall()]
+    if "user_id" not in run_columns:
+        try:
+            cursor.execute("ALTER TABLE runs ADD COLUMN user_id INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     if "competitors" not in run_columns:
         cursor.execute("ALTER TABLE runs ADD COLUMN competitors TEXT")
+    if "high_volume_keywords" not in run_columns:
+        cursor.execute("ALTER TABLE runs ADD COLUMN high_volume_keywords TEXT")
+    if "brand_keywords" not in run_columns:
+        cursor.execute("ALTER TABLE runs ADD COLUMN brand_keywords TEXT")
+    if "use_dataforseo" not in run_columns:
+        cursor.execute("ALTER TABLE runs ADD COLUMN use_dataforseo INTEGER DEFAULT 1")
     
     # Create mention_results table
     cursor.execute("""
@@ -82,6 +99,22 @@ def init_db():
             FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE
         )
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS run_provider_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            payload_json TEXT,
+            collected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_run_provider_results_run_id ON run_provider_results(run_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_run_provider_results_run_id_provider ON run_provider_results(run_id, provider)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS google_ads_connections (
@@ -218,14 +251,42 @@ def migrate_negative_keyword_settings(cursor):
             (SYSTEM_OWNER_KEY, row["custom_instructions"], row["updated_at"], SYSTEM_OWNER_KEY),
         )
 
-def create_run(brand_domain, brand_name, country, language, competitors=None):
+def create_run(
+    brand_domain,
+    brand_name,
+    country,
+    language,
+    competitors=None,
+    use_dataforseo=True,
+    high_volume_keywords=None,
+    brand_keywords=None,
+    user_id=None,
+):
     """Inserts a new run and returns the run_id."""
     conn = get_connection()
     cursor = conn.cursor()
     competitors_payload = json.dumps(competitors) if competitors is not None else None
+    high_volume_payload = json.dumps(high_volume_keywords) if high_volume_keywords is not None else None
+    brand_keywords_payload = json.dumps(brand_keywords) if brand_keywords is not None else None
     cursor.execute(
-        "INSERT INTO runs (brand_domain, brand_name, country, language, competitors, run_date) VALUES (?, ?, ?, ?, ?, ?)",
-        (brand_domain, brand_name, country, language, competitors_payload, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        """
+        INSERT INTO runs (
+            user_id, brand_domain, brand_name, country, language, competitors,
+            high_volume_keywords, brand_keywords, use_dataforseo, run_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            brand_domain,
+            brand_name,
+            country,
+            language,
+            competitors_payload,
+            high_volume_payload,
+            brand_keywords_payload,
+            1 if use_dataforseo else 0,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
     )
     run_id = cursor.lastrowid
     conn.commit()
@@ -293,11 +354,65 @@ def insert_competitor_metrics(run_id, domain, total_mentions, avg_position, shar
     conn.commit()
     conn.close()
 
+
+def upsert_run_provider_result(run_id, provider, status, payload=None, reason=None):
+    """Stores or replaces a provider collection result for a run."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM run_provider_results WHERE run_id = ? AND provider = ?", (run_id, provider))
+    cursor.execute(
+        """
+        INSERT INTO run_provider_results (run_id, provider, status, reason, payload_json, collected_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            provider,
+            status,
+            reason,
+            json.dumps(payload) if payload is not None else None,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_run_provider_results(run_id):
+    """Fetches provider collection results for a run."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM run_provider_results WHERE run_id = ? ORDER BY provider ASC, id ASC",
+        (run_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item["payload_json"]) if item.get("payload_json") else None
+        except (TypeError, ValueError):
+            item["payload"] = None
+        results.append(item)
+    return results
+
 def get_run(run_id):
     """Fetches a specific run record."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_run_for_user(run_id, user_id: int):
+    """Fetches a specific run record owned by the authenticated user."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM runs WHERE id = ? AND user_id = ?", (run_id, int(user_id)))
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -356,6 +471,8 @@ def get_trend_data(brand_domain, competitor_domains):
     trend = []
     for r in runs:
         run_id = r["id"]
+        cursor.execute("SELECT COUNT(*) FROM mention_results WHERE run_id = ? AND has_valid_data = 1", (run_id,))
+        valid_result_count = int(cursor.fetchone()[0] or 0)
         # Fetch competitor metrics for this run_id
         cursor.execute("SELECT domain, total_mentions FROM competitor_metrics WHERE run_id = ?", (run_id,))
         metrics = cursor.fetchall()
@@ -372,10 +489,10 @@ def get_trend_data(brand_domain, competitor_domains):
             
         entry = {
             "run_date": formatted_date,
-            "brand": metrics_dict.get(brand_domain.lower(), 0)
+            "brand": metrics_dict.get(brand_domain.lower()) if valid_result_count > 0 else None
         }
         for comp in competitor_domains:
-            entry[comp] = metrics_dict.get(comp.lower(), 0)
+            entry[comp] = metrics_dict.get(comp.lower()) if valid_result_count > 0 else None
             
         trend.append(entry)
         

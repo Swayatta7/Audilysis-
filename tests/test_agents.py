@@ -24,6 +24,7 @@ class AgentRoutesTestCase(unittest.TestCase):
         if not user:
             user_id = create_user("agent-tests@example.com", generate_password_hash("Password123"))
             user = {"id": user_id, "email": "agent-tests@example.com"}
+        self.user_id = int(user["id"])
         self.csrf_token = "test-csrf-token"
         with self.client.session_transaction() as flask_session:
             flask_session["auth_user_id"] = user["id"]
@@ -100,6 +101,56 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertEqual(data['keyword_opportunities'][0]['search_volume'], None)
         self.assertEqual(data['keyword_opportunities'][0]['metric_source'], 'Unavailable in Free Mode')
 
+    @patch("agents.base_agent.post_dataforseo_task", return_value={
+        "ok": True,
+        "status": "connected",
+        "http_status": 200,
+        "message": "Authenticated DataForSEO response received.",
+        "data": {
+            "tasks": [{
+                "status_code": 20000,
+                "result": [{
+                    "items": [{
+                        "keyword": "digital marketing agency",
+                        "search_volume": 1200,
+                        "cpc": 2.4,
+                        "competition": 0.6,
+                        "competition_index": 55,
+                        "monthly_searches": [],
+                    }]
+                }],
+            }]
+        },
+        "endpoint": "keywords_data/google_ads/search_volume/live",
+    })
+    @patch('agents.keyword_research.crawl_site')
+    def test_agent_can_reuse_session_scoped_dataforseo_credentials(self, keyword_crawl, _mocked_post):
+        keyword_crawl.return_value = {
+            'pages': [{
+                'url': 'https://example.com',
+                'title': 'Digital Marketing Agency',
+                'meta_description': 'SEO services and content strategy for growth.',
+                'h1': ['Digital Marketing Agency'],
+                'h2': ['SEO Services', 'Content Strategy'],
+            }],
+            'crawled_urls': ['https://example.com'],
+        }
+        with self.client.session_transaction() as flask_session:
+            flask_session["credentials"] = {"login": "session-login", "password": "session-password"}
+        response = self.client.post('/run-agent', json={
+            'agent': 'keyword_research',
+            'website_url': 'https://example.com',
+            'seed_keyword': 'digital marketing agency',
+            'country': 'United States',
+            'language': 'English',
+            'competitors': ['https://competitor1.com'],
+            'business_goal': 'generate SEO leads'
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['keyword_opportunities'][0]['search_volume'], 1200)
+
     def test_run_content_and_social_agents_return_json(self):
         base_payload = {
             'website_url': 'https://example.com',
@@ -141,10 +192,78 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'SEO Reports', response.data)
 
+    def test_reports_page_uses_explicit_run_id(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        response = self.client.get(f'/seo-reports?run_id={run_id}')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(f'Run #{run_id}'.encode(), response.data)
+
+    def test_reports_page_invalid_run_id_does_not_fall_back(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        with self.client.session_transaction() as flask_session:
+            flask_session["last_run_id"] = run_id
+        response = self.client.get('/seo-reports?run_id=999999')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'was not found', response.data)
+        self.assertNotIn(f'Run #{run_id}'.encode(), response.data)
+
     def test_strategy_page_renders(self):
         response = self.client.get('/seo-strategy')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'SEO Strategy', response.data)
+
+    @patch('agents.strategy.get_env_value', return_value='test-openai-key')
+    @patch('agents.strategy.openai_chat_completion', return_value=(200, json.dumps({
+        "summary": "Strategy based on verified run data.",
+        "recommendations": ["Focus on weak platforms."],
+        "data": {
+            "business_goal": "Grow visibility",
+            "phases": ["Diagnose", "Improve"],
+            "focus": ["visibility"],
+            "verified_metrics_used": ["brand_mentions", "share_of_voice"],
+            "measured_facts": ["One verified run was supplied."],
+            "ai_recommendations_note": "AI interpreted verified metrics only."
+        }
+    })))
+    def test_strategy_agent_receives_verified_run_data(self, mocked_openai, _mocked_env):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        insert_mention_result(
+            run_id=run_id,
+            keyword='example brand',
+            platform='google',
+            mentioned=True,
+            mention_position=1,
+            sources_cited=['https://example.com'],
+            competitor_mentions={},
+            ai_response_text='Example brand appears here.',
+            response_status='success',
+            error_category='success',
+            error_message='',
+            has_valid_data=True,
+            retry_recommendation='No retry needed.',
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'strategy',
+            'run_id': run_id,
+            'business_goal': 'Grow visibility',
+            'website_url': 'https://example.com',
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['data']['data_source'], 'verified_run_data_and_openai')
+        prompt = mocked_openai.call_args.args[1]
+        self.assertIn('"run_id": %d' % run_id, prompt)
+        self.assertIn('"status": "available"', prompt)
+        self.assertNotIn('"share_of_voice": 0', prompt)
+
+    def test_run_agent_invalid_run_id_returns_not_found(self):
+        response = self.client.post('/run-agent', json={
+            'agent': 'weekly_report',
+            'run_id': 999999,
+        })
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()['error'], 'Run not found')
 
     def test_required_templates_exist(self):
         for template_name in [
@@ -170,7 +289,7 @@ class AgentRoutesTestCase(unittest.TestCase):
             self.assertNotIn(link_response.status_code, (404, 500), href)
 
     def test_dashboard_shows_agent_counts(self):
-        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'])
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
         with self.client.session_transaction() as flask_session:
             flask_session["last_run_id"] = run_id
         response = self.client.get('/dashboard')
@@ -185,6 +304,36 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertIn(str(len(grouped[CONTENT_GROUP])).encode(), response.data)
         self.assertIn(str(len(grouped[SOCIAL_GROUP])).encode(), response.data)
         self.assertEqual(len(grouped[PPC_GROUP]), 1)
+
+    def test_run_routes_are_isolated_per_authenticated_user(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+
+        other_user = get_user_by_email("other-agent-tests@example.com")
+        if not other_user:
+            other_user_id = create_user("other-agent-tests@example.com", generate_password_hash("Password123"))
+            other_user = {"id": other_user_id, "email": "other-agent-tests@example.com"}
+
+        other_client = app.test_client()
+        with other_client.session_transaction() as flask_session:
+            flask_session["auth_user_id"] = other_user["id"]
+            flask_session["csrf_token"] = "other-csrf-token"
+            flask_session["browser_session_id"] = "other-agent-tests-session"
+
+        dashboard_response = other_client.get(f'/dashboard?run_id={run_id}')
+        self.assertEqual(dashboard_response.status_code, 200)
+        self.assertIn(b'Run Not Found', dashboard_response.data)
+
+        reports_response = other_client.get(f'/seo-reports?run_id={run_id}')
+        self.assertEqual(reports_response.status_code, 200)
+        self.assertIn(b'was not found', reports_response.data)
+
+        run_agent_response = other_client.post(
+            '/run-agent',
+            json={'agent': 'weekly_report', 'run_id': run_id},
+            headers={"X-CSRF-Token": "other-csrf-token", "X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(run_agent_response.status_code, 404)
+        self.assertEqual(run_agent_response.get_json()['error'], 'Run not found')
 
     def test_all_registered_agents_have_required_metadata_and_run(self):
         grouped = get_all_agents()
@@ -519,7 +668,7 @@ class AgentRoutesTestCase(unittest.TestCase):
 
     def test_pdf_report_includes_competitors_and_visibility_summary(self):
         init_db()
-        run_id = create_run('example.com', 'Example', 'United States', 'en', ['https://competitor1.com', 'https://competitor2.com'])
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['https://competitor1.com', 'https://competitor2.com'], user_id=self.user_id)
         insert_mention_result(
             run_id=run_id,
             keyword='example brand',
@@ -604,14 +753,27 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertEqual(set(standalone_agents.keys()), {'negative_keyword'})
         self.assertEqual({field['id'] for field in standalone_agents['negative_keyword']['input_schema']}, negative_fields)
 
-    @patch('agents.weekly_report.get_latest_run')
-    @patch('agents.weekly_report.get_mention_results', return_value=[])
-    @patch('agents.weekly_report.get_competitor_metrics', return_value=[])
-    def test_weekly_report_date_range_validation(self, _metrics, _results, latest_run):
-        latest_run.return_value = {'id': 1}
+    def test_weekly_report_date_range_validation(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        insert_mention_result(
+            run_id=run_id,
+            keyword='example brand',
+            platform='google',
+            mentioned=True,
+            mention_position=1,
+            sources_cited=['https://example.com'],
+            competitor_mentions={},
+            ai_response_text='Example brand appears here.',
+            response_status='success',
+            error_category='success',
+            error_message='',
+            has_valid_data=True,
+            retry_recommendation='No retry needed.',
+        )
 
         seven_day_response = self.client.post('/run-agent', json={
             'agent': 'weekly_report',
+            'run_id': run_id,
             'start_date': '2026-07-01',
             'end_date': '2026-07-08',
         })
@@ -620,6 +782,7 @@ class AgentRoutesTestCase(unittest.TestCase):
 
         skewed_response = self.client.post('/run-agent', json={
             'agent': 'weekly_report',
+            'run_id': run_id,
             'start_date': '2026-07-01',
             'end_date': '2026-07-20',
         })

@@ -5,14 +5,18 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+import json
+from pathlib import Path
 
 from werkzeug.security import generate_password_hash
 
+import db.storage as storage
 from app import app, generate_report_content
 from api.dataforseo import query_platform
-from db.storage import DB_PATH, create_run, create_user, get_user_by_email, init_db, insert_mention_result
+from db.storage import DB_PATH, create_run, create_user, get_run, get_run_provider_results, get_user_by_email, init_db, insert_mention_result
 from services.pdf_generator import generate_pdf_report
 from services.report_health import evaluate_report_data_health
+from services.tracker_interpretation import generate_tracker_interpretation
 
 
 def reset_tracker_tables():
@@ -20,6 +24,7 @@ def reset_tracker_tables():
     cursor = conn.cursor()
     cursor.execute("DELETE FROM mention_results")
     cursor.execute("DELETE FROM competitor_metrics")
+    cursor.execute("DELETE FROM run_provider_results")
     cursor.execute("DELETE FROM runs")
     conn.commit()
     conn.close()
@@ -35,12 +40,13 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         if not user:
             user_id = create_user("tracker-tests@example.com", generate_password_hash("Password123"))
             user = {"id": user_id, "email": "tracker-tests@example.com"}
+        self.user_id = int(user["id"])
         with self.client.session_transaction() as flask_session:
             flask_session["auth_user_id"] = user["id"]
             flask_session["csrf_token"] = "tracker-csrf"
 
     def _create_run_with_results(self, rows):
-        run_id = create_run("example.com", "Example", "United States", "en", ["competitor1.com"])
+        run_id = create_run("example.com", "Example", "United States", "en", ["competitor1.com"], user_id=self.user_id)
         for row in rows:
             insert_mention_result(run_id=run_id, **row)
         return run_id
@@ -124,6 +130,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(report["stat_brand_mentions"], 1)
         self.assertEqual(report["stat_brand_sov"], 100.0)
         self.assertEqual(report["report_health"]["failed_platforms"], 1)
+        self.assertIsNone(report["trend_data"][0]["brand"] if report["trend_data"] else None)
 
     def test_all_success_with_zero_mentions_produces_valid_zero_sov(self):
         run_id = self._create_run_with_results([
@@ -148,29 +155,176 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(report["stat_brand_sov"], 0.0)
         self.assertEqual(report["stat_brand_mentions"], 0)
 
+    def test_invalid_run_id_does_not_fall_back_to_latest_dashboard(self):
+        valid_run_id = self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        with self.client.session_transaction() as flask_session:
+            flask_session["last_run_id"] = valid_run_id
+        response = self.client.get("/dashboard?run_id=999999")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Run Not Found", response.data)
+        self.assertNotIn(b"Example", response.data)
+
+    def test_download_report_requires_explicit_or_session_run_not_global_latest(self):
+        self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        with self.client.session_transaction() as flask_session:
+            flask_session.pop("last_run_id", None)
+        response = self.client.get("/download-report")
+        self.assertEqual(response.status_code, 404)
+
+    def test_partial_source_run_preserves_unavailable_metrics_in_pdf(self):
+        run_id = self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            },
+            {
+                "keyword": "example brand",
+                "platform": "chat_gpt",
+                "mentioned": None,
+                "mention_position": None,
+                "sources_cited": [],
+                "competitor_mentions": {},
+                "ai_response_text": "",
+                "response_status": "timeout",
+                "error_category": "timeout",
+                "error_message": "The platform request timed out before completion.",
+                "has_valid_data": False,
+                "retry_recommendation": "Retry later.",
+            },
+        ])
+        report = generate_report_content(run_id)
+        self.assertEqual(report["metric_provenance"]["brand_mentions"]["value"], 1)
+        self.assertEqual(report["metric_provenance"]["share_of_voice"]["value"], 100.0)
+        self.assertEqual(report["metric_provenance"]["api_health"]["value"], 50.0)
+
+    def test_sqlite_migration_preserves_historical_rows_and_adds_tracker_columns(self):
+        original_db_path = storage.DB_PATH
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_db_path = Path(temp_dir) / "legacy_tracker.db"
+            storage.DB_PATH = temp_db_path
+            try:
+                conn = sqlite3.connect(temp_db_path)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        brand_domain TEXT NOT NULL,
+                        brand_name TEXT NOT NULL,
+                        country TEXT NOT NULL,
+                        language TEXT NOT NULL,
+                        run_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute(
+                    "INSERT INTO runs (brand_domain, brand_name, country, language, run_date) VALUES (?, ?, ?, ?, ?)",
+                    ("legacy-example.com", "Legacy Example", "United States", "en", "2026-01-01 12:00:00"),
+                )
+                conn.commit()
+                conn.close()
+
+                storage.init_db()
+
+                conn = sqlite3.connect(temp_db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT brand_domain, brand_name FROM runs")
+                rows = cursor.fetchall()
+                self.assertEqual(rows, [("legacy-example.com", "Legacy Example")])
+                cursor.execute("PRAGMA table_info(runs)")
+                run_columns = {row[1] for row in cursor.fetchall()}
+                self.assertIn("user_id", run_columns)
+                self.assertIn("high_volume_keywords", run_columns)
+                self.assertIn("brand_keywords", run_columns)
+                self.assertIn("use_dataforseo", run_columns)
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='run_provider_results'")
+                self.assertIsNotNone(cursor.fetchone())
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_run_provider_results_run_id'")
+                self.assertIsNotNone(cursor.fetchone())
+                cursor.execute("SELECT high_volume_keywords, brand_keywords, use_dataforseo, user_id FROM runs WHERE id = 1")
+                migrated_row = cursor.fetchone()
+                self.assertEqual(migrated_row, (None, None, 1, None))
+                conn.close()
+
+                storage.init_db()
+                conn = sqlite3.connect(temp_db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM runs")
+                self.assertEqual(cursor.fetchone()[0], 1)
+                conn.close()
+            finally:
+                storage.DB_PATH = original_db_path
+
     def test_empty_response_is_treated_as_invalid(self):
         mock_response = MagicMock(status_code=200)
         mock_response.json.return_value = {
             "tasks": [{"status_code": 20000, "result": [{"items": [{"markdown": ""}]}]}]
         }
-        with patch("api.dataforseo.requests.post", return_value=mock_response):
+        with patch("services.dataforseo_client.requests.post", return_value=mock_response):
             result = query_platform("google", "example brand", {"login": "u", "password": "p"}, "example.com", "Example", [], "United States", "en")
         self.assertFalse(result["has_valid_data"])
         self.assertEqual(result["response_status"], "no_data")
 
     def test_authentication_and_timeout_errors_are_categorized(self):
         auth_response = MagicMock(status_code=401)
-        with patch("api.dataforseo.requests.post", return_value=auth_response):
+        with patch("services.dataforseo_client.requests.post", return_value=auth_response):
             auth_result = query_platform("google", "example brand", {"login": "u", "password": "p"}, "example.com", "Example", [], "United States", "en")
         self.assertEqual(auth_result["response_status"], "authentication_error")
 
-        with patch("api.dataforseo.requests.post", side_effect=__import__("requests").exceptions.Timeout()):
+        with patch("services.dataforseo_client.requests.post", side_effect=__import__("requests").exceptions.Timeout()), patch("services.dataforseo_client.time.sleep", return_value=None):
             timeout_result = query_platform("google", "example brand", {"login": "u", "password": "p"}, "example.com", "Example", [], "United States", "en")
         self.assertEqual(timeout_result["response_status"], "timeout")
 
     def test_rate_limit_errors_are_categorized(self):
         rate_limit_response = MagicMock(status_code=429)
-        with patch("api.dataforseo.requests.post", return_value=rate_limit_response), patch("api.dataforseo.time.sleep", return_value=None):
+        with patch("services.dataforseo_client.requests.post", return_value=rate_limit_response), patch("services.dataforseo_client.time.sleep", return_value=None):
             result = query_platform("google", "example brand", {"login": "u", "password": "p"}, "example.com", "Example", [], "United States", "en")
         self.assertEqual(result["response_status"], "rate_limit")
         self.assertFalse(result["has_valid_data"])
@@ -180,6 +334,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
             response = self.client.post("/api/run", json={
                 "credentials": {"login": "demo", "password": "demo"},
                 "config": {
+                    "use_dataforseo": True,
                     "brand_domain": "example.com",
                     "brand_name": "Example",
                     "country": country,
@@ -191,6 +346,494 @@ class TrackerReportHealthTestCase(unittest.TestCase):
             }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
             self.assertEqual(response.status_code, 200, country)
             self.assertEqual(response.get_json()["status"], "success")
+
+    def test_setup_accepts_missing_dataforseo_credentials_when_disabled(self):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "success")
+
+    def test_setup_requires_dataforseo_credentials_when_enabled(self):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": True,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("DataForSEO credentials are required", response.get_json()["message"])
+
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}},
+        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
+    ])
+    @patch("app.query_platform")
+    def test_stream_skips_dataforseo_calls_when_disabled(self, mocked_query_platform, _mocked_provider_bundle):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "high_volume_keywords": ["brand query", "product query"],
+                "brand_keywords": ["comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+
+        stream_response = self.client.get("/stream")
+        self.assertEqual(stream_response.status_code, 200)
+        stream_text = stream_response.get_data(as_text=True)
+        self.assertIn("DataForSEO was disabled for this run", stream_text)
+        mocked_query_platform.assert_not_called()
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        self.assertEqual(report["source_provenance"]["dataforseo"]["status"], "skipped_by_user")
+        self.assertEqual(report["source_provenance"]["crawl"]["status"], "success")
+        self.assertEqual(report["source_provenance"]["pagespeed"]["status"], "success")
+        self.assertEqual(report["source_provenance"]["crux"]["status"], "unavailable")
+        self.assertEqual(report["report_mode"], "partial")
+        self.assertIsNone(report["stat_brand_sov"])
+        self.assertIsNone(report["stat_brand_mentions"])
+        self.assertEqual(report["metric_provenance"]["pagespeed_performance_score"]["value"], 92.0)
+        self.assertEqual(report["metric_provenance"]["crawl_pages_crawled"]["value"], 1)
+        self.assertFalse(bool(get_run(run_id)["use_dataforseo"]))
+        self.assertEqual(get_run(run_id)["high_volume_keywords"], '["brand query", "product query"]')
+        self.assertEqual(get_run(run_id)["brand_keywords"], '["comparison query"]')
+        self.assertEqual(len(get_run_provider_results(run_id)), 5)
+
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
+        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400, "interaction_to_next_paint_ms": 170, "cumulative_layout_shift": 0.08}},
+    ])
+    @patch("app.verify_dataforseo_credentials", return_value={
+        "connected": False,
+        "status": "authentication_failed",
+        "message": "DataForSEO rejected the credentials (HTTP 401).",
+        "provider_payload": {
+            "provider": "dataforseo",
+            "enabled": True,
+            "status": "authentication_failed",
+            "authentication": "failed",
+        },
+    })
+    @patch("app.query_platform", return_value={
+        "text": "",
+        "sources_cited": [],
+        "has_valid_data": False,
+        "response_status": "platform_unavailable",
+        "error_category": "platform_unavailable",
+        "error_message": "The provider was unavailable for this request.",
+        "retry_recommendation": "Check provider status and rerun the audit later.",
+    })
+    def test_dataforseo_enabled_failure_is_marked_failed(self, _mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "demo", "password": "demo"},
+            "config": {
+                "use_dataforseo": True,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.client.get("/stream").get_data(as_text=True)
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        self.assertEqual(report["source_provenance"]["dataforseo"]["status"], "authentication_failed")
+        self.assertEqual(report["source_provenance"]["dataforseo"]["authentication"], "failed")
+        self.assertEqual(report["source_provenance"]["crawl"]["status"], "success")
+        self.assertEqual(report["source_provenance"]["pagespeed"]["status"], "unavailable")
+        self.assertEqual(report["source_provenance"]["crux"]["status"], "success")
+        self.assertEqual(report["report_mode"], "partial")
+        self.assertIsNone(report["metric_provenance"]["pagespeed_performance_score"]["value"])
+        self.assertEqual(report["metric_provenance"]["crux_lcp_ms"]["value"], 2400)
+
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}},
+    ])
+    @patch("app.verify_dataforseo_credentials", return_value={
+        "connected": True,
+        "status": "connected",
+        "message": "DataForSEO credentials verified successfully.",
+        "provider_payload": {
+            "provider": "dataforseo",
+            "enabled": True,
+            "status": "connected",
+            "authentication": "verified",
+            "endpoint": "serp/google/organic/live/advanced",
+        },
+    })
+    @patch("app.query_platform", return_value={
+        "text": "Example brand appears in this verified response.",
+        "sources_cited": ["https://example.com"],
+        "has_valid_data": True,
+        "response_status": "success",
+        "error_category": "success",
+        "error_message": "",
+        "retry_recommendation": "No retry needed.",
+    })
+    def test_dataforseo_valid_credentials_mark_provider_connected_then_success(self, mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "demo", "password": "secret-password"},
+            "config": {
+                "use_dataforseo": True,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.client.get("/stream").get_data(as_text=True)
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        provider_rows = get_run_provider_results(run_id)
+        dataforseo_row = next(row for row in provider_rows if row["provider"] == "dataforseo")
+        self.assertEqual(dataforseo_row["status"], "success")
+        self.assertEqual(report["source_provenance"]["dataforseo"]["status"], "success")
+        self.assertEqual(report["source_provenance"]["dataforseo"]["authentication"], "verified")
+        self.assertEqual(report["stat_brand_mentions"], 15)
+        self.assertEqual(report["stat_brand_sov"], 100.0)
+        self.assertNotIn("secret-password", json.dumps(report))
+        self.assertEqual(mocked_query_platform.call_count, 15)
+
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 88.0}},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2000}},
+    ])
+    @patch("app.verify_dataforseo_credentials", return_value={
+        "connected": False,
+        "status": "rate_limited",
+        "message": "DataForSEO rate limit or quota was reached.",
+        "provider_payload": {
+            "provider": "dataforseo",
+            "enabled": True,
+            "status": "rate_limited",
+            "authentication": "failed",
+        },
+    })
+    @patch("app.query_platform")
+    def test_invalid_dataforseo_verification_stops_follow_up_analysis_calls(self, mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "demo", "password": "bad-password"},
+            "config": {
+                "use_dataforseo": True,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("DataForSEO authentication failed or the provider was unavailable", stream_text)
+        mocked_query_platform.assert_not_called()
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        self.assertEqual(report["source_provenance"]["dataforseo"]["status"], "rate_limited")
+        self.assertIsNone(report["stat_brand_mentions"])
+        self.assertIsNone(report["stat_brand_sov"])
+
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "failed", "reason": "Crawl failed", "payload": None},
+        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None},
+        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
+    ])
+    @patch("app.query_platform")
+    def test_total_factual_collection_failure_remains_technical_failure(self, mocked_query_platform, _mocked_provider_bundle):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.client.get("/stream").get_data(as_text=True)
+        mocked_query_platform.assert_not_called()
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        self.assertEqual(report["report_mode"], "technical_failure")
+        self.assertIsNone(report["metric_provenance"]["pagespeed_performance_score"]["value"])
+        self.assertIsNone(report["metric_provenance"]["crux_lcp_ms"]["value"])
+
+    def test_keyword_categories_are_preserved_in_setup_payload(self):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["https://competitor1.com/path"],
+                "high_volume_keywords": ["best seo software", "ai tracker"],
+                "brand_keywords": ["audilysis review", "audilysis pricing"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as flask_session:
+            config = flask_session["tracker_config"]
+        self.assertEqual(config["brand_domain"], "example.com")
+        self.assertEqual(config["competitors"], ["competitor1.com"])
+        self.assertEqual(config["high_volume_keywords"], ["best seo software", "ai tracker"])
+        self.assertEqual(config["brand_keywords"], ["audilysis review", "audilysis pricing"])
+        self.assertEqual(config["keywords"], ["best seo software", "ai tracker", "audilysis review", "audilysis pricing"])
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False)
+    @patch("services.tracker_interpretation.openai_chat_completion", return_value=(
+        {"id": "resp"},
+        json.dumps({
+            "executive_summary": "Verified summary only.",
+            "key_findings": ["Finding A"],
+            "recommendations": ["Recommendation A"],
+            "action_plan": ["Action A"],
+        }),
+    ))
+    def test_openai_interpretation_uses_verified_data_only_prompt(self, mocked_completion):
+        run_id = self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        report = generate_report_content(run_id)
+        result = generate_tracker_interpretation(report)
+        self.assertEqual(result["status"], "success")
+        prompt = mocked_completion.call_args.args[1]
+        self.assertIn("Use only the supplied verified data.", prompt)
+        self.assertIn("Do not invent, infer or estimate missing factual metrics.", prompt)
+        self.assertIn('"share_of_voice": 100.0', prompt)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_openai_interpretation_unavailable_without_key(self):
+        run_id = self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        report = generate_report_content(run_id)
+        result = generate_tracker_interpretation(report)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["role"], "interpretation_only")
+
+    @patch("app.send_report_email")
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_TRANSCRIPTION", "role": "interpretation_only", "payload": None})
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}},
+    ])
+    def test_auto_email_false_does_not_attempt_smtp(self, _providers, _interpretation, mocked_send_mail):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {
+                "smtp_host": "smtp.gmail.com",
+                "smtp_port": "587",
+                "sender_email": "sender@example.com",
+                "sender_password": "top-secret",
+                "recipient_emails": "a@example.com",
+                "email_automatically": False,
+            },
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.client.get("/stream").get_data(as_text=True)
+        mocked_send_mail.assert_not_called()
+
+    def test_auto_email_true_requires_backend_fields(self):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {
+                "smtp_host": "",
+                "smtp_port": "587",
+                "sender_email": "sender@example.com",
+                "sender_password": "top-secret",
+                "recipient_emails": "a@example.com",
+                "email_automatically": True,
+            },
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Automatic email requires", response.get_json()["message"])
+
+    @patch("app.send_report_email", return_value=(None, "Email authentication failed."))
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_TRANSCRIPTION", "role": "interpretation_only", "payload": None})
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}},
+    ])
+    def test_smtp_failure_does_not_corrupt_successful_run(self, _providers, _interpretation, mocked_send_mail):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {
+                "smtp_host": "smtp.gmail.com",
+                "smtp_port": "587",
+                "sender_email": "sender@example.com",
+                "sender_password": "top-secret",
+                "recipient_emails": "a@example.com, b@example.com",
+                "email_automatically": True,
+            },
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("Auto-email failed", stream_text)
+        self.assertIn("Redirecting to Dashboard", stream_text)
+        mocked_send_mail.assert_called_once()
+        args = mocked_send_mail.call_args.args
+        self.assertEqual(args[0], "smtp.gmail.com")
+        self.assertEqual(str(args[1]), "587")
+        self.assertEqual(args[2], "sender@example.com")
+        self.assertEqual(args[4], "a@example.com, b@example.com")
+        self.assertNotIn("top-secret", stream_text)
+
+    @patch("app.send_report_email", return_value=("a@example.com, b@example.com", None))
+    @patch("app.generate_pdf_report", return_value=b"%PDF-1.4 test report")
+    def test_manual_email_route_uses_explicit_run_id(self, _mocked_pdf, mocked_send_mail):
+        run_a = self._create_run_with_results([
+            {
+                "keyword": "brand a",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com/a"],
+                "competitor_mentions": {},
+                "ai_response_text": "Brand A mention",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        run_b = self._create_run_with_results([
+            {
+                "keyword": "brand b",
+                "platform": "google",
+                "mentioned": False,
+                "mention_position": None,
+                "sources_cited": ["https://example.com/b"],
+                "competitor_mentions": {},
+                "ai_response_text": "Brand B mention",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        with self.client.session_transaction() as flask_session:
+            flask_session["last_run_id"] = run_b
+            flask_session["email_settings"] = {
+                "smtp_host": "smtp.gmail.com",
+                "smtp_port": "587",
+                "sender_email": "sender@example.com",
+                "sender_password": "top-secret",
+                "recipient_emails": "a@example.com, b@example.com",
+            }
+        response = self.client.post(
+            "/api/email-report",
+            json={"run_id": run_a},
+            headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(response.status_code, 200)
+        mocked_send_mail.assert_called_once()
+        self.assertIn("Audilysis-2.0-AI-Mention-Report-example.com-", mocked_send_mail.call_args.args[8])
 
     def test_evaluate_report_data_health_distinguishes_failure_partial_and_full(self):
         technical = evaluate_report_data_health([{"platform": "google", "has_valid_data": False, "response_status": "timeout", "error_category": "timeout", "error_message": "x"}])
