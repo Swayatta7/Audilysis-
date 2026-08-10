@@ -72,7 +72,13 @@
                 <span class="text-xs font-semibold uppercase tracking-wider">Total Checks</span>
                 <i class="fa-solid fa-clipboard-list text-xl text-slate-400"></i>
             </div>
-            <div class="text-2xl font-bold text-slate-900">{{ stat_total_checks }}</div>
+            <div class="text-2xl font-bold text-slate-900">
+                {% if source_provenance.dataforseo and source_provenance.dataforseo.status == 'skipped_by_user' and stat_total_checks is none %}
+                    Requires DataForSEO
+                {% else %}
+                    {{ stat_total_checks if stat_total_checks is not none else 'Data Unavailable' }}
+                {% endif %}
+            </div>
             <p class="text-xs text-slate-500 mt-1">Keywords × Platforms analyzed</p>
             <p class="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Open visibility report</p>
         </a>
@@ -265,7 +271,7 @@
             <div class="flex items-center gap-4 text-xs font-semibold">
                 <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-emerald-500 border border-emerald-600 block"></span> Mentioned</span>
                 <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-rose-500 border border-rose-600 block"></span> Not Mentioned</span>
-                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-slate-300 border border-slate-400 block"></span> No Data/Error</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-slate-300 border border-slate-400 block"></span> Not Run / Error</span>
             </div>
         </div>
         <div class="overflow-x-auto">
@@ -287,7 +293,11 @@
                         {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
                             {% set res = heatmap_data[kw][platform] %}
                             <td class="px-4 py-4 text-center">
-                                {% if res is none %}
+                                {% if res is mapping and res.status == 'skipped_by_user' %}
+                                    <div class="mx-auto w-28 py-1.5 rounded-lg bg-slate-100 border border-slate-300 text-slate-600 text-xs font-semibold flex items-center justify-center gap-1">
+                                        <i class="fa-solid fa-ban text-[10px]"></i> Not Run
+                                    </div>
+                                {% elif res is none %}
                                     <div class="mx-auto w-24 py-1.5 rounded-lg bg-slate-200 border border-slate-300 text-slate-600 text-xs font-semibold flex items-center justify-center gap-1">
                                         <i class="fa-solid fa-circle-exclamation text-[10px]"></i> Error
                                     </div>
@@ -338,7 +348,13 @@
                 <i class="fa-solid fa-chart-pie text-blue-500"></i> Platform Mention Success Rate
             </h3>
             <div class="h-64 relative">
+                {% if source_provenance.dataforseo and source_provenance.dataforseo.status == 'skipped_by_user' and stat_total_checks is none %}
+                <div class="h-full flex items-center justify-center text-slate-400 text-sm">
+                    Enable DataForSEO in a future run to measure AI visibility across platforms.
+                </div>
+                {% else %}
                 <canvas id="platformChart"></canvas>
+                {% endif %}
             </div>
         </div>
 

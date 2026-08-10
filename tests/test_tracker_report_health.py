@@ -666,6 +666,34 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertIn("Do not invent, infer or estimate missing factual metrics.", prompt)
         self.assertIn('"share_of_voice": 100.0', prompt)
 
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False)
+    @patch("services.tracker_interpretation.openai_chat_completion", return_value=(
+        None,
+        "OpenAI API returned HTTP 500: upstream failure",
+    ))
+    def test_openai_upstream_failure_is_not_misclassified_as_invalid_json(self, _mocked_completion):
+        run_id = self._create_run_with_results([
+            {
+                "keyword": "example brand",
+                "platform": "google",
+                "mentioned": True,
+                "mention_position": 1,
+                "sources_cited": ["https://example.com"],
+                "competitor_mentions": {},
+                "ai_response_text": "Example brand appears here.",
+                "response_status": "success",
+                "error_category": "success",
+                "error_message": "",
+                "has_valid_data": True,
+                "retry_recommendation": "No retry needed.",
+            }
+        ])
+        report = generate_report_content(run_id)
+        result = generate_tracker_interpretation(report)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "OpenAI API returned HTTP 500: upstream failure")
+        self.assertNotEqual(result["reason"], "OpenAI returned invalid JSON.")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_openai_interpretation_unavailable_without_key(self):
         run_id = self._create_run_with_results([
@@ -688,6 +716,64 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         result = generate_tracker_interpretation(report)
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["role"], "interpretation_only")
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False)
+    @patch("services.tracker_interpretation.openai_chat_completion", return_value=(
+        None,
+        "OpenAI API returned HTTP 500: upstream failure",
+    ))
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
+        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403: API key restrictions blocked this request.", "payload": None},
+        {"provider": "crux", "status": "unavailable", "reason": "Chrome UX Report returned HTTP 403: API key restrictions blocked this request.", "payload": None},
+    ])
+    @patch("app.query_platform")
+    def test_dataforseo_disabled_provider_failures_preserve_truthful_unavailable_metrics(self, mocked_query_platform, _mocked_provider_bundle, _mocked_completion):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "high_volume_keywords": ["brand query", "product query"],
+                "brand_keywords": ["comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.client.get("/stream").get_data(as_text=True)
+        mocked_query_platform.assert_not_called()
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+
+        report = generate_report_content(run_id)
+        provider_rows = get_run_provider_results(run_id)
+        openai_row = next(row for row in provider_rows if row["provider"] == "openai")
+
+        self.assertEqual(report["report_mode"], "partial")
+        self.assertEqual(report["source_provenance"]["dataforseo"]["status"], "skipped_by_user")
+        self.assertEqual(report["source_provenance"]["pagespeed"]["status"], "unavailable")
+        self.assertEqual(report["source_provenance"]["crux"]["status"], "unavailable")
+        self.assertEqual(report["source_provenance"]["openai"]["status"], "failed")
+        self.assertEqual(report["source_provenance"]["crawl"]["status"], "success")
+        self.assertIsNone(report["stat_total_checks"])
+        self.assertIsNone(report["stat_brand_mentions"])
+        self.assertIsNone(report["stat_brand_sov"])
+        self.assertIsNone(report["stat_api_health"])
+        self.assertEqual(report["metric_provenance"]["crawl_pages_crawled"]["value"], 1)
+        self.assertIn("disabled for this run", report["visibility_summary_text"])
+        self.assertEqual(openai_row["reason"], "OpenAI API returned HTTP 500: upstream failure")
+
+        pdf_text = self._pdf_text_normalized(generate_pdf_report(run_id))
+        self.assertIn("Requires DataForSEO", pdf_text)
+        self.assertIn("Data Unavailable", pdf_text)
+        self.assertIn("Not Run", pdf_text)
+        self.assertIn("AI visibility measurement was not performed because DataForSEO was disabled for this run.", pdf_text)
+        self.assertNotIn("None%", pdf_text)
 
     @patch("app.send_report_email")
     @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_TRANSCRIPTION", "role": "interpretation_only", "payload": None})

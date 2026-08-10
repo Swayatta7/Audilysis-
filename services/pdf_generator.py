@@ -31,7 +31,12 @@ from services.report_health import (
     evaluate_report_data_health,
     is_valid_platform_result,
 )
-from services.run_context import load_run_analysis_context
+from services.run_context import (
+    build_heatmap_data,
+    build_visibility_summary_text,
+    display_total_checks_value,
+    load_run_analysis_context,
+)
 
 # ================= Matplotlib Chart Plotting Functions =================
 
@@ -397,14 +402,12 @@ def generate_pdf_report(run_id):
 
     valid_results = run_context["valid_results"]
     metrics = run_context["metrics"]
-    
-    # Calculations
-    total_checks = len(results)
-    brand_mentions = sum(1 for r in valid_results if r.get("mentioned"))
-    successful_checks = len(valid_results)
+    dataforseo_status = run_context["provider_provenance"]["dataforseo"]["status"]
 
-    brand_sov = round((brand_mentions / successful_checks * 100), 1) if successful_checks > 0 else None
-    api_health = round((successful_checks / total_checks * 100), 1) if total_checks > 0 else None
+    total_checks = display_total_checks_value(run_context["total_checks"], dataforseo_status=dataforseo_status)
+    brand_mentions = run_context["brand_mentions_metric"]["value"]
+    brand_sov = run_context["share_of_voice_metric"]["value"]
+    api_health = run_context["api_health_metric"]["value"]
 
     competitors = []
     if run.get("competitors"):
@@ -469,17 +472,7 @@ def generate_pdf_report(run_id):
         }
     
     keywords = sorted(list(set(r["keyword"] for r in results))) or run.get("keywords", [])
-    
-    heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
-    for r in results:
-        kw = r["keyword"]
-        plat = r["platform"]
-        heatmap_data[kw][plat] = {
-            "mentioned": r["mentioned"],
-            "position": r["mention_position"],
-            "status": r.get("response_status"),
-            "error_message": r.get("error_message"),
-        } if r.get("has_valid_data") else None
+    heatmap_data = build_heatmap_data(results, keywords, dataforseo_status=dataforseo_status)
         
     platform_breakdown = {plat: 0 for plat in PLATFORM_ORDER}
     for r in valid_results:
@@ -691,14 +684,16 @@ def generate_pdf_report(run_id):
     
     # ------------------ PAGE 2: EXECUTIVE SUMMARY & HEATMAP ------------------
     story.append(Paragraph("Executive Summary", h1_style))
-    summary_intro = (
-        f"This report presents brand visibility analysis for <b>{run['brand_name']}</b> across major AI and search engines. "
-        f"We audited the presence of the brand domain <b>{run['brand_domain']}</b> and brand name keywords across Google AI Overviews "
-        f"and conversational LLMs (ChatGPT, Perplexity, Gemini, Claude)."
+    story.append(
+        Paragraph(
+            build_visibility_summary_text(
+                run,
+                report_mode=report_health["report_mode"],
+                dataforseo_status=dataforseo_status,
+            ),
+            body_style,
+        )
     )
-    if report_health["report_mode"] == "partial":
-        summary_intro += " <b>Warning:</b> one or more platform requests failed, so the analytics below are based only on validated responses."
-    story.append(Paragraph(summary_intro, body_style))
     story.append(Spacer(1, 12))
     
     # Summary Grid (2x2 Box Cards)
@@ -708,8 +703,11 @@ def generate_pdf_report(run_id):
             Paragraph("<b>BRAND MENTIONS</b><br/>Mentions across all queries", cell_lbl_style)
         ],
         [
-            Paragraph(f"<font size=18 color='#1e1a4f'><b>{total_checks}</b></font>", cell_val_style),
-            Paragraph(f"<font size=18 color='#10b981'><b>{brand_mentions}</b></font>", cell_val_style)
+            Paragraph(
+                f"<font size=18 color='#1e1a4f'><b>{'Requires DataForSEO' if total_checks is None and dataforseo_status == 'skipped_by_user' else ('Data Unavailable' if total_checks is None else total_checks)}</b></font>",
+                cell_val_style,
+            ),
+            Paragraph(f"<font size=18 color='#10b981'><b>{brand_mentions if brand_mentions is not None else 'Data Unavailable'}</b></font>", cell_val_style)
         ],
         [
             Paragraph("<b>SHARE OF VOICE (SOV)</b><br/>Relative brand presence rate", cell_lbl_style),
@@ -717,7 +715,7 @@ def generate_pdf_report(run_id):
         ],
         [
             Paragraph(f"<font size=18 color='#4361ee'><b>{brand_sov if brand_sov is not None else 'Data Unavailable'}{'%' if brand_sov is not None else ''}</b></font>", cell_val_style),
-            Paragraph(f"<font size=18 color='#f43f5e'><b>{api_health}%</b></font>", cell_val_style)
+            Paragraph(f"<font size=18 color='#f43f5e'><b>{api_health if api_health is not None else 'Data Unavailable'}{'%' if api_health is not None else ''}</b></font>", cell_val_style)
         ]
     ]
     summary_table = Table(summary_data, colWidths=[246, 246])
@@ -766,7 +764,9 @@ def generate_pdf_report(run_id):
             row = [Paragraph(f"<b>{kw}</b>", body_style)]
             for platform in PLATFORM_ORDER:
                 res = heatmap_data[kw][platform]
-                if res is None:
+                if isinstance(res, dict) and res.get("status") == "skipped_by_user":
+                    row.append(Paragraph("Not Run", center_bold_style))
+                elif res is None:
                     row.append(Paragraph("Data Unavailable", center_bold_style))
                 elif res["mentioned"]:
                     pos_lbl = f" (#{int(round(res['position']))})" if res.get('position') else ""
@@ -791,7 +791,9 @@ def generate_pdf_report(run_id):
         for r_idx, kw in enumerate(keywords, start=1):
             for c_idx, platform in enumerate(PLATFORM_ORDER, start=1):
                 res = heatmap_data[kw][platform]
-                if res is None:
+                if isinstance(res, dict) and res.get("status") == "skipped_by_user":
+                    bg = '#cbd5e1'
+                elif res is None:
                     bg = '#94a3b8'
                 elif res["mentioned"]:
                     bg = '#10b981'

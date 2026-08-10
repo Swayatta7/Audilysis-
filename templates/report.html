@@ -64,17 +64,29 @@
                 </div>
                 <div class="p-4 bg-slate-50 rounded-lg">
                     <span class="text-xs text-slate-500 font-semibold uppercase block">Platforms Audited</span>
-                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">5 Platforms</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">
+                        {% if source_provenance.dataforseo and source_provenance.dataforseo.status == 'skipped_by_user' %}
+                            Requires DataForSEO
+                        {% else %}
+                            5 Platforms
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="p-4 bg-slate-50 rounded-lg">
                     <span class="text-xs text-slate-500 font-semibold uppercase block">Brand Mention Rate</span>
-                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">{{ stat_brand_sov }}%</span>
-                    <span class="text-[10px] text-slate-400">Mentioned in {{ stat_brand_mentions }} of {{ stat_total_checks }} checks</span>
+                    <span class="text-xl font-extrabold text-slate-900 mt-1 block">{{ (stat_brand_sov ~ '%') if stat_brand_sov is not none else 'Data Unavailable' }}</span>
+                    <span class="text-[10px] text-slate-400">
+                        {% if source_provenance.dataforseo and source_provenance.dataforseo.status == 'skipped_by_user' %}
+                            Requires DataForSEO
+                        {% else %}
+                            Mentioned in {{ stat_brand_mentions if stat_brand_mentions is not none else 'Data Unavailable' }} of {{ stat_total_checks if stat_total_checks is not none else 'Data Unavailable' }} checks
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="p-4 bg-slate-50 rounded-lg">
                     <span class="text-xs text-slate-500 font-semibold uppercase block">Top Competitor</span>
                     <span class="text-xl font-extrabold text-slate-900 mt-1 block truncate" title="{{ top_competitor_name }}">{{ top_competitor_name }}</span>
-                    <span class="text-[10px] text-slate-400">{{ top_competitor_mentions }} mentions across run</span>
+                    <span class="text-[10px] text-slate-400">{{ (top_competitor_mentions ~ ' mentions across run') if top_competitor_mentions is not none else 'Data Unavailable' }}</span>
                 </div>
             </div>
         </div>
@@ -103,7 +115,9 @@
                             {% for platform in ['google', 'chat_gpt', 'perplexity', 'gemini', 'claude'] %}
                                 {% set res = heatmap_data[kw][platform] %}
                                 <td class="px-4 py-4 text-center">
-                                    {% if res is none %}
+                                    {% if res is mapping and res.status == 'skipped_by_user' %}
+                                        <span class="inline-block px-3 py-1 bg-slate-100 text-slate-600 rounded text-xs font-semibold">Not Run</span>
+                                    {% elif res is none %}
                                         <span class="inline-block px-3 py-1 bg-slate-200 text-slate-600 rounded text-xs font-semibold">Error</span>
                                     {% elif res.mentioned %}
                                         <span class="inline-block px-3 py-1 bg-emerald-500 text-white rounded text-xs font-bold">

@@ -81,7 +81,13 @@ from services.report_health import (
     evaluate_report_data_health,
     is_valid_platform_result,
 )
-from services.run_context import build_metric_record, load_run_analysis_context
+from services.run_context import (
+    build_heatmap_data,
+    build_metric_record,
+    build_visibility_summary_text,
+    display_total_checks_value,
+    load_run_analysis_context,
+)
 from services.tracker_interpretation import generate_tracker_interpretation
 from services.tracker_providers import (
     combine_keywords,
@@ -163,17 +169,8 @@ def generate_report_content(run_id):
     api_health_metric = run_context["api_health_metric"]
 
     keywords = sorted(list(set(r["keyword"] for r in results))) or run.get("keywords", [])
-    heatmap_data = {kw: {plat: None for plat in PLATFORM_ORDER} for kw in keywords}
-    for r in results:
-        kw = r["keyword"]
-        plat = r["platform"]
-        heatmap_data[kw][plat] = {
-            "mentioned": r["mentioned"],
-            "position": r["mention_position"],
-            "status": r.get("response_status"),
-            "error_message": r.get("error_message"),
-            "has_valid_data": r.get("has_valid_data"),
-        } if r.get("has_valid_data") else None
+    dataforseo_status = run_context["provider_provenance"]["dataforseo"]["status"]
+    heatmap_data = build_heatmap_data(results, keywords, dataforseo_status=dataforseo_status)
 
     platform_breakdown = {plat: 0 for plat in PLATFORM_ORDER}
     for r in valid_results:
@@ -207,7 +204,7 @@ def generate_report_content(run_id):
         "platform_breakdown": platform_breakdown,
         "trend_data": trend_data,
         "top_domains": top_domains,
-        "stat_total_checks": total_checks,
+        "stat_total_checks": display_total_checks_value(total_checks, dataforseo_status=dataforseo_status),
         "stat_brand_mentions": brand_mentions_metric["value"],
         "stat_brand_sov": share_of_voice_metric["value"],
         "stat_api_health": api_health_metric["value"],
@@ -234,6 +231,11 @@ def generate_report_content(run_id):
         "openai_interpretation": run_context.get("openai_interpretation"),
         "top_competitor_name": top_competitor_name,
         "top_competitor_mentions": top_competitor_mentions,
+        "visibility_summary_text": build_visibility_summary_text(
+            run,
+            report_mode=run_context["report_mode"],
+            dataforseo_status=dataforseo_status,
+        ),
         "source_provenance": {
             **run_context["provider_provenance"],
         },
@@ -902,13 +904,14 @@ def stream():
                             </tr>
                             <tr>
                                 <td style="padding: 8px 0; font-weight: bold; color: #475569;">Total Checks:</td>
-                                <td style="padding: 8px 0; text-align: right;">{report_data['stat_total_checks']}</td>
+                                <td style="padding: 8px 0; text-align: right;">{"Requires DataForSEO" if report_data['source_provenance']['dataforseo']['status'] == 'skipped_by_user' and report_data['stat_total_checks'] is None else ("Data Unavailable" if report_data['stat_total_checks'] is None else report_data['stat_total_checks'])}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 8px 0; font-weight: bold; color: #475569;">Top Competitor:</td>
                                 <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({"Data Unavailable" if report_data['top_competitor_mentions'] is None else str(report_data['top_competitor_mentions']) + " mentions"})</td>
                             </tr>
                         </table>
+                        <p style="margin-top: 18px; font-size: 13px; color: #475569;">{report_data['visibility_summary_text']}</p>
                         <p style="margin-top: 24px; font-size: 14px;">The complete interactive PDF report is attached to this email. You can open and view it in any PDF reader.</p>
                     </body>
                     </html>
@@ -1503,13 +1506,14 @@ def api_email_report():
                 </tr>
                 <tr>
                     <td style="padding: 8px 0; font-weight: bold; color: #475569;">Total Checks:</td>
-                    <td style="padding: 8px 0; text-align: right;">{report_data['stat_total_checks']}</td>
+                    <td style="padding: 8px 0; text-align: right;">{"Requires DataForSEO" if report_data['source_provenance']['dataforseo']['status'] == 'skipped_by_user' and report_data['stat_total_checks'] is None else ("Data Unavailable" if report_data['stat_total_checks'] is None else report_data['stat_total_checks'])}</td>
                 </tr>
                 <tr>
                     <td style="padding: 8px 0; font-weight: bold; color: #475569;">Top Competitor:</td>
                     <td style="padding: 8px 0; text-align: right;">{report_data['top_competitor_name']} ({"Data Unavailable" if report_data['top_competitor_mentions'] is None else str(report_data['top_competitor_mentions']) + " mentions"})</td>
                 </tr>
             </table>
+            <p style="margin-top: 18px; font-size: 13px; color: #475569;">{report_data['visibility_summary_text']}</p>
             <p style="margin-top: 24px; font-size: 14px;">Your complete Audilysis 2.0 report is attached as a PDF file. You can view it in any PDF reader.</p>
         </body>
         </html>

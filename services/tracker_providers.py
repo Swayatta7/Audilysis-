@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from urllib.parse import urlparse
 
@@ -13,6 +14,36 @@ from agents.runtime_config import get_env_value
 PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 CRUX_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord"
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
+logger = logging.getLogger(__name__)
+
+
+def _safe_google_error_detail(response: requests.Response, provider: str) -> tuple[str, str]:
+    classification = "provider_rejected"
+    detail = f"{provider} returned HTTP {response.status_code}."
+    try:
+        payload = response.json()
+    except ValueError:
+        return classification, detail
+
+    error = payload.get("error") or {}
+    raw_message = str(error.get("message") or payload.get("message") or "").strip()
+    lowered = raw_message.lower()
+    safe_message = " ".join(raw_message.split())[:240] if raw_message else ""
+
+    if "api has not been used" in lowered or "is not enabled" in lowered:
+        classification = "api_not_enabled"
+    elif "api key not valid" in lowered or "invalid api key" in lowered:
+        classification = "invalid_api_key"
+    elif "quota" in lowered or "rate limit" in lowered:
+        classification = "quota_or_rate_limited"
+    elif "referer" in lowered or "ip address" in lowered or "restriction" in lowered or "caller" in lowered:
+        classification = "api_key_restricted"
+    elif response.status_code in {401, 403}:
+        classification = "authentication_or_authorization_failed"
+
+    if safe_message:
+        detail = f"{provider} returned HTTP {response.status_code}: {safe_message}"
+    return classification, detail
 
 
 def normalize_domain(value: str) -> str | None:
@@ -122,11 +153,29 @@ def collect_pagespeed_provider(website_url: str) -> dict:
             timeout=60,
         )
         if response.status_code != 200:
+            classification, detail = _safe_google_error_detail(response, "PageSpeed")
+            logger.warning(
+                "pagespeed_provider_http_error function=collect_pagespeed_provider method=GET endpoint=%s key_present=%s status=%s classification=%s detail=%s",
+                PAGESPEED_ENDPOINT,
+                bool(api_key),
+                response.status_code,
+                classification,
+                detail,
+            )
             return {
                 "provider": "pagespeed",
                 "status": "unavailable" if response.status_code in {401, 403, 429} else "failed",
-                "reason": f"PageSpeed returned HTTP {response.status_code}.",
-                "payload": None,
+                "reason": detail,
+                "payload": {
+                    "diagnostics": {
+                        "function": "collect_pagespeed_provider",
+                        "endpoint": PAGESPEED_ENDPOINT,
+                        "method": "GET",
+                        "http_status": response.status_code,
+                        "api_key_configured": True,
+                        "classification": classification,
+                    }
+                },
             }
         payload = response.json()
         lighthouse = payload.get("lighthouseResult", {})
@@ -178,11 +227,29 @@ def collect_crux_provider(website_url: str) -> dict:
                 "payload": None,
             }
         if response.status_code != 200:
+            classification, detail = _safe_google_error_detail(response, "Chrome UX Report")
+            logger.warning(
+                "crux_provider_http_error function=collect_crux_provider method=POST endpoint=%s key_present=%s status=%s classification=%s detail=%s",
+                CRUX_ENDPOINT,
+                bool(api_key),
+                response.status_code,
+                classification,
+                detail,
+            )
             return {
                 "provider": "crux",
                 "status": "unavailable" if response.status_code in {401, 403, 429} else "failed",
-                "reason": f"Chrome UX Report returned HTTP {response.status_code}.",
-                "payload": None,
+                "reason": detail,
+                "payload": {
+                    "diagnostics": {
+                        "function": "collect_crux_provider",
+                        "endpoint": CRUX_ENDPOINT,
+                        "method": "POST",
+                        "http_status": response.status_code,
+                        "api_key_configured": True,
+                        "classification": classification,
+                    }
+                },
             }
         record = response.json().get("record", {})
         metrics = record.get("metrics", {})

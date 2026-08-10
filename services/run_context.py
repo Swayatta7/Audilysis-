@@ -26,6 +26,63 @@ def build_metric_record(
     }
 
 
+def is_dataforseo_skipped(status: str | None) -> bool:
+    return (status or "").strip().lower() == "skipped_by_user"
+
+
+def display_total_checks_value(total_checks: int, *, dataforseo_status: str | None) -> int | None:
+    if is_dataforseo_skipped(dataforseo_status) and total_checks == 0:
+        return None
+    return total_checks
+
+
+def build_heatmap_data(results: list[dict], keywords: list[str], *, dataforseo_status: str | None) -> dict:
+    skipped = is_dataforseo_skipped(dataforseo_status) and not results
+    heatmap = {
+        kw: {
+            plat: (
+                {
+                    "status": "skipped_by_user",
+                    "display": "Not Run",
+                    "reason": "DataForSEO was disabled for this run.",
+                }
+                if skipped
+                else None
+            )
+            for plat in PLATFORM_ORDER
+        }
+        for kw in keywords
+    }
+    for row in results:
+        kw = row["keyword"]
+        plat = row["platform"]
+        heatmap[kw][plat] = {
+            "mentioned": row["mentioned"],
+            "position": row["mention_position"],
+            "status": row.get("response_status"),
+            "error_message": row.get("error_message"),
+            "has_valid_data": row.get("has_valid_data"),
+        } if row.get("has_valid_data") else None
+    return heatmap
+
+
+def build_visibility_summary_text(run: dict, *, report_mode: str, dataforseo_status: str | None) -> str:
+    if is_dataforseo_skipped(dataforseo_status):
+        return (
+            "AI visibility measurement was not performed because DataForSEO was disabled for this run. "
+            "The report contains verified data from the remaining enabled providers."
+        )
+
+    summary = (
+        f"This report presents brand visibility analysis for <b>{run['brand_name']}</b> across major AI and search engines. "
+        f"We audited the presence of the brand domain <b>{run['brand_domain']}</b> and brand name keywords across Google AI Overviews "
+        "and conversational LLMs (ChatGPT, Perplexity, Gemini, Claude)."
+    )
+    if report_mode == "partial":
+        summary += " <b>Warning:</b> one or more platform requests failed, so the analytics below are based only on validated responses."
+    return summary
+
+
 def _safe_timestamp(raw: str | None) -> str | None:
     if not raw:
         return None

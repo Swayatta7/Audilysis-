@@ -37,6 +37,25 @@ def build_tracker_interpretation_input(report_data: dict) -> dict:
     }
 
 
+def _parse_json_content(content: str) -> dict:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
 def generate_tracker_interpretation(report_data: dict) -> dict:
     api_key = get_env_value("OPENAI_API_KEY")
     if not api_key:
@@ -57,7 +76,15 @@ def generate_tracker_interpretation(report_data: dict) -> dict:
         + json.dumps(verified_dataset, ensure_ascii=True)
     )
     try:
-        _response, content = openai_chat_completion(api_key, prompt, model="gpt-4o-mini")
+        response_payload, content = openai_chat_completion(api_key, prompt, model="gpt-4o-mini")
+        if response_payload is None:
+            return {
+                "provider": "openai",
+                "status": "failed",
+                "reason": (content or "OpenAI interpretation request failed.").strip()[:240],
+                "role": "interpretation_only",
+                "payload": None,
+            }
         if not content:
             return {
                 "provider": "openai",
@@ -66,7 +93,7 @@ def generate_tracker_interpretation(report_data: dict) -> dict:
                 "role": "interpretation_only",
                 "payload": None,
             }
-        parsed = json.loads(content)
+        parsed = _parse_json_content(content)
         payload = {
             "executive_summary": parsed.get("executive_summary") or "Data Unavailable",
             "key_findings": parsed.get("key_findings") or [],
