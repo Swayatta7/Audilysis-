@@ -32,6 +32,7 @@ from services.report_health import (
     is_valid_platform_result,
 )
 from services.run_context import (
+    SEO_AGENT_STATUS_META,
     build_heatmap_data,
     build_visibility_summary_text,
     display_total_checks_value,
@@ -730,6 +731,33 @@ def generate_pdf_report(run_id):
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 24))
+
+    completed_agent_results = run_context.get("completed_agent_results") or []
+    if completed_agent_results:
+        agent_label_map = dict(SEO_AGENT_STATUS_META)
+        story.append(Paragraph("Completed SEO Agent Outputs", h1_style))
+        story.append(Paragraph("Only agents explicitly completed for this run are listed here. Unrun workflows are not represented as completed analysis.", body_style))
+        story.append(Spacer(1, 8))
+        agent_rows = [["Agent", "Status", "Source", "Summary"]]
+        for row in completed_agent_results[:8]:
+            result = row.get("result") or {}
+            provenance = row.get("provenance") or {}
+            agent_id = row.get("agent_name") or provenance.get("agent_id") or result.get("agent_id") or ""
+            agent_rows.append([
+                html.escape(str(provenance.get("agent_label") or result.get("agent") or agent_label_map.get(agent_id) or agent_id)),
+                html.escape(str(row.get("status") or "completed")),
+                html.escape(str(provenance.get("data_source") or (result.get("data") or {}).get("data_source") or "run_scoped_agent_result")),
+                html.escape(str(result.get("summary") or result.get("message") or "Completed agent result stored for this run."))[:260],
+            ])
+        agent_table = Table(agent_rows, colWidths=[110, 70, 110, 214])
+        agent_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), HexColor('#f1f5f9')),
+            ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#e2e8f0')),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        story.append(agent_table)
+        story.append(Spacer(1, 24))
 
     story.append(Paragraph("Platform Response Health", h1_style))
     platform_rows = [["Platform", "Status", "Error Category", "Safe Message"]]

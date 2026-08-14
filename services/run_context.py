@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 import json
 
-from db.storage import get_competitor_metrics, get_mention_results, get_run, get_run_for_user, get_run_provider_results
+from db.storage import get_agent_results_for_run, get_competitor_metrics, get_mention_results, get_run, get_run_for_user, get_run_provider_results
 from services.report_health import PLATFORM_LABELS, PLATFORM_ORDER, evaluate_report_data_health, is_valid_platform_result
 
 
@@ -102,6 +102,55 @@ def _parse_json_list(raw: str | None) -> list[str]:
     return [str(item).strip() for item in parsed if str(item).strip()]
 
 
+SEO_AGENT_STATUS_META = [
+    ("technical_audit", "Technical Audit Agent"),
+    ("competitor_analysis", "Competitor Analysis Agent"),
+    ("keyword_research", "Keyword Research Agent"),
+    ("keyword_clustering", "Keyword Clustering Agent"),
+    ("content_gap", "Content Gap Agent"),
+    ("serp_analysis", "SERP Analysis Agent"),
+    ("rank_tracking", "Rank Tracking Agent"),
+    ("on_page_optimizer", "On-page Optimizer Agent"),
+    ("schema_agent", "Schema Agent"),
+    ("internal_linking", "Internal Linking Agent"),
+    ("backlink_prospecting", "Backlink Prospecting Agent"),
+    ("outreach", "Outreach Agent"),
+    ("backlink_verification", "Backlink Verification Agent"),
+    ("weekly_report", "Weekly Report Agent"),
+    ("monthly_report", "Monthly Report Agent"),
+    ("strategy", "Strategy Agent"),
+]
+
+
+def _normalize_agent_status(status: str | None) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"completed", "success"}:
+        return "completed"
+    if normalized in {"failed", "error"}:
+        return "failed"
+    if normalized == "partial":
+        return "partial"
+    return "not_run"
+
+
+def _build_agent_statuses(agent_results: list[dict]) -> dict:
+    latest = {}
+    for row in agent_results:
+        latest.setdefault(row.get("agent_name"), row)
+    statuses = {}
+    for agent_id, label in SEO_AGENT_STATUS_META:
+        row = latest.get(agent_id)
+        status = _normalize_agent_status(row.get("status") if row else None)
+        statuses[agent_id] = {
+            "agent_id": agent_id,
+            "label": label,
+            "status": status,
+            "updated_at": row.get("updated_at") if row else None,
+            "result_id": row.get("id") if row else None,
+        }
+    return statuses
+
+
 def _provider_metric_record(provider_map: dict, provider: str, key: str, run_id: int, *, reason: str) -> dict:
     record = provider_map.get(provider) or {}
     payload = record.get("payload") or {}
@@ -136,6 +185,8 @@ def load_run_analysis_context(run_id: int | str | None, *, user_id: int | None =
     results = get_mention_results(normalized_run_id)
     metrics = get_competitor_metrics(normalized_run_id)
     provider_rows = get_run_provider_results(normalized_run_id)
+    agent_results = get_agent_results_for_run(normalized_run_id, user_id=user_id)
+    agent_statuses = _build_agent_statuses(agent_results)
     provider_result_map = {row["provider"]: row for row in provider_rows}
     report_health = evaluate_report_data_health(results)
     valid_results = [row for row in results if is_valid_platform_result(row)]
@@ -332,6 +383,16 @@ def load_run_analysis_context(run_id: int | str | None, *, user_id: int | None =
         "results": results,
         "metrics": metrics,
         "provider_results": provider_rows,
+        "agent_results": agent_results,
+        "agent_statuses": agent_statuses,
+        "agent_status_summary": {
+            "available": len(SEO_AGENT_STATUS_META),
+            "completed": sum(1 for item in agent_statuses.values() if item["status"] == "completed"),
+            "failed": sum(1 for item in agent_statuses.values() if item["status"] == "failed"),
+            "partial": sum(1 for item in agent_statuses.values() if item["status"] == "partial"),
+            "not_run": sum(1 for item in agent_statuses.values() if item["status"] == "not_run"),
+        },
+        "completed_agent_results": [row for row in agent_results if _normalize_agent_status(row.get("status")) == "completed"],
         "valid_results": valid_results,
         "report_health": report_health,
         "report_mode": effective_report_mode,

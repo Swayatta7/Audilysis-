@@ -131,11 +131,83 @@ class TechnicalAuditAgent(BaseAgent):
     def _issue_group(self, title: str, severity: str, affected_pages: list[str], affected_count: int, examples: list[str], summary: str, fix: str, impact: str, eta: str) -> dict:
         return {"issue": title, "severity": severity, "affected_pages": len(affected_pages), "affected_count": affected_count, "examples": examples[:3], "summary": summary, "recommended_fix": fix, "estimated_seo_impact": impact, "estimated_time_to_fix": eta}
 
+    def _truthy(self, value) -> bool:
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _stored_provider_result(self, input_data: dict) -> dict | None:
+        if self._truthy(input_data.get("force_refresh")):
+            return None
+        run_context = input_data.get("_tracker_run_context") or {}
+        provider_rows = run_context.get("provider_results") or []
+        provider_map = {row.get("provider"): row for row in provider_rows}
+        crawl = provider_map.get("crawl") or {}
+        if crawl.get("status") != "success":
+            return None
+        pagespeed = provider_map.get("pagespeed") or {}
+        crux = provider_map.get("crux") or {}
+        crawl_payload = crawl.get("payload") or {}
+        pagespeed_payload = pagespeed.get("payload") or {}
+        crux_payload = crux.get("payload") or {}
+        pagespeed_available = pagespeed.get("status") == "success"
+        crux_available = crux.get("status") == "success"
+        score_parts = [
+            crawl_payload.get("indexable_pages") is not None,
+            crawl_payload.get("title_present") is True,
+            crawl_payload.get("meta_description_present") is True,
+            crawl_payload.get("https") is True,
+            pagespeed_payload.get("performance_score") is not None,
+            crux_payload.get("largest_contentful_paint_ms") is not None,
+        ]
+        score = round((sum(1 for item in score_parts if item) / len(score_parts)) * 100)
+        score_status = self._score_status(score)
+        warnings = []
+        if not pagespeed_available:
+            warnings.append({"metric": "PageSpeed", "status": pagespeed.get("status", "unavailable"), "reason": pagespeed.get("reason") or "PageSpeed data unavailable for this run."})
+        if not crux_available:
+            warnings.append({"metric": "CrUX", "status": crux.get("status", "unavailable"), "reason": crux.get("reason") or "CrUX data unavailable for this run."})
+        return self.build_structured_response(
+            input_data,
+            f"Technical SEO audit reused verified tracker provider data for run #{run_context.get('run_id')}.",
+            ["Use Force Refresh if you need a fresh crawl or fresh Google provider calls."],
+            {
+                "overview": {
+                    "pages_crawled": crawl_payload.get("pages_crawled"),
+                    "indexable_pages": crawl_payload.get("indexable_pages"),
+                    "score": score,
+                    "score_status": score_status,
+                    "source_run_id": run_context.get("run_id"),
+                },
+                "provider_metrics": {
+                    "crawl": crawl_payload,
+                    "pagespeed": pagespeed_payload if pagespeed_available else None,
+                    "crux": crux_payload if crux_available else None,
+                },
+                "checks": [
+                    {"label": "HTTPS Enabled", "passed": crawl_payload.get("https"), "detail": "Reused from tracker crawl provider."},
+                    {"label": "Title Present", "passed": crawl_payload.get("title_present"), "detail": "Reused from tracker crawl provider."},
+                    {"label": "Meta Description Present", "passed": crawl_payload.get("meta_description_present"), "detail": "Reused from tracker crawl provider."},
+                    {"label": "H1 Count", "passed": (crawl_payload.get("h1_count") or 0) > 0, "detail": crawl_payload.get("h1_count")},
+                ],
+                "warnings": warnings,
+                "data_sources": [
+                    self._source("Tracker Crawl Provider", True, "Stored provider row for this run."),
+                    self._source("Google PageSpeed Insights", pagespeed_available, pagespeed.get("reason") or "Stored provider row for this run."),
+                    self._source("Chrome UX Report", crux_available, crux.get("reason") or "Stored provider row for this run."),
+                ],
+                "api_used": ["Stored Tracker Provider Results"],
+                "data_source": "stored_run_provider_data",
+                "missing_api_keys": [],
+            },
+        )
+
     def run(self, input_data: dict) -> dict:
         started = time.perf_counter()
         website_url = ensure_url(input_data.get("website_url") or "")
         if not website_url:
             return self.missing_input_response("website_url", input_data)
+        stored_result = self._stored_provider_result(input_data)
+        if stored_result:
+            return stored_result
 
         raw_crawl_depth = input_data.get("crawl_depth")
         crawl_depth = 1 if raw_crawl_depth in (None, "") else max(0, min(int(raw_crawl_depth), 2))

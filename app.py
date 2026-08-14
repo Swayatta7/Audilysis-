@@ -16,7 +16,7 @@ from werkzeug.exceptions import HTTPException
 # Imports from local packages
 from db.storage import (
     init_db, create_run, insert_mention_result, insert_competitor_metrics,
-    get_negative_keyword_report, upsert_run_provider_result,
+    get_negative_keyword_report, upsert_agent_result, upsert_run_provider_result,
     get_run, get_run_for_user, get_mention_results, get_competitor_metrics, get_trend_data,
     list_negative_keyword_audit,
 )
@@ -229,6 +229,9 @@ def generate_report_content(run_id):
             "brand_keywords": run.get("brand_keywords", []),
         },
         "openai_interpretation": run_context.get("openai_interpretation"),
+        "agent_statuses": run_context.get("agent_statuses", {}),
+        "agent_status_summary": run_context.get("agent_status_summary", {}),
+        "completed_agent_results": run_context.get("completed_agent_results", []),
         "top_competitor_name": top_competitor_name,
         "top_competitor_mentions": top_competitor_mentions,
         "visibility_summary_text": build_visibility_summary_text(
@@ -260,6 +263,65 @@ def get_current_user_id() -> int | None:
     if not user:
         return None
     return int(user["id"])
+
+
+SENSITIVE_RESULT_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "authorization_header",
+    "basic_auth",
+    "cookie",
+    "cookiefile",
+    "cookies",
+    "credentials",
+    "password",
+    "proxy",
+    "proxy_url",
+    "refresh_token",
+    "secret",
+    "sender_password",
+    "smtp_password",
+    "token",
+}
+
+
+def sanitize_agent_result_payload(value):
+    """Remove secrets from agent output before run-scoped persistence."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if any(sensitive in normalized for sensitive in SENSITIVE_RESULT_KEYS):
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = sanitize_agent_result_payload(item)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_agent_result_payload(item) for item in value]
+    return value
+
+
+def persist_agent_run_result(run_id, user_id, agent_id, result):
+    if not run_id or user_id is None or not agent_id:
+        return
+    status = "completed" if result.get("success") is True and result.get("status") != "error" else "failed"
+    safe_result = sanitize_agent_result_payload(result)
+    provenance = {
+        "agent_id": agent_id,
+        "agent_label": result.get("agent") or result.get("agent_name") or agent_id,
+        "status": status,
+        "data_source": (result.get("data") or {}).get("data_source") or result.get("data_source"),
+        "api_used": (result.get("data") or {}).get("api_used") or result.get("api_used") or [],
+    }
+    upsert_agent_result(
+        run_id=int(run_id),
+        user_id=int(user_id),
+        agent_name=agent_id,
+        status=status,
+        result=safe_result,
+        provenance=sanitize_agent_result_payload(provenance),
+    )
 
 
 def build_dashboard_not_found_context(requested_run_id: int | None) -> dict:
@@ -313,6 +375,9 @@ def build_dashboard_not_found_context(requested_run_id: int | None) -> dict:
         "report_mode": "technical_failure",
         "valid_results": [],
         "openai_interpretation": None,
+        "agent_statuses": {},
+        "agent_status_summary": {"available": 0, "completed": 0, "failed": 0, "partial": 0, "not_run": 0},
+        "completed_agent_results": [],
         "top_competitor_name": "None",
         "top_competitor_mentions": None,
         "email_enabled": False,
@@ -1366,6 +1431,8 @@ def run_agent_route():
     except Exception:
         app.logger.exception("run_agent_route_failed agent=%s", agent_id)
         return json_error_response("Server error", 500, "server_error")
+    if payload.get("run_id"):
+        persist_agent_run_result(payload.get("run_id"), get_current_user_id(), agent_id, result)
     if result.get("status") == "error" and not result.get("success"):
         return jsonify(result), 400
     return jsonify(result)

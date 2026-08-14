@@ -34,6 +34,10 @@ class KeywordClusteringAgent(BaseAgent):
 
     def run(self, input_data: dict) -> dict:
         raw = input_data.get("keyword_list")
+        run_context = input_data.get("_tracker_run_context") or {}
+        run_data = run_context.get("run") or {}
+        if not raw:
+            raw = (run_data.get("high_volume_keywords") or []) + (run_data.get("brand_keywords") or [])
         parsed, total_received, duplicates_removed, invalid_rows_removed = self._parse_keyword_list(raw)
         if len(parsed) < 2:
             return self.missing_input_response("keyword_list", input_data, "Provide at least 2 valid keywords, one per line.")
@@ -89,6 +93,12 @@ class KeywordClusteringAgent(BaseAgent):
                 "business_goal": input_data.get("business_goal") or "",
                 "similarity_threshold": threshold,
                 "minimum_cluster_size": minimum_cluster_size,
+                "source_run_id": run_context.get("run_id"),
+            },
+            "tracker_keyword_groups": {
+                "high_volume_keywords": run_data.get("high_volume_keywords") or [],
+                "brand_keywords": run_data.get("brand_keywords") or [],
+                "used_when_keyword_list_missing": bool(run_context and not input_data.get("keyword_list")),
             },
             "total_keywords_received": total_received,
             "valid_keywords": len(parsed),

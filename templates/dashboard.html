@@ -200,6 +200,34 @@
         </div>
     </div>
 
+    <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div class="p-5 border-b border-slate-100 bg-slate-50 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+                <h3 class="font-bold text-slate-900 flex items-center gap-2">
+                    <i class="fa-solid fa-list-check text-indigo-500"></i>
+                    SEO Agent Status for This Run
+                </h3>
+                <p class="mt-1 text-sm text-slate-500">Workflow count is separate from completed analysis.</p>
+            </div>
+            <div class="flex flex-wrap gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-600">
+                <span class="rounded-full bg-slate-100 px-3 py-1">Available {{ agent_status_summary.available or agent_counts.SEO }}</span>
+                <span class="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">Completed {{ agent_status_summary.completed or 0 }}</span>
+                <span class="rounded-full bg-rose-50 px-3 py-1 text-rose-700">Failed {{ agent_status_summary.failed or 0 }}</span>
+                <span class="rounded-full bg-slate-100 px-3 py-1">Not Run {{ agent_status_summary.not_run or agent_counts.SEO }}</span>
+            </div>
+        </div>
+        <div class="grid gap-3 p-5 md:grid-cols-2 xl:grid-cols-4">
+            {% for agent_id, agent_status in agent_statuses.items() %}
+            <a href="/agents?agent={{ agent_id }}&run_id={{ run.id }}" class="rounded-lg border border-slate-200 bg-slate-50 p-3 hover:border-indigo-300 transition">
+                <div class="text-sm font-semibold text-slate-900">{{ agent_status.label }}</div>
+                <div class="mt-2 text-xs font-semibold uppercase tracking-[0.16em] {% if agent_status.status == 'completed' %}text-emerald-700{% elif agent_status.status == 'failed' %}text-rose-700{% elif agent_status.status == 'partial' %}text-amber-700{% else %}text-slate-500{% endif %}">
+                    {{ agent_status.status|replace('_', ' ') }}
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         <a href="/agents?agent=technical_audit&run_id={{ run.id }}" class="block bg-white border border-slate-200 rounded-xl p-5 shadow-sm hover:border-indigo-300 hover:shadow-md transition">
             <div class="flex items-center justify-between text-slate-400 mb-2">

@@ -9,10 +9,19 @@ from unittest.mock import patch
 import requests
 from werkzeug.security import generate_password_hash
 
-from app import app
+from app import app, generate_report_content
 from agents.agent_manager import CONTENT_GROUP, PPC_GROUP, SEO_GROUP, SOCIAL_GROUP, get_all_agents
 from agents.base_agent import BaseAgent
-from db.storage import create_run, create_user, get_user_by_email, init_db, insert_mention_result
+from db.storage import (
+    create_run,
+    create_user,
+    get_agent_results_for_run,
+    get_user_by_email,
+    init_db,
+    insert_mention_result,
+    upsert_agent_result,
+    upsert_run_provider_result,
+)
 from services.pdf_generator import generate_pdf_report
 
 
@@ -306,6 +315,41 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertIn(str(len(grouped[SOCIAL_GROUP])).encode(), response.data)
         self.assertEqual(len(grouped[PPC_GROUP]), 1)
 
+    def test_run_agent_persists_owned_agent_result_and_dashboard_status(self):
+        run_id = create_run(
+            'example.com',
+            'Example',
+            'United States',
+            'en',
+            ['competitor1.com'],
+            high_volume_keywords=['technical seo audit', 'seo checklist'],
+            brand_keywords=['example seo'],
+            user_id=self.user_id,
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'keyword_clustering',
+            'run_id': run_id,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        rows = get_agent_results_for_run(run_id, user_id=self.user_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['agent_name'], 'keyword_clustering')
+        self.assertEqual(rows[0]['status'], 'completed')
+        self.assertNotIn('password', json.dumps(rows[0]).lower())
+
+        report = generate_report_content(run_id)
+        self.assertEqual(report['agent_statuses']['keyword_clustering']['status'], 'completed')
+        self.assertEqual(report['agent_status_summary']['completed'], 1)
+        self.assertEqual(report['agent_status_summary']['not_run'], len(get_all_agents()[SEO_GROUP]) - 1)
+
+        dashboard = self.client.get(f'/dashboard?run_id={run_id}')
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn(b'SEO Agent Status for This Run', dashboard.data)
+        self.assertIn(b'Keyword Clustering Agent', dashboard.data)
+        self.assertIn(b'Completed', dashboard.data)
+
     def test_run_routes_are_isolated_per_authenticated_user(self):
         run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
 
@@ -335,6 +379,25 @@ class AgentRoutesTestCase(unittest.TestCase):
         )
         self.assertEqual(run_agent_response.status_code, 404)
         self.assertEqual(run_agent_response.get_json()['error'], 'Run not found')
+
+    def test_agent_results_are_isolated_per_authenticated_user(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        upsert_agent_result(
+            run_id,
+            self.user_id,
+            'technical_audit',
+            'completed',
+            {'success': True, 'summary': 'Owned result'},
+            {'agent_id': 'technical_audit'},
+        )
+
+        other_user = get_user_by_email("other-agent-result-tests@example.com")
+        if not other_user:
+            other_user_id = create_user("other-agent-result-tests@example.com", generate_password_hash("Password123"))
+            other_user = {"id": other_user_id, "email": "other-agent-result-tests@example.com"}
+
+        self.assertEqual(len(get_agent_results_for_run(run_id, user_id=self.user_id)), 1)
+        self.assertEqual(get_agent_results_for_run(run_id, user_id=other_user["id"]), [])
 
     def test_all_registered_agents_have_required_metadata_and_run(self):
         grouped = get_all_agents()
@@ -642,6 +705,38 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertIn('technical_metrics', data['data'])
         self.assertIn('priority_fixes', data['data'])
 
+    @patch('agents.technical_audit.crawl_site')
+    def test_technical_audit_reuses_run_provider_data_without_fresh_crawl(self, crawl_site_mock):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['competitor1.com'], user_id=self.user_id)
+        upsert_run_provider_result(run_id, 'crawl', 'success', {
+            'pages_crawled': 3,
+            'indexable_pages': 2,
+            'https': True,
+            'title_present': True,
+            'meta_description_present': True,
+            'h1_count': 1,
+        })
+        upsert_run_provider_result(run_id, 'pagespeed', 'success', {
+            'performance_score': 91.0,
+            'seo_score': 96.0,
+        })
+        upsert_run_provider_result(run_id, 'crux', 'success', {
+            'largest_contentful_paint_ms': 2200,
+            'interaction_to_next_paint_ms': 150,
+        })
+
+        response = self.client.post('/run-agent', json={
+            'agent': 'technical_audit',
+            'run_id': run_id,
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['data']['data_source'], 'stored_run_provider_data')
+        self.assertEqual(data['data']['overview']['source_run_id'], run_id)
+        self.assertEqual(data['data']['provider_metrics']['crawl']['pages_crawled'], 3)
+        crawl_site_mock.assert_not_called()
+
     def test_api_backed_agents_fail_honestly_without_keys(self):
         cases = {
             'serp_analysis': ('DATAFORSEO_LOGIN', {'keyword': 'seo agency'}),
@@ -702,6 +797,56 @@ class AgentRoutesTestCase(unittest.TestCase):
         self.assertIn('Competitors Analyzed', text_output)
         self.assertIn('https://competitor1.com', text_output)
         self.assertIn('AI Visibility Summary', text_output)
+
+    def test_pdf_report_includes_completed_persisted_agent_outputs_only(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', ['https://competitor1.com'], user_id=self.user_id)
+        insert_mention_result(
+            run_id=run_id,
+            keyword='example brand',
+            platform='google',
+            mentioned=True,
+            mention_position=1,
+            sources_cited=['https://example.com'],
+            competitor_mentions={},
+            ai_response_text='Example brand is recommended here.',
+            response_status='success',
+            error_category='success',
+            error_message='',
+            has_valid_data=True,
+            retry_recommendation='No retry needed.',
+        )
+        upsert_agent_result(
+            run_id,
+            self.user_id,
+            'technical_audit',
+            'completed',
+            {'success': True, 'summary': 'Completed technical audit output.'},
+            {'agent_id': 'technical_audit', 'data_source': 'stored_run_provider_data'},
+        )
+        upsert_agent_result(
+            run_id,
+            self.user_id,
+            'keyword_research',
+            'failed',
+            {'success': False, 'summary': 'Failed keyword output.'},
+            {'agent_id': 'keyword_research', 'data_source': 'dataforseo'},
+        )
+
+        pdf_bytes = generate_pdf_report(run_id)
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+            temp_pdf.write(pdf_bytes)
+            temp_path = temp_pdf.name
+
+        try:
+            text_output = re.sub(r'\s+', ' ', subprocess.check_output(['pdftotext', temp_path, '-'], text=True)).strip()
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        self.assertIn('Completed SEO Agent Outputs', text_output)
+        self.assertIn('Technical Audit Agent', text_output)
+        self.assertIn('Completed technical audit output.', text_output)
+        self.assertNotIn('Failed keyword output.', text_output)
 
     def test_base_agent_input_schema_is_empty(self):
         self.assertEqual(BaseAgent.INPUT_SCHEMA, [])
@@ -806,6 +951,40 @@ class AgentRoutesTestCase(unittest.TestCase):
         })
         self.assertEqual(serp_response.status_code, 400)
         self.assertEqual(serp_response.get_json()['missing_key'], 'DATAFORSEO_LOGIN')
+
+    @patch('agents.keyword_research.crawl_site')
+    def test_keyword_agents_reuse_tracker_keywords_when_manual_inputs_missing(self, keyword_crawl):
+        keyword_crawl.return_value = {'pages': [], 'crawled_urls': []}
+        run_id = create_run(
+            'example.com',
+            'Example',
+            'United States',
+            'English',
+            ['competitor1.com'],
+            high_volume_keywords=['technical seo audit', 'seo checklist'],
+            brand_keywords=['example seo platform'],
+            user_id=self.user_id,
+        )
+
+        research_response = self.client.post('/run-agent', json={
+            'agent': 'keyword_research',
+            'run_id': run_id,
+        })
+        self.assertEqual(research_response.status_code, 200)
+        research = research_response.get_json()
+        self.assertTrue(research['success'])
+        self.assertEqual(research['input_summary']['seed_keyword'], 'technical seo audit')
+        self.assertTrue(research['tracker_keyword_groups']['used_as_seed'])
+
+        clustering_response = self.client.post('/run-agent', json={
+            'agent': 'keyword_clustering',
+            'run_id': run_id,
+        })
+        self.assertEqual(clustering_response.status_code, 200)
+        clustering = clustering_response.get_json()
+        self.assertTrue(clustering['success'])
+        self.assertEqual(clustering['total_keywords_received'], 3)
+        self.assertTrue(clustering['tracker_keyword_groups']['used_when_keyword_list_missing'])
 
 
 if __name__ == '__main__':

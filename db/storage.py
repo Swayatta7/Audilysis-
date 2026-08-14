@@ -112,9 +112,27 @@ def init_db():
             FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            agent_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT,
+            provenance_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_run_provider_results_run_id ON run_provider_results(run_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_run_provider_results_run_id_provider ON run_provider_results(run_id, provider)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_results_run_id ON agent_results(run_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_results_user_id ON agent_results(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_results_run_id_agent ON agent_results(run_id, agent_name)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS google_ads_connections (
@@ -395,6 +413,78 @@ def get_run_provider_results(run_id):
             item["payload"] = json.loads(item["payload_json"]) if item.get("payload_json") else None
         except (TypeError, ValueError):
             item["payload"] = None
+        results.append(item)
+    return results
+
+
+def upsert_agent_result(run_id: int, user_id: int, agent_name: str, status: str, result: dict | None = None, provenance: dict | None = None):
+    """Create or update the latest persisted result for one agent on an owned run."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    result_json = json.dumps(result) if result is not None else None
+    provenance_json = json.dumps(provenance) if provenance is not None else None
+    cursor.execute(
+        """
+        SELECT id FROM agent_results
+        WHERE run_id = ? AND user_id = ? AND agent_name = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (int(run_id), int(user_id), agent_name),
+    )
+    existing = cursor.fetchone()
+    if existing:
+        cursor.execute(
+            """
+            UPDATE agent_results
+            SET status = ?, result_json = ?, provenance_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, result_json, provenance_json, timestamp, existing["id"]),
+        )
+        result_id = existing["id"]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO agent_results
+            (run_id, user_id, agent_name, status, result_json, provenance_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (int(run_id), int(user_id), agent_name, status, result_json, provenance_json, timestamp, timestamp),
+        )
+        result_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return result_id
+
+
+def get_agent_results_for_run(run_id: int, user_id: int | None = None):
+    """Fetch persisted agent results for a run, optionally scoped to a user."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if user_id is None:
+        cursor.execute(
+            "SELECT * FROM agent_results WHERE run_id = ? ORDER BY updated_at DESC, id DESC",
+            (int(run_id),),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM agent_results WHERE run_id = ? AND user_id = ? ORDER BY updated_at DESC, id DESC",
+            (int(run_id), int(user_id)),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["result"] = json.loads(item["result_json"]) if item.get("result_json") else None
+        except (TypeError, ValueError):
+            item["result"] = None
+        try:
+            item["provenance"] = json.loads(item["provenance_json"]) if item.get("provenance_json") else None
+        except (TypeError, ValueError):
+            item["provenance"] = None
         results.append(item)
     return results
 

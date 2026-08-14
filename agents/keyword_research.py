@@ -151,6 +151,12 @@ class KeywordResearchAgent(BaseAgent):
     def run(self, input_data: dict) -> dict:
         website_url = ensure_url(input_data.get("website_url") or "")
         seed = self._clean_phrase(input_data.get("seed_keyword") or input_data.get("keyword") or "")
+        run_context = input_data.get("_tracker_run_context") or {}
+        run_keywords = (run_context.get("run") or {}).get("keywords") or []
+        high_volume_keywords = (run_context.get("run") or {}).get("high_volume_keywords") or []
+        brand_keywords = (run_context.get("run") or {}).get("brand_keywords") or []
+        if not seed and run_keywords:
+            seed = self._clean_phrase(run_keywords[0])
         country = (input_data.get("country") or input_data.get("location") or "").strip()
         language = (input_data.get("language") or "").strip()
         if not website_url:
@@ -242,6 +248,12 @@ class KeywordResearchAgent(BaseAgent):
                 "industry": input_data.get("industry") or "",
                 "target_audience": input_data.get("target_audience") or "",
                 "business_goal": input_data.get("business_goal") or "",
+                "source_run_id": run_context.get("run_id"),
+            },
+            "tracker_keyword_groups": {
+                "high_volume_keywords": high_volume_keywords,
+                "brand_keywords": brand_keywords,
+                "used_as_seed": bool(run_keywords and not (input_data.get("seed_keyword") or input_data.get("keyword"))),
             },
             "website_topics_detected": context["website_topics"],
             "competitor_topics_detected": context["competitor_topics"],
