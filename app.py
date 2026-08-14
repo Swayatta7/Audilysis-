@@ -16,7 +16,8 @@ from werkzeug.exceptions import HTTPException
 # Imports from local packages
 from db.storage import (
     init_db, create_run, insert_mention_result, insert_competitor_metrics,
-    get_negative_keyword_report, upsert_agent_result, upsert_run_provider_result,
+    get_negative_keyword_report, upsert_run_provider_result,
+    get_agent_results_for_run,
     get_run, get_run_for_user, get_mention_results, get_competitor_metrics, get_trend_data,
     list_negative_keyword_audit,
 )
@@ -95,6 +96,7 @@ from services.tracker_providers import (
     normalize_competitor_domains,
     normalize_domain,
 )
+from services.agent_orchestrator import SEO_AGENT_ORDER, execute_agent_for_run, persist_agent_run_result
 from services.dataforseo_client import (
     build_dataforseo_provider_payload,
     build_skipped_dataforseo_payload,
@@ -263,65 +265,6 @@ def get_current_user_id() -> int | None:
     if not user:
         return None
     return int(user["id"])
-
-
-SENSITIVE_RESULT_KEYS = {
-    "api_key",
-    "apikey",
-    "authorization",
-    "authorization_header",
-    "basic_auth",
-    "cookie",
-    "cookiefile",
-    "cookies",
-    "credentials",
-    "password",
-    "proxy",
-    "proxy_url",
-    "refresh_token",
-    "secret",
-    "sender_password",
-    "smtp_password",
-    "token",
-}
-
-
-def sanitize_agent_result_payload(value):
-    """Remove secrets from agent output before run-scoped persistence."""
-    if isinstance(value, dict):
-        sanitized = {}
-        for key, item in value.items():
-            normalized = str(key).lower()
-            if any(sensitive in normalized for sensitive in SENSITIVE_RESULT_KEYS):
-                sanitized[key] = "[REDACTED]"
-            else:
-                sanitized[key] = sanitize_agent_result_payload(item)
-        return sanitized
-    if isinstance(value, list):
-        return [sanitize_agent_result_payload(item) for item in value]
-    return value
-
-
-def persist_agent_run_result(run_id, user_id, agent_id, result):
-    if not run_id or user_id is None or not agent_id:
-        return
-    status = "completed" if result.get("success") is True and result.get("status") != "error" else "failed"
-    safe_result = sanitize_agent_result_payload(result)
-    provenance = {
-        "agent_id": agent_id,
-        "agent_label": result.get("agent") or result.get("agent_name") or agent_id,
-        "status": status,
-        "data_source": (result.get("data") or {}).get("data_source") or result.get("data_source"),
-        "api_used": (result.get("data") or {}).get("api_used") or result.get("api_used") or [],
-    }
-    upsert_agent_result(
-        run_id=int(run_id),
-        user_id=int(user_id),
-        agent_name=agent_id,
-        status=status,
-        result=safe_result,
-        provenance=sanitize_agent_result_payload(provenance),
-    )
 
 
 def build_dashboard_not_found_context(requested_run_id: int | None) -> dict:
@@ -589,6 +532,8 @@ def api_run():
     high_volume_keywords = [item.strip() for item in (config.get("high_volume_keywords") or []) if str(item).strip()]
     brand_keywords = [item.strip() for item in (config.get("brand_keywords") or []) if str(item).strip()]
     fallback_keywords = [item.strip() for item in (config.get("keywords") or []) if str(item).strip()]
+    if not high_volume_keywords and not brand_keywords and fallback_keywords:
+        high_volume_keywords = fallback_keywords
     combined_keywords = combine_keywords(
         high_volume_keywords or fallback_keywords,
         brand_keywords if high_volume_keywords or brand_keywords else [],
@@ -681,6 +626,7 @@ def stream():
     high_volume_keywords = config.get("high_volume_keywords", [])
     brand_keywords = config.get("brand_keywords", [])
     use_dataforseo = bool(config.get("use_dataforseo", True))
+    current_user_id = get_current_user_id()
     
     run_id = create_run(
         brand_domain,
@@ -691,12 +637,12 @@ def stream():
         use_dataforseo=use_dataforseo,
         high_volume_keywords=high_volume_keywords,
         brand_keywords=brand_keywords,
-        user_id=get_current_user_id(),
+        user_id=current_user_id,
     )
     session["last_run_id"] = run_id
     
     # Outer generator execution scope passing isolated variables
-    def generate(config, creds, email_cfg, run_id, session_run_id):
+    def generate(config, creds, email_cfg, run_id, session_run_id, user_id):
         provider_plan = [
             ("crawl", "Collecting crawl data..."),
             ("pagespeed", "Collecting PageSpeed data..."),
@@ -704,7 +650,7 @@ def stream():
         ]
         platforms = ["google", "chat_gpt", "perplexity", "gemini", "claude"] if use_dataforseo else []
         verification_steps = 1
-        total_steps = len(provider_plan) + verification_steps + (len(keywords) * len(platforms))
+        total_steps = len(provider_plan) + verification_steps + (len(keywords) * len(platforms)) + len(SEO_AGENT_ORDER)
         current_step = 0
         
         # Clear cancellations list for this new thread execution if present
@@ -918,6 +864,24 @@ def stream():
                 sov = round((mentions_count / valid_total_checks * 100), 1)
                 insert_competitor_metrics(run_id, dom, mentions_count, avg_pos, sov)
 
+        agent_credentials = creds if (use_dataforseo and dataforseo_ready) else None
+        for agent_id in SEO_AGENT_ORDER:
+            if session_run_id in cancelled_runs:
+                yield f"data: {json.dumps({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user during SEO agent orchestration.', 'status': 'error', 'error_message': 'User cancelled run.'})}\n\n"
+                return
+            current_step += 1
+            progress = (current_step / total_steps) * 100 if total_steps else 100
+            agent_label = (get_agent_metadata(agent_id) or {}).get("name") or agent_id
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': f'[AGENT] Running {agent_label}...', 'status': 'running'})}\n\n"
+            result = execute_agent_for_run(agent_id, run_id, user_id, agent_credentials)
+            persisted_status = "completed" if result.get("success") is True and result.get("status") != "error" else result.get("status") or "failed"
+            reason = result.get("reason_code")
+            status_label = str(persisted_status).replace("_", " ")
+            message = f"[AGENT] {agent_label} -> {status_label}"
+            if reason:
+                message += f" ({reason})"
+            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})}\n\n"
+
         report_data = generate_report_content(run_id)
         interpretation = generate_tracker_interpretation(report_data) if report_data else {
             "provider": "openai",
@@ -1006,7 +970,7 @@ def stream():
         # Redirect URL
         yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': '[SYSTEM] Redirecting to Dashboard...', 'status': 'completed', 'redirect_url': '/dashboard'})}\n\n"
 
-    return Response(generate(config, creds, email_cfg, run_id, session_run_id), mimetype='text/event-stream')
+    return Response(generate(config, creds, email_cfg, run_id, session_run_id, current_user_id), mimetype='text/event-stream')
 
 @app.route("/agents")
 @login_required
@@ -1015,6 +979,10 @@ def agents_page():
     selected_agent = (request.args.get("agent") or "").strip()
     selected_run_id = request.args.get("run_id", type=int)
     selected_run = get_run_for_user(selected_run_id, get_current_user_id()) if selected_run_id else None
+    selected_agent_results = {
+        row["agent_name"]: row
+        for row in get_agent_results_for_run(selected_run_id, user_id=get_current_user_id())
+    } if selected_run else {}
     if selected_agent == "negative_keyword":
         agent = get_agent_metadata("negative_keyword")
         if not agent:
@@ -1025,6 +993,7 @@ def agents_page():
             standalone_agent=agent,
             selected_run=selected_run,
             selected_run_id=selected_run_id,
+            selected_agent_results=selected_agent_results,
             run_not_found=bool(selected_run_id and not selected_run),
         )
     return render_template(
@@ -1033,6 +1002,7 @@ def agents_page():
         standalone_agent=None,
         selected_run=selected_run,
         selected_run_id=selected_run_id,
+        selected_agent_results=selected_agent_results,
         run_not_found=bool(selected_run_id and not selected_run),
     )
 
@@ -1048,6 +1018,7 @@ def content_agents_page():
         agents=get_agents_by_group(CONTENT_GROUP),
         selected_run=selected_run,
         selected_run_id=selected_run_id,
+        selected_agent_results={},
         run_not_found=bool(selected_run_id and not selected_run),
     )
 
@@ -1063,6 +1034,7 @@ def social_agents_page():
         agents=get_agents_by_group(SOCIAL_GROUP),
         selected_run=selected_run,
         selected_run_id=selected_run_id,
+        selected_agent_results={},
         run_not_found=bool(selected_run_id and not selected_run),
     )
 

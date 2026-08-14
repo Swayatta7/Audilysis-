@@ -13,7 +13,7 @@ from werkzeug.security import generate_password_hash
 import db.storage as storage
 from app import app, generate_report_content
 from api.dataforseo import query_platform
-from db.storage import DB_PATH, create_run, create_user, get_run, get_run_provider_results, get_user_by_email, init_db, insert_mention_result
+from db.storage import DB_PATH, create_run, create_user, get_agent_results_for_run, get_run, get_run_provider_results, get_user_by_email, init_db, insert_mention_result
 from services.pdf_generator import generate_pdf_report
 from services.report_health import evaluate_report_data_health
 from services.tracker_interpretation import generate_tracker_interpretation
@@ -427,6 +427,80 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(get_run(run_id)["brand_keywords"], '["comparison query"]')
         self.assertEqual(len(get_run_provider_results(run_id)), 5)
 
+    @patch("services.agent_orchestrator.get_env_value", return_value="")
+    @patch("services.agent_orchestrator.run_agent")
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_API_KEY is not configured.", "role": "interpretation_only", "payload": None})
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}},
+        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
+    ])
+    @patch("app.query_platform")
+    def test_run_new_tracker_auto_executes_applicable_agents_without_dataforseo_or_openai(self, mocked_query_platform, _providers, _interpretation, mocked_run_agent, _env):
+        def agent_success(agent_id, payload):
+            return {
+                "success": True,
+                "agent": f"{agent_id} test result",
+                "agent_id": agent_id,
+                "summary": f"{agent_id} completed from run context.",
+                "recommendations": [],
+                "data": {"data_source": "verified_run_context_test", "api_used": []},
+            }
+
+        mocked_run_agent.side_effect = agent_success
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "high_volume_keywords": ["brand query", "product query"],
+                "brand_keywords": ["comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("[AGENT] Running Technical Audit Agent", stream_text)
+        self.assertIn("[AGENT] SERP Analysis Agent -> not run (provider_unavailable)", stream_text)
+        mocked_query_platform.assert_not_called()
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        rows = {row["agent_name"]: row for row in get_agent_results_for_run(run_id, user_id=self.user_id)}
+        self.assertEqual(rows["technical_audit"]["status"], "completed")
+        self.assertEqual(rows["keyword_research"]["status"], "completed")
+        self.assertEqual(rows["keyword_clustering"]["status"], "completed")
+        self.assertEqual(rows["serp_analysis"]["status"], "not_run")
+        self.assertEqual(rows["serp_analysis"]["result"]["reason_code"], "provider_unavailable")
+        self.assertEqual(rows["rank_tracking"]["status"], "not_run")
+        self.assertEqual(rows["strategy"]["status"], "not_run")
+        self.assertEqual(rows["outreach"]["status"], "not_run")
+        self.assertNotIn("credentials", json.dumps(rows).lower())
+
+        called_agents = [call.args[0] for call in mocked_run_agent.call_args_list]
+        self.assertIn("technical_audit", called_agents)
+        self.assertIn("content_gap", called_agents)
+        self.assertNotIn("serp_analysis", called_agents)
+        self.assertNotIn("rank_tracking", called_agents)
+        self.assertNotIn("strategy", called_agents)
+
+        report = generate_report_content(run_id)
+        self.assertGreaterEqual(report["agent_status_summary"]["completed"], 8)
+        self.assertGreaterEqual(report["agent_status_summary"]["not_run"], 5)
+        pdf_text = self._pdf_text_normalized(generate_pdf_report(run_id))
+        self.assertIn("Completed SEO Agent Outputs", pdf_text)
+        self.assertIn("technical_audit completed from run context.", pdf_text)
+
+        agent_page = self.client.get(f"/agents?agent=technical_audit&run_id={run_id}")
+        self.assertEqual(agent_page.status_code, 200)
+        self.assertIn(b"Saved result from Run #", agent_page.data)
+        self.assertIn(b"Re-run / Force Refresh", agent_page.data)
+        self.assertIn(b"technical_audit completed from run context.", agent_page.data)
+
     @patch("app.collect_tracker_provider_bundle", return_value=[
         {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
         {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None},
@@ -479,6 +553,79 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(report["report_mode"], "partial")
         self.assertIsNone(report["metric_provenance"]["pagespeed_performance_score"]["value"])
         self.assertEqual(report["metric_provenance"]["crux_lcp_ms"]["value"], 2400)
+
+    @patch("services.agent_orchestrator.get_env_value", return_value="test-openai-key")
+    @patch("services.agent_orchestrator.run_agent")
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "success", "reason": None, "role": "interpretation_only", "payload": {"summary": "ok"}})
+    @patch("app.collect_tracker_provider_bundle", return_value=[
+        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}},
+        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}},
+        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}},
+    ])
+    @patch("app.verify_dataforseo_credentials", return_value={
+        "connected": True,
+        "status": "connected",
+        "message": "DataForSEO credentials verified successfully.",
+        "provider_payload": {
+            "provider": "dataforseo",
+            "enabled": True,
+            "status": "connected",
+            "authentication": "verified",
+            "endpoint": "serp/google/organic/live/advanced",
+        },
+    })
+    @patch("app.query_platform", return_value={
+        "text": "Example brand appears in this verified response.",
+        "sources_cited": ["https://example.com"],
+        "has_valid_data": True,
+        "response_status": "success",
+        "error_category": "success",
+        "error_message": "",
+        "retry_recommendation": "No retry needed.",
+    })
+    def test_run_new_tracker_auto_executes_dataforseo_dependent_agents_when_verified(self, mocked_query_platform, _verify, _providers, _interpretation, mocked_run_agent, _env):
+        mocked_run_agent.side_effect = lambda agent_id, payload: {
+            "success": True,
+            "agent": f"{agent_id} test result",
+            "agent_id": agent_id,
+            "summary": f"{agent_id} completed from verified providers.",
+            "recommendations": [],
+            "data": {"data_source": "verified_run_context_test", "api_used": ["DataForSEO"] if agent_id in {"serp_analysis", "rank_tracking"} else []},
+        }
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "demo", "password": "secret-password"},
+            "config": {
+                "use_dataforseo": True,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("DataForSEO verification", stream_text)
+        self.assertIn("connected", stream_text)
+        self.assertIn("[AGENT] SERP Analysis Agent -> completed", stream_text)
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        rows = {row["agent_name"]: row for row in get_agent_results_for_run(run_id, user_id=self.user_id)}
+        self.assertEqual(rows["serp_analysis"]["status"], "completed")
+        self.assertEqual(rows["rank_tracking"]["status"], "completed")
+        self.assertEqual(rows["strategy"]["status"], "completed")
+        self.assertEqual(rows["backlink_verification"]["status"], "not_run")
+        self.assertEqual(rows["weekly_report"]["status"], "not_run")
+        self.assertNotIn("secret-password", json.dumps(rows))
+        self.assertEqual(mocked_query_platform.call_count, 15)
+
+        called_agents = [call.args[0] for call in mocked_run_agent.call_args_list]
+        self.assertIn("serp_analysis", called_agents)
+        self.assertIn("rank_tracking", called_agents)
+        self.assertIn("strategy", called_agents)
 
     @patch("app.collect_tracker_provider_bundle", return_value=[
         {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3}},

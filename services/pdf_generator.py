@@ -739,7 +739,7 @@ def generate_pdf_report(run_id):
         story.append(Paragraph("Only agents explicitly completed for this run are listed here. Unrun workflows are not represented as completed analysis.", body_style))
         story.append(Spacer(1, 8))
         agent_rows = [["Agent", "Status", "Source", "Summary"]]
-        for row in completed_agent_results[:8]:
+        for row in completed_agent_results:
             result = row.get("result") or {}
             provenance = row.get("provenance") or {}
             agent_id = row.get("agent_name") or provenance.get("agent_id") or result.get("agent_id") or ""

@@ -28,7 +28,12 @@ class StrategyAgent(BaseAgent):
     ]
 
     def run(self, input_data: dict) -> dict:
-        run_context = load_run_analysis_context(input_data.get("run_id"))
+        user_id = input_data.get("_user_id")
+        run_context = (
+            load_run_analysis_context(input_data.get("run_id"), user_id=user_id)
+            if user_id
+            else load_run_analysis_context(input_data.get("run_id"))
+        )
         if run_context:
             api_key = get_env_value("OPENAI_API_KEY")
             if not api_key:
