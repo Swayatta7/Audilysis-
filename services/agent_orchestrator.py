@@ -4,6 +4,7 @@ import traceback
 from typing import Callable, Iterable
 
 from agents.agent_manager import get_agent_metadata, run_agent
+from agents.backlink_verification import extract_backlink_candidates
 from agents.runtime_config import get_env_value
 from db.storage import upsert_agent_result
 from services.run_context import load_run_analysis_context
@@ -175,6 +176,8 @@ def _base_payload(run_context: dict, user_id: int, credentials: dict | None) -> 
     }
     if credentials:
         payload["credentials"] = credentials
+    if extract_backlink_candidates({"_tracker_run_context": run_context, "website_url": website_url}):
+        payload["backlinks"] = extract_backlink_candidates({"_tracker_run_context": run_context, "website_url": website_url})
     return payload
 
 
@@ -205,7 +208,9 @@ def evaluate_agent_eligibility(agent_id: str, run_context: dict) -> tuple[bool, 
     if agent_id == "outreach":
         return (True, None, None) if openai_ready else (False, "provider_unavailable", "OpenAI is required to draft outreach copy.")
     if agent_id == "backlink_verification":
-        return False, "missing_required_input", "No verified backlink URLs exist in this tracker run."
+        website_url = f"https://{run['brand_domain']}"
+        backlink_candidates = extract_backlink_candidates({"_tracker_run_context": run_context, "website_url": website_url})
+        return (True, None, None) if backlink_candidates else (False, "missing_required_input", "No verified backlink URLs exist in this tracker run.")
     if agent_id == "weekly_report":
         return False, "insufficient_history", "Weekly Report requires enough historical/run-period data."
     if agent_id == "monthly_report":

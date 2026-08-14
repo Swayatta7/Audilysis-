@@ -23,6 +23,21 @@ from db.storage import (
     upsert_run_provider_result,
 )
 from services.pdf_generator import generate_pdf_report
+from services.agent_orchestrator import execute_agent_for_run
+
+
+def backlink_fetch_response(source_url, html, *, status_code=200, final_url=None, history=None):
+    return {
+        "url": source_url,
+        "final_url": final_url or source_url,
+        "status_code": status_code,
+        "headers": {"content-type": "text/html"},
+        "text": html,
+        "content": html.encode("utf-8"),
+        "page_size_bytes": len(html.encode("utf-8")),
+        "response_time_ms": 12.0,
+        "history": history or [],
+    }
 
 
 class AgentRoutesTestCase(unittest.TestCase):
@@ -516,7 +531,7 @@ class AgentRoutesTestCase(unittest.TestCase):
     @patch('agents.content_gap.audit_single_page')
     @patch('agents.competitor_analysis.CompetitorAnalysisAgent._crawl_site_or_warning')
     @patch('agents.backlink_prospecting.audit_single_page')
-    @patch('agents.backlink_verification.audit_single_page')
+    @patch('agents.backlink_verification.fetch_url')
     @patch('agents.technical_audit.crawl_site')
     def test_crawl_based_agents_run_from_real_crawl_interfaces(
         self,
@@ -559,7 +574,10 @@ class AgentRoutesTestCase(unittest.TestCase):
         competitor_page.return_value = (page, None)
         content_gap_page.return_value = page
         backlink_prospect_page.return_value = page
-        backlink_verify_page.return_value = page
+        backlink_verify_page.return_value = backlink_fetch_response(
+            'https://referring-site.com/link-page',
+            '<html><a href="https://example.com/landing">Example Anchor</a></html>',
+        )
 
         for agent_id, payload in [
             ('technical_audit', {'website_url': 'https://example.com'}),
@@ -569,7 +587,7 @@ class AgentRoutesTestCase(unittest.TestCase):
             ('schema_agent', {'website_url': 'https://example.com'}),
             ('internal_linking', {'website_url': 'https://example.com'}),
             ('backlink_prospecting', {'website_url': 'https://example.com', 'competitors': ['https://competitor.com']}),
-            ('backlink_verification', {'backlink_url': 'https://example.com/link-page'}),
+            ('backlink_verification', {'backlink_url': 'https://referring-site.com/link-page', 'target_url': 'https://example.com/landing'}),
         ]:
             response = self.client.post('/run-agent', json={'agent': agent_id, **payload})
             self.assertEqual(response.status_code, 200, agent_id)
@@ -579,7 +597,7 @@ class AgentRoutesTestCase(unittest.TestCase):
     @patch('agents.schema_agent.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
     @patch('agents.content_gap.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
     @patch('agents.backlink_prospecting.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
-    @patch('agents.backlink_verification.audit_single_page', side_effect=requests.exceptions.ConnectionError("dns failed"))
+    @patch('agents.backlink_verification.fetch_url', side_effect=requests.exceptions.ConnectionError("dns failed"))
     def test_crawl_based_agents_return_structured_failure_when_network_unavailable(
         self,
         _backlink_verify_page,
@@ -593,14 +611,196 @@ class AgentRoutesTestCase(unittest.TestCase):
             ('on_page_optimizer', {'website_url': 'https://example.com'}),
             ('schema_agent', {'website_url': 'https://example.com'}),
             ('backlink_prospecting', {'website_url': 'https://example.com', 'competitors': ['https://competitor.com']}),
-            ('backlink_verification', {'backlink_url': 'https://example.com/link-page'}),
+            ('backlink_verification', {'backlink_url': 'https://referring-site.com/link-page', 'target_url': 'https://example.com'}),
         ]:
             response = self.client.post('/run-agent', json={'agent': agent_id, **payload})
             self.assertEqual(response.status_code, 200, agent_id)
             data = response.get_json()
             self.assertFalse(data['success'], agent_id)
             self.assertNotIn("raised an unexpected error", data.get('message', ''), agent_id)
-            self.assertEqual(data['data']['data_source'], 'real_crawl' if agent_id != 'backlink_prospecting' else 'real_user_input_and_real_crawl')
+            expected_source = 'real_user_input_and_real_crawl' if agent_id == 'backlink_prospecting' else 'real_crawl'
+            if agent_id == 'backlink_verification':
+                expected_source = 'real_backlink_source_crawl'
+            self.assertEqual(data['data']['data_source'], expected_source)
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_detects_follow_link(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://source.example/article',
+            '<html><body><a href="https://example.com/page">Trusted partner</a></body></html>',
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_url': 'https://source.example/article',
+            'target_url': 'https://example.com/page',
+            'expected_anchor_text': 'Trusted',
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        backlink = data['data']['backlinks'][0]
+        self.assertEqual(backlink['verification_status'], 'VERIFIED')
+        self.assertEqual(backlink['link_type'], 'follow')
+        self.assertTrue(backlink['anchor_text_matched'])
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_detects_nofollow_link(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://source.example/article',
+            '<a href="https://example.com/page" rel="nofollow ugc">Mention</a>',
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_url': 'https://source.example/article',
+            'target_url': 'https://example.com/page',
+        })
+        self.assertEqual(response.status_code, 200)
+        backlink = response.get_json()['data']['backlinks'][0]
+        self.assertEqual(backlink['verification_status'], 'UGC')
+        self.assertEqual(backlink['link_type'], 'ugc')
+        self.assertIn('nofollow', backlink['link_rel'])
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_marks_reachable_missing_link_as_lost(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://source.example/article',
+            '<a href="https://other.example/page">Other site</a>',
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_url': 'https://source.example/article',
+            'target_url': 'https://example.com/page',
+        })
+        self.assertEqual(response.status_code, 200)
+        backlink = response.get_json()['data']['backlinks'][0]
+        self.assertFalse(backlink['backlink_found'])
+        self.assertEqual(backlink['verification_status'], 'TARGET_NOT_FOUND')
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_records_broken_source(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://source.example/missing',
+            'not found',
+            status_code=404,
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_url': 'https://source.example/missing',
+            'target_url': 'https://example.com/page',
+        })
+        self.assertEqual(response.status_code, 200)
+        backlink = response.get_json()['data']['backlinks'][0]
+        self.assertEqual(backlink['http_status'], 404)
+        self.assertEqual(backlink['verification_status'], 'BROKEN_SOURCE')
+
+    @patch('agents.backlink_verification.fetch_url', side_effect=requests.exceptions.Timeout("slow source"))
+    def test_backlink_verification_records_timeout_as_structured_failure(self, _mocked_fetch):
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_urls': ['https://source.example/slow'],
+            'target_url': 'https://example.com/page',
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['success'])
+        self.assertEqual(data['status'], 'failed')
+        self.assertEqual(data['data']['backlinks'][0]['verification_status'], 'UNREACHABLE')
+        self.assertEqual(data['data']['backlinks'][0]['error'], 'timeout')
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_records_redirect_final_url(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://source.example/old',
+            '<a href="https://example.com/page">Example</a>',
+            final_url='https://source.example/new',
+            history=[{"url": "https://source.example/old", "status_code": 301}],
+        )
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_url': 'https://source.example/old',
+            'target_url': 'https://example.com/page',
+        })
+        self.assertEqual(response.status_code, 200)
+        backlink = response.get_json()['data']['backlinks'][0]
+        self.assertTrue(backlink['redirected'])
+        self.assertEqual(backlink['final_url'], 'https://source.example/new')
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_handles_multiple_backlinks_with_one_failure(self, mocked_fetch):
+        mocked_fetch.side_effect = [
+            backlink_fetch_response('https://source.example/good', '<a href="https://example.com">Example</a>'),
+            requests.exceptions.ConnectionError("dns failed"),
+        ]
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'backlink_urls': ['https://source.example/good', 'https://source.example/bad'],
+            'target_url': 'https://example.com',
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['status'], 'partial')
+        self.assertEqual(data['data']['verified_count'], 1)
+        self.assertEqual(data['data']['broken_or_unreachable_count'], 1)
+
+    def test_backlink_verification_without_inputs_returns_not_run(self):
+        response = self.client.post('/run-agent', json={
+            'agent': 'backlink_verification',
+            'target_url': 'https://example.com',
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['success'])
+        self.assertEqual(data['status'], 'not_run')
+        self.assertEqual(data['reason_code'], 'missing_required_input')
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_auto_runs_from_stored_run_backlink_payload(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://referrer.example/article',
+            '<a href="https://example.com/landing">Example landing</a>',
+        )
+        run_id = create_run('example.com', 'Example', 'United States', 'en', [], user_id=self.user_id)
+        upsert_run_provider_result(run_id, 'backlinks', 'success', {
+            'provider': 'manual_import',
+            'backlinks': [{'source_url': 'https://referrer.example/article', 'target_url': 'https://example.com/landing'}],
+        })
+
+        result = execute_agent_for_run('backlink_verification', run_id, self.user_id)
+
+        self.assertTrue(result['success'])
+        rows = {row['agent_name']: row for row in get_agent_results_for_run(run_id, user_id=self.user_id)}
+        self.assertEqual(rows['backlink_verification']['status'], 'completed')
+        stored = rows['backlink_verification']['result']
+        self.assertEqual(stored['data']['verified_count'], 1)
+        self.assertNotIn('password', json.dumps(stored).lower())
+
+    def test_backlink_verification_orchestration_without_backlinks_stays_not_run(self):
+        run_id = create_run('example.com', 'Example', 'United States', 'en', [], user_id=self.user_id)
+        result = execute_agent_for_run('backlink_verification', run_id, self.user_id)
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['status'], 'not_run')
+        self.assertEqual(result['reason_code'], 'missing_required_input')
+        rows = {row['agent_name']: row for row in get_agent_results_for_run(run_id, user_id=self.user_id)}
+        self.assertEqual(rows['backlink_verification']['status'], 'not_run')
+
+    @patch('agents.backlink_verification.fetch_url')
+    def test_backlink_verification_results_do_not_leak_between_users(self, mocked_fetch):
+        mocked_fetch.return_value = backlink_fetch_response(
+            'https://referrer.example/article',
+            '<a href="https://example.com">Example</a>',
+        )
+        run_id = create_run('example.com', 'Example', 'United States', 'en', [], user_id=self.user_id)
+        upsert_run_provider_result(run_id, 'backlinks', 'success', {
+            'backlink_urls': ['https://referrer.example/article'],
+        })
+        execute_agent_for_run('backlink_verification', run_id, self.user_id)
+
+        other = get_user_by_email("backlink-other@example.com")
+        if not other:
+            other_id = create_user("backlink-other@example.com", generate_password_hash("Password123"))
+            other = {"id": other_id, "email": "backlink-other@example.com"}
+        self.assertEqual(get_agent_results_for_run(run_id, user_id=int(other["id"])), [])
 
     @patch('agents.competitor_analysis.CompetitorAnalysisAgent._crawl_site_or_warning')
     def test_competitor_analysis_timeout_returns_warning_not_500(self, crawl_site_or_warning):
@@ -880,7 +1080,7 @@ class AgentRoutesTestCase(unittest.TestCase):
 
         expected_fields = {
             'technical_audit': {'website_url', 'crawl_depth', 'maximum_pages', 'device', 'sitemap_url', 'robots_txt_url', 'force_refresh'},
-            'backlink_verification': {'backlink_url', 'target_url', 'expected_anchor_text', 'project_name', 'verification_frequency', 'force_javascript_rendering'},
+            'backlink_verification': {'backlink_url', 'backlink_urls', 'target_url', 'expected_anchor_text', 'project_name', 'verification_frequency', 'force_javascript_rendering'},
             'strategy': {'website_url', 'business_goal', 'target_country', 'target_audience', 'target_keywords', 'competitor_urls', 'timeframe', 'budget_level', 'team_capacity', 'project_name', 'selected_agent_results'},
         }
         for agent_id, fields in expected_fields.items():

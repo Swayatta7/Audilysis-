@@ -1159,6 +1159,19 @@
             sections.push(cardSection('SERP Features', renderBulletList(payload.serp_features, 'fa-layer-group', 'text-indigo-600')));
             sections.push(cardSection('Recommended Outline', renderOrderedList(payload.recommended_outline)));
             sections.push(cardSection('Suggested FAQs', renderBulletList(payload.faq_suggestions, 'fa-circle-question', 'text-sky-600')));
+        } else if (agentId === 'backlink_verification') {
+            sections.push(cardSection('Verification Summary', renderMetricCards([
+                { label: 'Checked', value: payload.total_backlinks_checked },
+                { label: 'Verified', value: payload.verified_count },
+                { label: 'Lost', value: payload.lost_count },
+                { label: 'Broken / Unreachable', value: payload.broken_or_unreachable_count },
+                { label: 'Follow', value: payload.follow_count },
+                { label: 'Nofollow', value: payload.nofollow_count }
+            ])));
+            sections.push(cardSection('Backlink Checks', renderTable(payload.backlinks, ['verification_status', 'source_url', 'target_url', 'anchor_text', 'link_type', 'http_status', 'final_url', 'checked_at'])));
+            if ((payload.unavailable_metrics || []).length) {
+                sections.push(cardSection('Unavailable Metrics', renderBulletList(payload.unavailable_metrics, 'fa-lock', 'text-slate-500')));
+            }
         } else if (agentId === 'content_calendar' || agentId === 'social_calendar') {
             sections.push(cardSection('Calendar', renderTable(payload.calendar)));
         } else if (agentId === 'seo_brief') {
