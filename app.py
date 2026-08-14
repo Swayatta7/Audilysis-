@@ -4,6 +4,7 @@ import socket
 import time
 import uuid
 import threading
+import queue
 import webbrowser
 from http import HTTPStatus
 from pathlib import Path
@@ -92,7 +93,9 @@ from services.run_context import (
 from services.tracker_interpretation import generate_tracker_interpretation
 from services.tracker_providers import (
     combine_keywords,
-    collect_tracker_provider_bundle,
+    collect_crawl_provider,
+    collect_crux_provider,
+    collect_pagespeed_provider,
     normalize_competitor_domains,
     normalize_domain,
 )
@@ -265,6 +268,43 @@ def get_current_user_id() -> int | None:
     if not user:
         return None
     return int(user["id"])
+
+
+def sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def sse_comment(message: str = "heartbeat") -> str:
+    return f": {message} {int(time.time())}\n\n"
+
+
+def stream_response(generator):
+    response = Response(generator, mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+def run_with_sse_heartbeats(work, *, heartbeat_message: str, interval_seconds: float = 10.0):
+    """Run blocking work off-generator so SSE comments can keep proxies alive."""
+    result_queue = queue.Queue(maxsize=1)
+
+    def target():
+        try:
+            result_queue.put(("ok", work()))
+        except Exception as exc:
+            result_queue.put(("error", exc))
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    while True:
+        try:
+            kind, value = result_queue.get(timeout=interval_seconds)
+            if kind == "error":
+                raise value
+            return value
+        except queue.Empty:
+            yield sse_comment(heartbeat_message)
 
 
 def build_dashboard_not_found_context(requested_run_id: int | None) -> dict:
@@ -613,8 +653,8 @@ def stream():
     if not config or session_run_id is None:
         # Yield single error and exit
         def err_gen():
-            yield f"data: {json.dumps({'status': 'error', 'error_message': 'Session expired or configuration missing.'})}\n\n"
-        return Response(err_gen(), mimetype='text/event-stream')
+            yield sse_event({'status': 'error', 'error_message': 'Session expired or configuration missing.'})
+        return stream_response(err_gen())
         
     # Create the run in DB prior to streaming
     brand_domain = config.get("brand_domain")
@@ -644,25 +684,52 @@ def stream():
     # Outer generator execution scope passing isolated variables
     def generate(config, creds, email_cfg, run_id, session_run_id, user_id):
         provider_plan = [
-            ("crawl", "Collecting crawl data..."),
-            ("pagespeed", "Collecting PageSpeed data..."),
-            ("crux", "Collecting Chrome UX Report data..."),
+            ("crawl", "Collecting crawl data...", collect_crawl_provider),
+            ("pagespeed", "Collecting PageSpeed data...", collect_pagespeed_provider),
+            ("crux", "Collecting Chrome UX Report data...", collect_crux_provider),
         ]
         platforms = ["google", "chat_gpt", "perplexity", "gemini", "claude"] if use_dataforseo else []
         verification_steps = 1
         total_steps = len(provider_plan) + verification_steps + (len(keywords) * len(platforms)) + len(SEO_AGENT_ORDER)
         current_step = 0
+
+        yield sse_event({
+            'progress': 0,
+            'current_step': 0,
+            'total_steps': total_steps,
+            'message': '[SYSTEM] Stream connected. Starting tracker execution...',
+            'status': 'running',
+        })
+        yield sse_comment("stream-started")
         
         # Clear cancellations list for this new thread execution if present
         if session_run_id in cancelled_runs:
             cancelled_runs.remove(session_run_id)
             
         website_url = f"https://{brand_domain}"
-        provider_results = collect_tracker_provider_bundle(website_url)
-        for index, provider_result in enumerate(provider_results, start=1):
+        for provider, start_message, provider_func in provider_plan:
+            yield sse_event({
+                'progress': (current_step / total_steps) * 100 if total_steps else 0,
+                'current_step': current_step,
+                'total_steps': total_steps,
+                'message': f"[SOURCE] {start_message}",
+                'status': 'running',
+            })
+            try:
+                provider_result = yield from run_with_sse_heartbeats(
+                    lambda provider_func=provider_func: provider_func(website_url),
+                    heartbeat_message=f"heartbeat provider={provider}",
+                )
+            except Exception as exc:
+                provider_result = {
+                    "provider": provider,
+                    "status": "failed",
+                    "reason": f"{provider.title()} provider failed: {type(exc).__name__}",
+                    "payload": None,
+                }
+                app.logger.exception("tracker_provider_failed provider=%s run_id=%s", provider, run_id)
             current_step += 1
             progress = (current_step / total_steps) * 100 if total_steps else 100
-            provider = provider_result["provider"]
             upsert_run_provider_result(
                 run_id,
                 provider,
@@ -675,7 +742,7 @@ def stream():
             message = f"[SOURCE] {provider.title()} → {status_text}"
             if reason_text:
                 message += f" ({reason_text})"
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})}\n\n"
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})
 
         current_step += 1
         progress = (current_step / total_steps) * 100 if total_steps else 100
@@ -689,16 +756,35 @@ def stream():
                 payload=build_skipped_dataforseo_payload(run_id=run_id),
                 reason="DataForSEO was intentionally disabled for this run.",
             )
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'skipped by user', 'status': 'running'})}\n\n"
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'skipped by user', 'status': 'running'})
         else:
             verification_keyword = keywords[0] if keywords else brand_name
-            verification = verify_dataforseo_credentials(
-                creds,
-                keyword=verification_keyword,
-                country=country,
-                language=language,
-                run_id=run_id,
-            )
+            yield sse_event({'progress': progress, 'current_step': current_step - 1, 'total_steps': total_steps, 'message': '[SOURCE] Verifying DataForSEO credentials...', 'status': 'running'})
+            try:
+                verification = yield from run_with_sse_heartbeats(
+                    lambda: verify_dataforseo_credentials(
+                        creds,
+                        keyword=verification_keyword,
+                        country=country,
+                        language=language,
+                        run_id=run_id,
+                    ),
+                    heartbeat_message="heartbeat provider=dataforseo_verification",
+                )
+            except Exception as exc:
+                app.logger.exception("dataforseo_verification_failed run_id=%s", run_id)
+                verification = {
+                    "connected": False,
+                    "status": "failed",
+                    "message": f"DataForSEO verification failed: {type(exc).__name__}.",
+                    "provider_payload": build_dataforseo_provider_payload(
+                        enabled=True,
+                        status="failed",
+                        authentication="failed",
+                        endpoint="credential_verification",
+                        run_id=run_id,
+                    ),
+                }
             verified_status = verification["status"]
             verified_reason = verification["message"]
             upsert_run_provider_result(
@@ -709,24 +795,24 @@ def stream():
                 reason=verified_reason,
             )
             if verification["connected"]:
-                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'connected', 'status': 'running'})}\n\n"
+                yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + 'connected', 'status': 'running'})
             else:
                 dataforseo_ready = False
-                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + verified_status.replace('_', ' '), 'status': 'running'})}\n\n"
+                yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': dataforseo_enabled_message + verified_status.replace('_', ' '), 'status': 'running'})
 
         if not use_dataforseo:
             progress = (current_step / total_steps) * 100 if total_steps else 100
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO was disabled for this run. Skipping AI visibility collection and continuing with other real providers.', 'status': 'running'})}\n\n"
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO was disabled for this run. Skipping AI visibility collection and continuing with other real providers.', 'status': 'running'})
         elif not dataforseo_ready:
             progress = (current_step / total_steps) * 100 if total_steps else 100
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO authentication failed or the provider was unavailable. Skipping DataForSEO-dependent analysis and continuing with other real providers.', 'status': 'running'})}\n\n"
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] DataForSEO authentication failed or the provider was unavailable. Skipping DataForSEO-dependent analysis and continuing with other real providers.', 'status': 'running'})
 
         active_platforms = platforms if dataforseo_ready else []
         for keyword in keywords:
             for platform in active_platforms:
                 # Polling Cancel Check
                 if session_run_id in cancelled_runs:
-                    yield f"data: {json.dumps({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user.', 'status': 'error', 'error_message': 'User cancelled run.'})}\n\n"
+                    yield sse_event({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user.', 'status': 'error', 'error_message': 'User cancelled run.'})
                     return
                     
                 current_step += 1
@@ -742,12 +828,32 @@ def stream():
                 }
                 p_name = platform_names.get(platform, platform)
                 log_message = f'[{current_step}/{total_steps}] Checking "{keyword}" on {p_name}...'
-                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_message, 'status': 'running'})}\n\n"
+                yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_message, 'status': 'running'})
                 
                 # Run the API query
-                platform_result = query_platform(
-                    platform, keyword, creds, brand_domain, brand_name, competitor_domains, country, language
-                )
+                try:
+                    platform_result = yield from run_with_sse_heartbeats(
+                        lambda platform=platform, keyword=keyword: query_platform(
+                            platform, keyword, creds, brand_domain, brand_name, competitor_domains, country, language
+                        ),
+                        heartbeat_message=f"heartbeat platform={platform}",
+                    )
+                except Exception as exc:
+                    app.logger.exception(
+                        "platform_query_failed run_id=%s platform=%s keyword=%s",
+                        run_id,
+                        platform,
+                        keyword,
+                    )
+                    platform_result = {
+                        "text": "",
+                        "sources_cited": [],
+                        "has_valid_data": False,
+                        "response_status": "failed",
+                        "error_category": "provider_exception",
+                        "error_message": f"{platform} query failed: {type(exc).__name__}.",
+                        "retry_recommendation": "Review provider status and rerun the tracker.",
+                    }
                 response_text = platform_result.get("text", "")
                 sources = platform_result.get("sources_cited", [])
                 mentioned = None
@@ -796,7 +902,7 @@ def stream():
                     retry_recommendation=platform_result.get("retry_recommendation"),
                 )
                 
-                yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_line, 'status': 'running'})}\n\n"
+                yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': log_line, 'status': 'running'})
                 
         # --- Run Complete Post-Processing ---
         # Calculate competitor SOV metrics locally
@@ -867,29 +973,63 @@ def stream():
         agent_credentials = creds if (use_dataforseo and dataforseo_ready) else None
         for agent_id in SEO_AGENT_ORDER:
             if session_run_id in cancelled_runs:
-                yield f"data: {json.dumps({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user during SEO agent orchestration.', 'status': 'error', 'error_message': 'User cancelled run.'})}\n\n"
+                yield sse_event({'progress': 100, 'current_step': current_step, 'total_steps': total_steps, 'message': '[SYSTEM] Tracker run aborted by user during SEO agent orchestration.', 'status': 'error', 'error_message': 'User cancelled run.'})
                 return
             current_step += 1
             progress = (current_step / total_steps) * 100 if total_steps else 100
             agent_label = (get_agent_metadata(agent_id) or {}).get("name") or agent_id
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': f'[AGENT] Running {agent_label}...', 'status': 'running'})}\n\n"
-            result = execute_agent_for_run(agent_id, run_id, user_id, agent_credentials)
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': f'[AGENT] Running {agent_label}...', 'status': 'running'})
+            try:
+                result = yield from run_with_sse_heartbeats(
+                    lambda agent_id=agent_id: execute_agent_for_run(agent_id, run_id, user_id, agent_credentials),
+                    heartbeat_message=f"heartbeat agent={agent_id}",
+                )
+            except Exception as exc:
+                app.logger.exception("agent_orchestration_failed run_id=%s agent=%s", run_id, agent_id)
+                result = {
+                    "success": False,
+                    "agent": agent_label,
+                    "agent_id": agent_id,
+                    "status": "failed",
+                    "reason_code": "agent_exception",
+                    "message": f"{agent_label} failed during automatic tracker orchestration: {type(exc).__name__}.",
+                }
+                persist_agent_run_result(run_id, user_id, agent_id, result)
             persisted_status = "completed" if result.get("success") is True and result.get("status") != "error" else result.get("status") or "failed"
+            if persisted_status == "error":
+                persisted_status = "failed"
             reason = result.get("reason_code")
             status_label = str(persisted_status).replace("_", " ")
             message = f"[AGENT] {agent_label} -> {status_label}"
             if reason:
                 message += f" ({reason})"
-            yield f"data: {json.dumps({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})}\n\n"
+            yield sse_event({'progress': progress, 'current_step': current_step, 'total_steps': total_steps, 'message': message, 'status': 'running'})
 
         report_data = generate_report_content(run_id)
-        interpretation = generate_tracker_interpretation(report_data) if report_data else {
-            "provider": "openai",
-            "status": "failed",
-            "reason": "Report data could not be generated for interpretation.",
-            "role": "interpretation_only",
-            "payload": None,
-        }
+        if report_data:
+            yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': '[SYSTEM] Generating tracker interpretation...', 'status': 'running'})
+            try:
+                interpretation = yield from run_with_sse_heartbeats(
+                    lambda: generate_tracker_interpretation(report_data),
+                    heartbeat_message="heartbeat provider=openai_interpretation",
+                )
+            except Exception as exc:
+                app.logger.exception("tracker_interpretation_failed run_id=%s", run_id)
+                interpretation = {
+                    "provider": "openai",
+                    "status": "failed",
+                    "reason": f"Tracker interpretation failed: {type(exc).__name__}.",
+                    "role": "interpretation_only",
+                    "payload": None,
+                }
+        else:
+            interpretation = {
+                "provider": "openai",
+                "status": "failed",
+                "reason": "Report data could not be generated for interpretation.",
+                "role": "interpretation_only",
+                "payload": None,
+            }
         upsert_run_provider_result(
             run_id,
             "openai",
@@ -901,14 +1041,17 @@ def stream():
         # Handle automatic emailing if configured
         if email_cfg and email_cfg.get("email_automatically"):
             recipient_list = email_cfg.get('recipient_emails', '')
-            yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] Preparing report email to {recipient_list}...', 'status': 'running'})}\n\n"
+            yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] Preparing report email to {recipient_list}...', 'status': 'running'})
             
             # Fetch data & build report
             report_data = generate_report_content(run_id)
             if report_data:
                 try:
                     # Generate dynamic PDF
-                    report_pdf = generate_pdf_report(run_id)
+                    report_pdf = yield from run_with_sse_heartbeats(
+                        lambda: generate_pdf_report(run_id),
+                        heartbeat_message="heartbeat report=pdf",
+                    )
                     if not report_pdf:
                         raise ValueError("PDF generation returned empty bytes.")
                     
@@ -948,29 +1091,32 @@ def stream():
                     filename = f"Audilysis-2.0-AI-Mention-Report-{brand_domain}-{date_str}.pdf"
                     
                     # Send
-                    to_str, mail_err = send_report_email(
-                        email_cfg["smtp_host"],
-                        email_cfg["smtp_port"],
-                        email_cfg["sender_email"],
-                        email_cfg["sender_password"],
-                        email_cfg["recipient_emails"],
-                        subject,
-                        body_html,
-                        report_pdf,
-                        filename
+                    to_str, mail_err = yield from run_with_sse_heartbeats(
+                        lambda: send_report_email(
+                            email_cfg["smtp_host"],
+                            email_cfg["smtp_port"],
+                            email_cfg["sender_email"],
+                            email_cfg["sender_password"],
+                            email_cfg["recipient_emails"],
+                            subject,
+                            body_html,
+                            report_pdf,
+                            filename
+                        ),
+                        heartbeat_message="heartbeat provider=smtp",
                     )
                     
                     if mail_err:
-                        yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ❌ Auto-email failed: {mail_err}', 'status': 'running'})}\n\n"
+                        yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ❌ Auto-email failed: {mail_err}', 'status': 'running'})
                     else:
-                        yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ✓ Auto-email sent successfully to {to_str}', 'status': 'running'})}\n\n"
+                        yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ✓ Auto-email sent successfully to {to_str}', 'status': 'running'})
                 except Exception as e:
-                    yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ❌ Auto-email render error: {str(e)}', 'status': 'running'})}\n\n"
+                    yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': f'[SMTP] ❌ Auto-email render error: {str(e)}', 'status': 'running'})
                     
         # Redirect URL
-        yield f"data: {json.dumps({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': '[SYSTEM] Redirecting to Dashboard...', 'status': 'completed', 'redirect_url': '/dashboard'})}\n\n"
+        yield sse_event({'progress': 100, 'current_step': total_steps, 'total_steps': total_steps, 'message': '[SYSTEM] Redirecting to Dashboard...', 'status': 'completed', 'redirect_url': '/dashboard'})
 
-    return Response(generate(config, creds, email_cfg, run_id, session_run_id, current_user_id), mimetype='text/event-stream')
+    return stream_response(generate(config, creds, email_cfg, run_id, session_run_id, current_user_id))
 
 @app.route("/agents")
 @login_required

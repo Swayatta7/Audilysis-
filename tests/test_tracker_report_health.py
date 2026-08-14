@@ -3,6 +3,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 import json
@@ -11,7 +12,7 @@ from pathlib import Path
 from werkzeug.security import generate_password_hash
 
 import db.storage as storage
-from app import app, generate_report_content
+from app import app, generate_report_content, run_with_sse_heartbeats
 from api.dataforseo import query_platform
 from db.storage import DB_PATH, create_run, create_user, get_agent_results_for_run, get_run, get_run_provider_results, get_user_by_email, init_db, insert_mention_result
 from services.pdf_generator import generate_pdf_report
@@ -22,6 +23,7 @@ from services.tracker_interpretation import generate_tracker_interpretation
 def reset_tracker_tables():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    cursor.execute("DELETE FROM agent_results")
     cursor.execute("DELETE FROM mention_results")
     cursor.execute("DELETE FROM competitor_metrics")
     cursor.execute("DELETE FROM run_provider_results")
@@ -381,13 +383,56 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("DataForSEO credentials are required", response.get_json()["message"])
 
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}},
-        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
-    ])
+    @patch("app.collect_crawl_provider")
+    def test_stream_sends_initial_event_and_headers_before_slow_work(self, mocked_crawl):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": [],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+
+        stream_response = self.client.get("/stream", buffered=False)
+        self.assertEqual(stream_response.status_code, 200)
+        self.assertIn("text/event-stream", stream_response.headers.get("Content-Type", ""))
+        self.assertEqual(stream_response.headers.get("Cache-Control"), "no-cache")
+        self.assertEqual(stream_response.headers.get("X-Accel-Buffering"), "no")
+
+        first_chunk = next(stream_response.response).decode("utf-8")
+        self.assertIn("Stream connected. Starting tracker execution", first_chunk)
+        mocked_crawl.assert_not_called()
+        stream_response.close()
+
+    def test_run_with_sse_heartbeats_emits_comment_while_work_runs(self):
+        def slow_work():
+            time.sleep(0.03)
+            return "done"
+
+        generator = run_with_sse_heartbeats(slow_work, heartbeat_message="heartbeat test=slow", interval_seconds=0.01)
+        first_chunk = next(generator)
+        self.assertTrue(first_chunk.startswith(": heartbeat test=slow"))
+        result = None
+        while True:
+            try:
+                next(generator)
+            except StopIteration as stopped:
+                result = stopped.value
+                break
+        self.assertEqual(result, "done")
+
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}})
     @patch("app.query_platform")
-    def test_stream_skips_dataforseo_calls_when_disabled(self, mocked_query_platform, _mocked_provider_bundle):
+    def test_stream_skips_dataforseo_calls_when_disabled(self, mocked_query_platform, _crawl, _pagespeed, _crux):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "", "password": ""},
             "config": {
@@ -428,15 +473,100 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertEqual(len(get_run_provider_results(run_id)), 5)
 
     @patch("services.agent_orchestrator.get_env_value", return_value="")
+    @patch("services.agent_orchestrator.run_agent", return_value={
+        "success": True,
+        "agent": "test agent",
+        "summary": "Agent completed.",
+        "recommendations": [],
+        "data": {"data_source": "verified_run_context_test", "api_used": []},
+    })
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_API_KEY is not configured.", "role": "interpretation_only", "payload": None})
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "failed", "reason": "PageSpeed returned HTTP 500: Lighthouse returned error: Something went wrong.", "payload": {"diagnostics": {"http_status": 500}}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}})
+    @patch("app.query_platform")
+    def test_pagespeed_500_does_not_kill_tracker_stream(self, mocked_query_platform, _crawl, _pagespeed, _crux, _interpretation, _run_agent, _env):
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("PageSpeed returned HTTP 500", stream_text)
+        self.assertIn("Redirecting to Dashboard", stream_text)
+        mocked_query_platform.assert_not_called()
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        report = generate_report_content(run_id)
+        self.assertEqual(report["source_provenance"]["pagespeed"]["status"], "failed")
+        self.assertEqual(report["source_provenance"]["crawl"]["status"], "success")
+        rows = get_agent_results_for_run(run_id, user_id=self.user_id)
+        self.assertTrue(rows)
+
+    @patch("services.agent_orchestrator.get_env_value", return_value="")
     @patch("services.agent_orchestrator.run_agent")
     @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_API_KEY is not configured.", "role": "interpretation_only", "payload": None})
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}},
-        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}})
     @patch("app.query_platform")
-    def test_run_new_tracker_auto_executes_applicable_agents_without_dataforseo_or_openai(self, mocked_query_platform, _providers, _interpretation, mocked_run_agent, _env):
+    def test_one_agent_failure_does_not_kill_tracker_stream(self, mocked_query_platform, _crawl, _pagespeed, _crux, _interpretation, mocked_run_agent, _env):
+        def run_agent_side_effect(agent_id, payload):
+            if agent_id == "technical_audit":
+                raise RuntimeError("boom")
+            return {
+                "success": True,
+                "agent": f"{agent_id} test result",
+                "agent_id": agent_id,
+                "summary": f"{agent_id} completed.",
+                "recommendations": [],
+                "data": {"data_source": "verified_run_context_test", "api_used": []},
+            }
+
+        mocked_run_agent.side_effect = run_agent_side_effect
+        response = self.client.post("/api/run", json={
+            "credentials": {"login": "", "password": ""},
+            "config": {
+                "use_dataforseo": False,
+                "brand_domain": "example.com",
+                "brand_name": "Example",
+                "country": "United States",
+                "language": "en",
+                "competitors": ["competitor1.com"],
+                "keywords": ["brand query", "product query", "comparison query"],
+            },
+            "email_settings": {},
+        }, headers={"X-CSRF-Token": "tracker-csrf", "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        stream_text = self.client.get("/stream").get_data(as_text=True)
+        self.assertIn("Technical Audit Agent -> failed", stream_text)
+        self.assertIn("Redirecting to Dashboard", stream_text)
+        mocked_query_platform.assert_not_called()
+
+        with self.client.session_transaction() as flask_session:
+            run_id = flask_session["last_run_id"]
+        rows = {row["agent_name"]: row for row in get_agent_results_for_run(run_id, user_id=self.user_id)}
+        self.assertEqual(rows["technical_audit"]["status"], "failed")
+        self.assertEqual(rows["keyword_research"]["status"], "completed")
+
+    @patch("services.agent_orchestrator.get_env_value", return_value="")
+    @patch("services.agent_orchestrator.run_agent")
+    @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_API_KEY is not configured.", "role": "interpretation_only", "payload": None})
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0, "seo_score": 88.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}})
+    @patch("app.query_platform")
+    def test_run_new_tracker_auto_executes_applicable_agents_without_dataforseo_or_openai(self, mocked_query_platform, _crawl, _pagespeed, _crux, _interpretation, mocked_run_agent, _env):
         def agent_success(agent_id, payload):
             return {
                 "success": True,
@@ -501,11 +631,9 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertIn(b"Re-run / Force Refresh", agent_page.data)
         self.assertIn(b"technical_audit completed from run context.", agent_page.data)
 
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
-        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400, "interaction_to_next_paint_ms": 170, "cumulative_layout_shift": 0.08}},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400, "interaction_to_next_paint_ms": 170, "cumulative_layout_shift": 0.08}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}})
     @patch("app.verify_dataforseo_credentials", return_value={
         "connected": False,
         "status": "authentication_failed",
@@ -526,7 +654,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         "error_message": "The provider was unavailable for this request.",
         "retry_recommendation": "Check provider status and rerun the audit later.",
     })
-    def test_dataforseo_enabled_failure_is_marked_failed(self, _mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+    def test_dataforseo_enabled_failure_is_marked_failed(self, _mocked_query_platform, _mocked_verify, _crawl, _pagespeed, _crux):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "demo", "password": "demo"},
             "config": {
@@ -557,11 +685,9 @@ class TrackerReportHealthTestCase(unittest.TestCase):
     @patch("services.agent_orchestrator.get_env_value", return_value="test-openai-key")
     @patch("services.agent_orchestrator.run_agent")
     @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "success", "reason": None, "role": "interpretation_only", "payload": {"summary": "ok"}})
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3, "https": True, "title_present": True, "meta_description_present": True, "h1_count": 1}})
     @patch("app.verify_dataforseo_credentials", return_value={
         "connected": True,
         "status": "connected",
@@ -583,7 +709,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         "error_message": "",
         "retry_recommendation": "No retry needed.",
     })
-    def test_run_new_tracker_auto_executes_dataforseo_dependent_agents_when_verified(self, mocked_query_platform, _verify, _providers, _interpretation, mocked_run_agent, _env):
+    def test_run_new_tracker_auto_executes_dataforseo_dependent_agents_when_verified(self, mocked_query_platform, _verify, _crawl, _pagespeed, _crux, _interpretation, mocked_run_agent, _env):
         mocked_run_agent.side_effect = lambda agent_id, payload: {
             "success": True,
             "agent": f"{agent_id} test result",
@@ -627,11 +753,9 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertIn("rank_tracking", called_agents)
         self.assertIn("strategy", called_agents)
 
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2100}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 91.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 4, "indexable_pages": 3}})
     @patch("app.verify_dataforseo_credentials", return_value={
         "connected": True,
         "status": "connected",
@@ -653,7 +777,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         "error_message": "",
         "retry_recommendation": "No retry needed.",
     })
-    def test_dataforseo_valid_credentials_mark_provider_connected_then_success(self, mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+    def test_dataforseo_valid_credentials_mark_provider_connected_then_success(self, mocked_query_platform, _mocked_verify, _crawl, _pagespeed, _crux):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "demo", "password": "secret-password"},
             "config": {
@@ -682,11 +806,9 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertNotIn("secret-password", json.dumps(report))
         self.assertEqual(mocked_query_platform.call_count, 15)
 
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 88.0}},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2000}},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2000}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 88.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 2, "indexable_pages": 2}})
     @patch("app.verify_dataforseo_credentials", return_value={
         "connected": False,
         "status": "rate_limited",
@@ -699,7 +821,7 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         },
     })
     @patch("app.query_platform")
-    def test_invalid_dataforseo_verification_stops_follow_up_analysis_calls(self, mocked_query_platform, _mocked_verify, _mocked_provider_bundle):
+    def test_invalid_dataforseo_verification_stops_follow_up_analysis_calls(self, mocked_query_platform, _mocked_verify, _crawl, _pagespeed, _crux):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "demo", "password": "bad-password"},
             "config": {
@@ -724,13 +846,11 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         self.assertIsNone(report["stat_brand_mentions"])
         self.assertIsNone(report["stat_brand_sov"])
 
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "failed", "reason": "Crawl failed", "payload": None},
-        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None},
-        {"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "insufficient_field_data", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403.", "payload": None})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "failed", "reason": "Crawl failed", "payload": None})
     @patch("app.query_platform")
-    def test_total_factual_collection_failure_remains_technical_failure(self, mocked_query_platform, _mocked_provider_bundle):
+    def test_total_factual_collection_failure_remains_technical_failure(self, mocked_query_platform, _crawl, _pagespeed, _crux):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "", "password": ""},
             "config": {
@@ -869,13 +989,11 @@ class TrackerReportHealthTestCase(unittest.TestCase):
         None,
         "OpenAI API returned HTTP 500: upstream failure",
     ))
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
-        {"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403: API key restrictions blocked this request.", "payload": None},
-        {"provider": "crux", "status": "unavailable", "reason": "Chrome UX Report returned HTTP 403: API key restrictions blocked this request.", "payload": None},
-    ])
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "unavailable", "reason": "Chrome UX Report returned HTTP 403: API key restrictions blocked this request.", "payload": None})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "unavailable", "reason": "PageSpeed returned HTTP 403: API key restrictions blocked this request.", "payload": None})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}})
     @patch("app.query_platform")
-    def test_dataforseo_disabled_provider_failures_preserve_truthful_unavailable_metrics(self, mocked_query_platform, _mocked_provider_bundle, _mocked_completion):
+    def test_dataforseo_disabled_provider_failures_preserve_truthful_unavailable_metrics(self, mocked_query_platform, _crawl, _pagespeed, _crux, _mocked_completion):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "", "password": ""},
             "config": {
@@ -924,12 +1042,10 @@ class TrackerReportHealthTestCase(unittest.TestCase):
 
     @patch("app.send_report_email")
     @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_TRANSCRIPTION", "role": "interpretation_only", "payload": None})
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}},
-    ])
-    def test_auto_email_false_does_not_attempt_smtp(self, _providers, _interpretation, mocked_send_mail):
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}})
+    def test_auto_email_false_does_not_attempt_smtp(self, _crawl, _pagespeed, _crux, _interpretation, mocked_send_mail):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "", "password": ""},
             "config": {
@@ -978,12 +1094,10 @@ class TrackerReportHealthTestCase(unittest.TestCase):
 
     @patch("app.send_report_email", return_value=(None, "Email authentication failed."))
     @patch("app.generate_tracker_interpretation", return_value={"provider": "openai", "status": "unavailable", "reason": "OPENAI_TRANSCRIPTION", "role": "interpretation_only", "payload": None})
-    @patch("app.collect_tracker_provider_bundle", return_value=[
-        {"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}},
-        {"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}},
-        {"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}},
-    ])
-    def test_smtp_failure_does_not_corrupt_successful_run(self, _providers, _interpretation, mocked_send_mail):
+    @patch("app.collect_crux_provider", return_value={"provider": "crux", "status": "success", "reason": None, "payload": {"largest_contentful_paint_ms": 2400}})
+    @patch("app.collect_pagespeed_provider", return_value={"provider": "pagespeed", "status": "success", "reason": None, "payload": {"performance_score": 92.0}})
+    @patch("app.collect_crawl_provider", return_value={"provider": "crawl", "status": "success", "reason": None, "payload": {"pages_crawled": 1, "indexable_pages": 1}})
+    def test_smtp_failure_does_not_corrupt_successful_run(self, _crawl, _pagespeed, _crux, _interpretation, mocked_send_mail):
         response = self.client.post("/api/run", json={
             "credentials": {"login": "", "password": ""},
             "config": {

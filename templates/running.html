@@ -128,10 +128,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
-    eventSource.onerror = (err) => {
-        // Since EventSource retries automatically, we close on error to avoid looping
-        addLog("[ERROR] Lost connection to server stream.", "error");
-        eventSource.close();
+    eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED) {
+            addLog("[ERROR] Lost connection to server stream.", "error");
+            eventSource.close();
+            return;
+        }
+        addLog("[SYSTEM] Stream interrupted; reconnecting...", "system");
     };
 
     // Cancel Button click
